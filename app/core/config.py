@@ -3,7 +3,6 @@
 """
 
 import os  # Импорт стандартного модуля os. Дает доступ к переменным окружения через os.getenv
-
 from dataclasses import dataclass
     # Декоратор @dataclass генерирует шаблонный код в классе, 
     # который предназначен преимущественно для хранения данных
@@ -39,7 +38,6 @@ from dataclasses import dataclass
     # Args:
 
     #     frozen — изменяемость (=True делает объект неизменяемым)
-
 from dotenv import load_dotenv
     # Функция load_dotenv() читает .env и добавляет переменные окружения в os.environ
     # Потом доступ ко всем переменным окружения можно получить через 
@@ -49,17 +47,34 @@ from dotenv import load_dotenv
     # os.environ.get('TELEGRAM_BOT_TOKEN')
 
 
-class ConfigError(RuntimeError):
-    """Raised when required configuration is missing or invalid."""
+class ConfigError(RuntimeError):  # Наследуется от встроенного класса RuntimeError
+    """Появляется, когда переменные окружения в .env отсутствуют или задан не корректный тип данных."""
 
-
+# Подчеркивание перед названием - маркер "приватной функции", которую не надо вызывать за пределами модуля
 def _get_int_env(name: str, default: int) -> int:
+    """
+    Вычисляет значение переменных окружения при создании экземпляра класса
+
+    Args:
+        name: название переменной
+        default: значение по умолчанию, если переменной нет
+
+    Returns:
+        Целое число (int)
+        
+    Raises:
+        Поднимает ConfigError, если строку невозможно преобразовать в число
+    """
+    # Берет переменную окружения name или использует default, но приводит к строке 
+    # strip() обрезает пробелы по краям значений. Напр., если в окружении написано "CHECK_INTERVAL_MINUTES= 15"
     raw = os.getenv(name, str(default)).strip()
+    
     try:
-        return int(raw)
+        return int(raw)  # Теперь преобразуем строку в целое число (int)
+    # ValueError - исключение, если тип данных правильный, но значение не подходит 
+    # (напр. попытка преобразовать "abc" в int)
     except ValueError as e:
         raise ConfigError(f"Invalid integer for {name}: {raw!r}") from e
-
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -67,10 +82,10 @@ class Config:
     DATABASE_URL: str
 
     # Optional settings (KISS defaults, aligned with README).
-    CHECK_INTERVAL_MINUTES: int = 15
-    SUMMARY_MIN_LEN: int = 140
-    SUMMARY_MAX_LEN: int = 280
-    LOG_LEVEL: str = "INFO"
+    CHECK_INTERVAL_MINUTES: int
+    SUMMARY_MIN_LEN: int
+    SUMMARY_MAX_LEN: int
+    LOG_LEVEL: str
 
     @classmethod
     def load(cls) -> "Config":
