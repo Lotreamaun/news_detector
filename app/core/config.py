@@ -68,7 +68,7 @@ def _get_int_env(name: str, default: int) -> int:
     # Берет переменную окружения name или использует default, но приводит к строке 
     # strip() обрезает пробелы по краям значений. Напр., если в окружении написано "CHECK_INTERVAL_MINUTES= 15"
     raw = os.getenv(name, str(default)).strip()
-    
+
     try:
         return int(raw)  # Теперь преобразуем строку в целое число (int)
     # ValueError - исключение, если тип данных правильный, но значение не подходит 
@@ -76,42 +76,51 @@ def _get_int_env(name: str, default: int) -> int:
     except ValueError as e:
         raise ConfigError(f"Invalid integer for {name}: {raw!r}") from e
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True)  # Генерирует шаблонный код для класса Config
 class Config:
+    """
+    Класс конфигурации
+    """
+    # Вот эти поля нужны для создания экземпляра класса
+    # Если создавать экземпляр класса, то так config = Config(TELEGRAM_BOT_TOKEN, DATABASE_URL)
+    # Но на практике мы вызовем метод класса и все значения загрузятся автоматом: config = Config.load()
     TELEGRAM_BOT_TOKEN: str
     DATABASE_URL: str
 
-    # Optional settings (KISS defaults, aligned with README).
+    # Это опциональные поля
     CHECK_INTERVAL_MINUTES: int
     SUMMARY_MIN_LEN: int
     SUMMARY_MAX_LEN: int
     LOG_LEVEL: str
 
-    @classmethod
+    @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
-        # Do not override existing system environment variables.
+        # Загружает переменные из .env
+        # override=False — не перезаписывать переменные, которые уже есть в системном окружении
         load_dotenv(override=False)
 
-        telegram_bot_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-        database_url = (os.getenv("DATABASE_URL") or "").strip()
+        telegram_bot_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()  # Получаем переменную или пустую строку
+        database_url = (os.getenv("DATABASE_URL") or "").strip()  # strip() снова для обрезания пробелов
 
         missing: list[str] = []
-        if not telegram_bot_token:
+        if not telegram_bot_token:  # Если пустая строка или None
             missing.append("TELEGRAM_BOT_TOKEN")
         if not database_url:
             missing.append("DATABASE_URL")
-        if missing:
+        if missing:  # Если хоть одна из переменных отсутствует
             raise ConfigError(
                 "Missing required environment variable(s): "
                 + ", ".join(missing)
                 + ". Create a .env file or set them in the environment."
             )
 
+        # Получаем из .env или используем дефолт значения
         check_interval_minutes = _get_int_env("CHECK_INTERVAL_MINUTES", 15)
         summary_min_len = _get_int_env("SUMMARY_MIN_LEN", 140)
         summary_max_len = _get_int_env("SUMMARY_MAX_LEN", 280)
         log_level = os.getenv("LOG_LEVEL", "INFO").strip() or "INFO"
 
+        # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
             raise ConfigError("CHECK_INTERVAL_MINUTES must be > 0")
         if summary_min_len <= 0:
@@ -121,6 +130,7 @@ class Config:
         if summary_min_len > summary_max_len:
             raise ConfigError("SUMMARY_MIN_LEN must be <= SUMMARY_MAX_LEN")
 
+        # Возвращаем объект с вычисленными атрибутами
         return cls(
             TELEGRAM_BOT_TOKEN=telegram_bot_token,
             DATABASE_URL=database_url,
