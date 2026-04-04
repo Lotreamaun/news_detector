@@ -14,6 +14,7 @@ trafilatura==2.0.0          # парсинг текст статей
 
 # База данных:
 sqlalchemy==2.0.46
+aiosqlite==0.21.0           # драйвер async для SQLite (sqlite+aiosqlite://)
 
 # Асинхронные запросы ко всем источникам одновременно:
 aiohttp==3.13.3

@@ -31,11 +31,13 @@ ENV/
 
 # IDE
 .vscode/
+.cursor/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+docs/
 
 # Database
 *.db
