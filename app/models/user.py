@@ -1,7 +1,7 @@
 """Модель пользователя Telegram для рассылки и идентификации."""
 
 from datetime import datetime
-
+# TODO: Выяснить как работает func и для чего нужен 
 from sqlalchemy import (
     BigInteger,  # нужен для telegram_id, потому что это большие числа
     Boolean,  # 
@@ -34,5 +34,7 @@ class User(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        # если при создании записи не будет указано created_at, 
+        # установится значение по умолчанию — текущее время сервера БД
         server_default=func.now(),
     )
