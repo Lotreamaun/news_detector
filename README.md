@@ -28,7 +28,8 @@
 
 ```
 news_detector/
-├── .env                   # Переменные окружения
+├── .env                   # Переменные окружения (не в git)
+├── .env.example           # Шаблон переменных окружения
 ├── .gitignore             # Игнорируемые файлы
 ├── requirements.txt       # Зависимости Python
 ├── README.md              # Эта документация
@@ -116,7 +117,59 @@ news_detector/
 
 ## ⚙️ Запуск
 
-#TODO: Добавить инструкцию по запуску на локалхосте
+### Требования
+- **Python 3.14+** (асинхронный код, `aiosqlite`)
+- Токен Telegram-бота от [@BotFather](https://t.me/BotFather)
+- Ключ авторизации GigaChat (`GIGACHAT_AUTH_KEY`) — в личном кабинете на [developers.sber.ru](https://developers.sber.ru)
+
+### Шаги
+
+1. **Клонировать репозиторий и перейти в папку проекта:**
+   ```bash
+   git clone <url-репозитория>
+   cd news_detector
+   ```
+
+2. **Создать и активировать виртуальное окружение:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate   # macOS / Linux
+   # venv\Scripts\activate    # Windows (PowerShell)
+   ```
+
+3. **Установить зависимости:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Настроить переменные окружения:**
+   ```bash
+   cp .env.example .env
+   ```
+   Открыть `.env` и заполнить обязательные поля:
+   - `TELEGRAM_BOT_TOKEN` — токен от BotFather
+   - `DATABASE_URL` — оставить `sqlite+aiosqlite:///./data/news_detector.db` или изменить путь
+   - `GIGACHAT_AUTH_KEY` — ключ в формате `Basic <секретный_код>`
+   Остальные параметры можно оставить по умолчанию.
+
+5. **Создать папку для БД** (если `DATABASE_URL` ведёт в `./data`):
+   ```bash
+   mkdir -p data
+   ```
+
+6. **Запустить приложение:**
+   ```bash
+   python -m app.main
+   ```
+
+После старта бот поднимется, создаст таблицы в SQLite и начнёт обрабатывать команды.
+Логи пишутся в консоль и в файл `bot.log`.
+
+### Проверка конфигурации (без запуска бота)
+```bash
+python -c "from app.core.config import Config; print(Config.load())"
+```
+Команда выведет объект конфигурации или поднимет `ConfigError` с описанием проблемы.
 
 ## 🔧 Разработка
 
