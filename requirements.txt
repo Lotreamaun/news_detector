@@ -14,10 +14,14 @@ trafilatura==2.0.0          # парсинг текст статей
 
 # База данных:
 sqlalchemy==2.0.46
+greenlet==3.5.4              # обязателен для async-режима SQLAlchemy (greenlet_spawn)
 aiosqlite==0.21.0           # драйвер async для SQLite (sqlite+aiosqlite://)
 
 # Асинхронные запросы ко всем источникам одновременно:
 aiohttp==3.13.3
+
+# Поддержка SOCKS5-прокси для httpx (нужна PTB для TELEGRAM_PROXY_URL=socks5://...)
+socksio==1.0.0
 
 # Саммаризация
 sumy==0.11.0
