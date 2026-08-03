@@ -216,7 +216,13 @@ class GigaChatClient:
         return context
 
     async def _request_access_token(self) -> str:
-        if not self._config.auth_key:
+        auth_key = self._config.auth_key
+        # developers.sber.ru отдаёт ключ без префикса "Basic " — добавляем сами
+        if auth_key and not auth_key.startswith("Basic "):
+            auth_key = f"Basic {auth_key}"
+            logger.info("К GIGACHAT_AUTH_KEY автоматически добавлен префикс 'Basic '")
+
+        if not auth_key:
             raise GigaChatAuthError(
                 "GIGACHAT_AUTH_KEY не задан. Скопируйте .env.example в .env "
                 "и укажите ключ вида 'Basic <секретный_код>' "
@@ -230,7 +236,7 @@ class GigaChatClient:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
                 "RqUID": str(uuid.uuid4()),
-                "Authorization": self._config.auth_key,
+                "Authorization": auth_key,
             },
             data={"scope": self._config.scope},
         )
@@ -298,7 +304,17 @@ class GigaChatClient:
                 data=data,
                 json=json,
             ) as resp:
-                body = await resp.json(content_type=None)
+                try:
+                    body = await resp.json(content_type=None)
+                except ValueError as exc:
+                    # Не-JSON ответ (бывает при 400/401 на OAuth) — ловим,
+                    # чтобы не уронить хендлер молча
+                    text = await resp.text()
+                    raise GigaChatAPIError(
+                        f"Ответ от {url} не является JSON (HTTP {resp.status}): {text[:300]}",
+                        status=resp.status,
+                        retryable=resp.status in _RETRYABLE_STATUS,
+                    ) from exc
                 if resp.status >= 400:
                     retryable = resp.status in _RETRYABLE_STATUS
                     raise GigaChatAPIError(
@@ -314,6 +330,13 @@ class GigaChatClient:
         except asyncio.TimeoutError as exc:
             raise GigaChatAPIError(
                 f"Таймаут запроса {url} ({self._config.timeout}s)", retryable=True
+            ) from exc
+        except GigaChatAPIError:
+            raise
+        except Exception as exc:  # страхуюсь от неожиданных ошибок стека
+            logger.exception("Неожиданная ошибка при запросе %s %s", method, url)
+            raise GigaChatAPIError(
+                f"Неожиданная ошибка при запросе {url}: {exc}", retryable=True
             ) from exc
 
     async def _get_session(self) -> aiohttp.ClientSession:
