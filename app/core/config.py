@@ -50,6 +50,25 @@ from dotenv import load_dotenv
 class ConfigError(RuntimeError):  # Наследуется от встроенного класса RuntimeError
     """Появляется, когда переменные окружения в .env отсутствуют или задан не корректный тип данных."""
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    """
+    Читает булеву переменную окружения.
+
+    Признаются значения: 1, true, yes (любой регистр) - как True.
+    Все остальное (в т.ч. пустая строка) - как False.
+
+    Args:
+        name: название переменной
+        default: значение по умолчанию, если переменной нет
+
+    Returns:
+        Булево значение (bool)
+    """
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes"}
+
 # Подчеркивание перед названием - маркер "приватной функции", которую не надо вызывать за пределами модуля
 def _get_int_env(name: str, default: int) -> int:
     """
@@ -93,6 +112,12 @@ class Config:
     SUMMARY_MAX_LEN: int
     LOG_LEVEL: str
 
+    # GigaChat API (опциональные, используются только сервисом summarizer)
+    GIGACHAT_AUTH_KEY: str  # вида "Basic <секретный_код>"
+    GIGACHAT_SCOPE: str
+    GIGACHAT_MODEL: str
+    GIGACHAT_VERIFY_SSL: bool
+
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
         # Загружает переменные из .env
@@ -120,6 +145,17 @@ class Config:
         summary_max_len = _get_int_env("SUMMARY_MAX_LEN", 280)
         log_level = os.getenv("LOG_LEVEL", "INFO").strip() or "INFO"
 
+        # GigaChat: пустой ключ разрешен — клиент поднимет ошибку
+        # с понятным сообщением при первом использовании
+        gigachat_auth_key = os.getenv("GIGACHAT_AUTH_KEY", "").strip()
+        gigachat_scope = (
+            os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip() or "GIGACHAT_API_PERS"
+        )
+        gigachat_model = (
+            os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
+        )
+        gigachat_verify_ssl = _get_bool_env("GIGACHAT_VERIFY_SSL", False)
+
         # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
             raise ConfigError("CHECK_INTERVAL_MINUTES must be > 0")
@@ -138,4 +174,8 @@ class Config:
             SUMMARY_MIN_LEN=summary_min_len,
             SUMMARY_MAX_LEN=summary_max_len,
             LOG_LEVEL=log_level,
+            GIGACHAT_AUTH_KEY=gigachat_auth_key,
+            GIGACHAT_SCOPE=gigachat_scope,
+            GIGACHAT_MODEL=gigachat_model,
+            GIGACHAT_VERIFY_SSL=gigachat_verify_ssl,
         )
