@@ -118,6 +118,9 @@ class Config:
     GIGACHAT_MODEL: str
     GIGACHAT_VERIFY_SSL: bool
 
+    # Прокси для Telegram Bot API (если api.telegram.org недоступен напрямую)
+    TELEGRAM_PROXY_URL: str | None
+
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
         # Загружает переменные из .env
@@ -156,6 +159,8 @@ class Config:
         )
         gigachat_verify_ssl = _get_bool_env("GIGACHAT_VERIFY_SSL", False)
 
+        telegram_proxy_url = os.getenv("TELEGRAM_PROXY_URL", "").strip() or None
+
         # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
             raise ConfigError("CHECK_INTERVAL_MINUTES must be > 0")
@@ -178,4 +183,5 @@ class Config:
             GIGACHAT_SCOPE=gigachat_scope,
             GIGACHAT_MODEL=gigachat_model,
             GIGACHAT_VERIFY_SSL=gigachat_verify_ssl,
+            TELEGRAM_PROXY_URL=telegram_proxy_url,
         )
