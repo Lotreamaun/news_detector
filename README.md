@@ -115,6 +115,58 @@ news_detector/
 - **python-dotenv** - управление переменными окружения
 - **aiohttp** - асинхронные HTTP-запросы
 
+## ⚡ Быстрый запуск на локалхосте (личный чек-лист)
+
+Предполагается: macOS, Python 3.14+, репозиторий уже склонирован.
+
+1. **Создать и активировать виртуальное окружение:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+2. **Установить зависимости:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Настроить `.env`:**
+   ```bash
+   cp .env.example .env
+   ```
+   Заполнить обязательно:
+   - `TELEGRAM_BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
+   - `GIGACHAT_AUTH_KEY` — в формате `Basic <секретный_код>` (личный кабинет на [developers.sber.ru](https://developers.sber.ru))
+   - `DATABASE_URL` — оставить как в шаблоне (`./data/news_detector.db`)
+
+4. **Создать папку для БД** (если `DATABASE_URL` ведёт в `./data`):
+   ```bash
+   mkdir -p data
+   ```
+
+5. **Проверить конфигурацию без запуска бота:**
+   ```bash
+   python -c "from app.core.config import Config; print(Config.load())"
+   ```
+   Должен вывестись объект конфига, а не `ConfigError`.
+
+6. **Запустить:**
+   ```bash
+   python -m app.main
+   ```
+
+7. **Проверить в Telegram:**
+   - `/start` — регистрация пользователя в БД
+   - `/test` — smoke-тест GigaChat (токен, список моделей, ответ)
+
+8. **Остановить:** `Ctrl+C` — graceful shutdown, соединения с БД закрываются.
+
+> **Из РФ:** если бот не подключается к Telegram (`Timed out`, `NetworkError`) —
+> включить VPN или указать в `.env` рабочий прокси `TELEGRAM_PROXY_URL`
+> (формат и подводные камни — в разделе «⚙️ Запуск» ниже).
+
+Логи пишутся в консоль и в файл `bot.log` (`tail -f bot.log`).
+
 ## ⚙️ Запуск
 
 ### Требования
