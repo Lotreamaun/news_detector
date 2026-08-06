@@ -50,6 +50,9 @@ from dotenv import load_dotenv
 class ConfigError(RuntimeError):  # Наследуется от встроенного класса RuntimeError
     """Появляется, когда переменные окружения в .env отсутствуют или задан не корректный тип данных."""
 
+# Стандартный API списка документов pravo.gov.ru (JSON; PeriodType: daily/weekly/monthly)
+_DEFAULT_PRAVO_API_URL = "http://publication.pravo.gov.ru/api/Documents?PeriodType=daily"
+
 def _get_bool_env(name: str, default: bool) -> bool:
     """
     Читает булеву переменную окружения.
@@ -121,6 +124,13 @@ class Config:
     # Прокси для Telegram Bot API (если api.telegram.org недоступен напрямую)
     TELEGRAM_PROXY_URL: str | None
 
+    # API списка документов, который опрашивает планировщик
+    PRAVO_API_URL: str
+
+    # Логирование: файл (None — только консоль) и срок хранения при ротации
+    LOG_FILE: str | None
+    LOG_RETENTION_DAYS: int
+
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
         # Загружает переменные из .env
@@ -161,6 +171,13 @@ class Config:
 
         telegram_proxy_url = os.getenv("TELEGRAM_PROXY_URL", "").strip() or None
 
+        pravo_api_url = (
+            os.getenv("PRAVO_API_URL", "").strip()
+            or _DEFAULT_PRAVO_API_URL
+        )
+        log_file = os.getenv("LOG_FILE", "app.log").strip() or None
+        log_retention_days = _get_int_env("LOG_RETENTION_DAYS", 30)
+
         # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
             raise ConfigError("CHECK_INTERVAL_MINUTES must be > 0")
@@ -170,6 +187,8 @@ class Config:
             raise ConfigError("SUMMARY_MAX_LEN must be > 0")
         if summary_min_len > summary_max_len:
             raise ConfigError("SUMMARY_MIN_LEN must be <= SUMMARY_MAX_LEN")
+        if log_retention_days <= 0:
+            raise ConfigError("LOG_RETENTION_DAYS must be > 0")
 
         # Возвращаем объект с вычисленными атрибутами
         return cls(
@@ -184,4 +203,7 @@ class Config:
             GIGACHAT_MODEL=gigachat_model,
             GIGACHAT_VERIFY_SSL=gigachat_verify_ssl,
             TELEGRAM_PROXY_URL=telegram_proxy_url,
+            PRAVO_API_URL=pravo_api_url,
+            LOG_FILE=log_file,
+            LOG_RETENTION_DAYS=log_retention_days,
         )

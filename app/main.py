@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+from logging.handlers import TimedRotatingFileHandler
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler
@@ -16,16 +17,33 @@ from app.core.database import (
     init_database,
     init_db_schema,
 )
+from app.services.scheduler import check_legislation_updates
 
 logger = logging.getLogger(__name__)
 
 
 def _configure_logging(config: Config) -> None:
-    """Настраивает вывод логов в консоль (уровень из конфигурации)."""
-    logging.basicConfig(
-        level=config.LOG_LEVEL,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    """Консоль + файл (app.log) с суточной ротацией и хранением 30 дней."""
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    root = logging.getLogger()
+    root.setLevel(config.LOG_LEVEL)
+
+    console = logging.StreamHandler()
+    console.setLevel(config.LOG_LEVEL)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    if config.LOG_FILE:
+        file_handler = TimedRotatingFileHandler(
+            config.LOG_FILE,
+            when="midnight",  # ротация каждый день в полночь
+            backupCount=config.LOG_RETENTION_DAYS,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(config.LOG_LEVEL)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
 
 def _build_application(config: Config) -> Application:
@@ -64,6 +82,24 @@ async def _init_database_schema(config: Config) -> None:
     await init_db_schema()
 
 
+def _schedule_jobs(application: Application, config: Config) -> None:
+    """Регистрирует периодическую проверку RSS в JobQueue PTB."""
+    job_queue = application.job_queue
+    if job_queue is None:
+        logger.warning("JobQueue недоступен: периодическая проверка RSS не запущена")
+        return
+
+    interval_seconds = config.CHECK_INTERVAL_MINUTES * 60
+    # first=0 — первая проверка сразу после старта, чтобы быстро увидеть результат.
+    # Идемпотентность по external_id защищает от дублей при повторных запусках.
+    job_queue.run_repeating(
+        check_legislation_updates,
+        interval=interval_seconds,
+        first=0,
+    )
+    logger.info("Проверка RSS запланирована: каждые %d минут", config.CHECK_INTERVAL_MINUTES)
+
+
 def main() -> None:
     """Запускает бота: конфиг -> БД -> polling -> graceful shutdown."""
     config = Config.load()
@@ -74,6 +110,7 @@ def main() -> None:
     logger.info("Таблицы БД готовы")
 
     application = _build_application(config)
+    _schedule_jobs(application, config)
     # run_polling - блокирующий метод: сам создаёт event loop и обрабатывает
     # Ctrl+C. Поэтому его нельзя вызывать внутри asyncio.run.
     application.run_polling(allowed_updates=Update.ALL_TYPES)
