@@ -52,6 +52,7 @@ def _build_application(config: Config) -> Application:
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_shutdown(_on_shutdown)
+        .post_init(_run_initial_check)
     )
     if config.TELEGRAM_PROXY_URL:
         # Для РФ api.telegram.org часто блокируется, поэтому прокси
@@ -90,14 +91,33 @@ def _schedule_jobs(application: Application, config: Config) -> None:
         return
 
     interval_seconds = config.CHECK_INTERVAL_MINUTES * 60
-    # first=0 — первая проверка сразу после старта, чтобы быстро увидеть результат.
-    # Идемпотентность по external_id защищает от дублей при повторных запусках.
+    # first не задаём: в PTB/APScheduler run_repeating(first=0) НЕ запускает
+    # job мгновенно (документированная ловушка). Первый прогон сразу после
+    # старта делает _run_initial_check, дальше — по интервалу.
     job_queue.run_repeating(
         check_legislation_updates,
         interval=interval_seconds,
-        first=0,
+        name="check_legislation_updates",
     )
     logger.info("Проверка RSS запланирована: каждые %d минут", config.CHECK_INTERVAL_MINUTES)
+
+
+async def _run_initial_check(application: Application) -> None:
+    """Прогоняет проверку публикаций сразу после старта бота (post_init).
+
+    PTB/APScheduler не умеют запускать run_repeating мгновенно (first=0 не
+    работает — документированная ловушка), поэтому первый прогон делаем
+    вручную через job.run. Идемпотентность по external_id защищает от дублей.
+    """
+    job_queue = application.job_queue
+    if job_queue is None:
+        return
+    job = job_queue.get_jobs_by_name("check_legislation_updates")
+    if not job:
+        logger.warning("Job проверки публикаций не найден — первый прогон пропущен")
+        return
+    logger.info("Первый прогон проверки публикаций сразу после старта")
+    await job[0].run(application)
 
 
 def main() -> None:
