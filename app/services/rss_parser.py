@@ -53,6 +53,10 @@ _HEADERS = {"User-Agent": "news_detector/0.1 (+legal-bot)"}
 # Заглушка в redtext, когда текст редакции ещё не подготовлен
 _REDTEXT_NOT_READY_MARKER = "Подготовка текста редакции"
 
+# GUID типа документа «Федеральный конституционный закон» в справочнике
+# publication.pravo.gov.ru (тот же идентификатор, что documentTypeId в API).
+_FKZ_DOCUMENT_TYPE_ID = "93273da3-3133-4acf-96c2-4adc1ae70e19"
+
 # Промпт для OCR-фоллбэка: просим выписать весь текст закона со сканов
 _OCR_PROMPT = (
     "Перед тобой скан нормативного правового акта. Распознай и выведи "
@@ -188,11 +192,11 @@ def is_important(entry: FeedEntry) -> bool:
     """
     «Важные» акты, которым полагается OCR-фоллбэк при отсутствии текста.
 
-    Пока список пуст — возвращаем ``False`` всегда. TODO: определить перечень
-    по ``document_type_id`` / ``signatory_authority_id`` (напр. ФКЗ и значимые
-    ФЗ), см. Этап 4 фильтрации в docs/PLAN.md.
+    Сейчас важными считаются федеральные конституционные законы (ФКЗ).
+    TODO: расширить перечень (значимые ФЗ, поправки к Конституции) по
+    document_type_id / signatory_authority_id — см. Этап 4 в docs/PLAN.md.
     """
-    return False
+    return entry.document_type_id == _FKZ_DOCUMENT_TYPE_ID
 
 
 async def ocr_document_text(
