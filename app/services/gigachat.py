@@ -150,11 +150,14 @@ class GigaChatClient:
             model: имя модели (по умолчанию берется из конфигурации).
             temperature: «креативность» ответа (0.0–1.0).
             max_tokens: максимальное число токенов в ответе.
-            attachments: id файлов из хранилища GigaChat (POST /files),
-                которые модель должна учесть при генерации.
-            function_call: режим функций. При attachments по умолчанию
-                выставляется ``"auto"``, иначе модель использует только
-                первый файл из списка.
+            attachments: id файлов из хранилища GigaChat (POST /files).
+                Передаются массивом строк внутри последнего user-сообщения
+                (формат из доки «Работа с файлами»); чтобы модель учла файлы,
+                для текстовых документов сервер сам вызывает встроенную
+                функцию ``get_file_content``.
+            function_call: режим функций (``"auto"``, ``"none"`` или имя).
+                При attachments по умолчанию выставляется ``"auto"`` —
+                включается автоматический режим чтения приложенных файлов.
 
         Returns:
             Текст ответа модели.
@@ -173,8 +176,11 @@ class GigaChatClient:
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         if attachments:
-            payload["attachments"] = [{"id": file_id} for file_id in attachments]
             payload["function_call"] = function_call or "auto"
+            if messages:
+                last = dict(messages[-1])
+                last["attachments"] = list(attachments)
+                payload["messages"] = [*messages[:-1], last]
 
         data = await self._request_json(
             "POST",
