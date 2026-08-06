@@ -139,6 +139,8 @@ class GigaChatClient:
         model: str | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        attachments: list[str] | None = None,
+        function_call: str | None = None,
     ) -> str:
         """
         Отправляет диалог в chat-completions и возвращает текст ответа.
@@ -148,6 +150,11 @@ class GigaChatClient:
             model: имя модели (по умолчанию берется из конфигурации).
             temperature: «креативность» ответа (0.0–1.0).
             max_tokens: максимальное число токенов в ответе.
+            attachments: id файлов из хранилища GigaChat (POST /files),
+                которые модель должна учесть при генерации.
+            function_call: режим функций. При attachments по умолчанию
+                выставляется ``"auto"``, иначе модель использует только
+                первый файл из списка.
 
         Returns:
             Текст ответа модели.
@@ -165,6 +172,9 @@ class GigaChatClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if attachments:
+            payload["attachments"] = [{"id": file_id} for file_id in attachments]
+            payload["function_call"] = function_call or "auto"
 
         data = await self._request_json(
             "POST",
@@ -177,6 +187,74 @@ class GigaChatClient:
             json=payload,
         )
         return self._extract_reply(data)
+
+    async def upload_file(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        mime: str,
+        purpose: str = "general",
+    ) -> str:
+        """
+        Загружает файл в хранилище GigaChat и возвращает его id.
+
+        Id можно передавать в ``attachments`` запроса ``complete``.
+        Использовать файл может только тот пользователь, кто его загрузил
+        (по умолчанию — Client ID проекта).
+
+        Args:
+            data: содержимое файла.
+            filename: имя файла (например, ``0001202608040001.pdf``).
+            mime: MIME-тип (например, ``application/pdf``).
+            purpose: назначение файла; ``"general"`` — для генераций.
+
+        Returns:
+            Идентификатор загруженного файла.
+        """
+        token = await self.get_access_token()
+
+        form = aiohttp.FormData()
+        form.add_field("purpose", purpose)
+        form.add_field("file", data, filename=filename, content_type=mime)
+
+        body = await self._request_json(
+            "POST",
+            f"{self._config.api_base_url}/files",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            data=form,
+        )
+        file_id = body.get("id")
+        if not file_id:
+            raise GigaChatAPIError(f"Ответ POST /files не содержит id: {body}")
+        logger.info("Файл %s загружен в хранилище GigaChat (file=%s)", filename, file_id)
+        return str(file_id)
+
+    async def delete_file(self, file_id: str) -> None:
+        """
+        Удаляет файл из хранилища GigaChat (гигиена после OCR).
+
+        Args:
+            file_id: идентификатор файла, полученный при загрузке.
+
+        Raises:
+            GigaChatAuthError: не задан ключ или не удалось получить токен.
+            GigaChatAPIError: ошибка API.
+        """
+        token = await self.get_access_token()
+        await self._request_json(
+            "POST",
+            f"{self._config.api_base_url}/files/{file_id}/delete",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            expect_json=False,
+        )
+        logger.info("Файл %s удалён из хранилища GigaChat", file_id)
 
     async def get_models(self) -> list[str]:
         """Возвращает список доступных моделей (для отладки и TODO-проверок)."""
@@ -265,15 +343,21 @@ class GigaChatClient:
         url: str,
         *,
         headers: dict[str, str] | None = None,
-        data: dict[str, str] | None = None,
+        data: Any | None = None,
         json: Any | None = None,
+        expect_json: bool = True,
     ) -> dict[str, Any]:
         """Выполняет запрос с ретраями на временные ошибки."""
         last_error: GigaChatError | None = None
         for attempt in range(self._config.max_retries):
             try:
                 return await self._request_json_once(
-                    method, url, headers=headers, data=data, json=json
+                    method,
+                    url,
+                    headers=headers,
+                    data=data,
+                    json=json,
+                    expect_json=expect_json,
                 )
             except GigaChatError as exc:
                 last_error = exc
@@ -292,8 +376,9 @@ class GigaChatClient:
         url: str,
         *,
         headers: dict[str, str] | None = None,
-        data: dict[str, str] | None = None,
+        data: Any | None = None,
         json: Any | None = None,
+        expect_json: bool = True,
     ) -> dict[str, Any]:
         session = await self._get_session()
         try:
@@ -307,6 +392,10 @@ class GigaChatClient:
                 try:
                     body = await resp.json(content_type=None)
                 except ValueError as exc:
+                    # Некоторые эндпоинты (напр. удаление файла) возвращают
+                    # пустое тело с 200 — для них expect_json=False.
+                    if not expect_json and resp.status < 400:
+                        return {}
                     # Не-JSON ответ (бывает при 400/401 на OAuth) — ловим,
                     # чтобы не уронить хендлер молча
                     text = await resp.text()
