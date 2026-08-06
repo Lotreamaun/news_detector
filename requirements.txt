@@ -8,10 +8,6 @@
 python-telegram-bot[job-queue]==22.6
 python-dotenv==1.2.1        # для загрузки переменной окружения
 
-# Парсинг:
-feedparser==6.0.12          # парсит RSS и даты
-trafilatura==2.0.0          # парсинг текст статей
-
 # База данных:
 sqlalchemy==2.0.46
 greenlet==3.5.4              # обязателен для async-режима SQLAlchemy (greenlet_spawn)
