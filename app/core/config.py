@@ -113,6 +113,7 @@ class Config:
     CHECK_INTERVAL_MINUTES: int
     SUMMARY_MIN_LEN: int
     SUMMARY_MAX_LEN: int
+    FORCE_SUMMARIZE_MONTHLY_LIMIT: int
     LOG_LEVEL: str
 
     # GigaChat API (опциональные, используются только сервисом summarizer)
@@ -156,6 +157,9 @@ class Config:
         check_interval_minutes = _get_int_env("CHECK_INTERVAL_MINUTES", 15)
         summary_min_len = _get_int_env("SUMMARY_MIN_LEN", 140)
         summary_max_len = _get_int_env("SUMMARY_MAX_LEN", 280)
+        force_summarize_monthly_limit = _get_int_env(
+            "FORCE_SUMMARIZE_MONTHLY_LIMIT", 10
+        )
         log_level = os.getenv("LOG_LEVEL", "INFO").strip() or "INFO"
 
         # GigaChat: пустой ключ разрешен — клиент поднимет ошибку
@@ -187,6 +191,8 @@ class Config:
             raise ConfigError("SUMMARY_MAX_LEN must be > 0")
         if summary_min_len > summary_max_len:
             raise ConfigError("SUMMARY_MIN_LEN must be <= SUMMARY_MAX_LEN")
+        if force_summarize_monthly_limit <= 0:
+            raise ConfigError("FORCE_SUMMARIZE_MONTHLY_LIMIT must be > 0")
         if log_retention_days <= 0:
             raise ConfigError("LOG_RETENTION_DAYS must be > 0")
 
@@ -197,6 +203,7 @@ class Config:
             CHECK_INTERVAL_MINUTES=check_interval_minutes,
             SUMMARY_MIN_LEN=summary_min_len,
             SUMMARY_MAX_LEN=summary_max_len,
+            FORCE_SUMMARIZE_MONTHLY_LIMIT=force_summarize_monthly_limit,
             LOG_LEVEL=log_level,
             GIGACHAT_AUTH_KEY=gigachat_auth_key,
             GIGACHAT_SCOPE=gigachat_scope,
