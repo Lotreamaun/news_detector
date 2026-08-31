@@ -7,9 +7,17 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 
 from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
-from app.bot.handlers import help_command, latest, start, test_gigachat
+from app.bot.handlers import (
+    force_summarize,
+    help_command,
+    latest,
+    notify_me,
+    start,
+    summary_command,
+    test_gigachat,
+)
 from app.core.config import Config
 from app.core.database import (
     close_database,
@@ -69,6 +77,11 @@ def _build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("test", test_gigachat))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("notify_me", notify_me))
+    application.add_handler(CommandHandler("summary", summary_command))
+    application.add_handler(
+        CallbackQueryHandler(force_summarize, pattern=r"^force_sum:summary:")
+    )
 
     return application
 
@@ -115,6 +128,8 @@ async def _register_commands(application: Application) -> None:
     commands = [
         BotCommand("start", "Регистрация пользователя"),
         BotCommand("latest", "Последние обработанные законы"),
+        BotCommand("summary", "Принудительно сделать саммари закона"),
+        BotCommand("notify_me", "Отправить тестовое уведомление с кнопкой"),
         BotCommand("test", "Проверка связи с GigaChat API"),
         BotCommand("help", "Справка по командам"),
     ]

@@ -3,19 +3,23 @@ Telegram-обработчики команд бота.
 """
 
 import logging
+from datetime import datetime
 
 from sqlalchemy import desc, select
 from telegram import Update
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 
-from app.models import Article, User
+from app.models import Article, SummarizationUsage, User
 from app.services.gigachat import (
     GigaChatAPIError,
     GigaChatAuthError,
     GigaChatClient,
     GigaChatConfig,
 )
+from app.services.rss_parser import get_legal_text, ocr_document_text
+from app.services.scheduler import FORCE_SUMMARIZE_PREFIX, _build_notification
+from app.services.summarizer import Summarizer, SummarizerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +28,8 @@ HELP_TEXT = (
     "/start — регистрация пользователя\n"
     "/test — проверка связи с GigaChat API\n"
     "/latest — последние обработанные законы\n"
+    "/summary <external_id> — принудительно сделать саммари закона\n"
+    "/notify_me <external_id> — отправить тестовое уведомление с кнопкой\n"
     "/help — эта справка"
 )
 
@@ -143,4 +149,305 @@ async def test_gigachat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Токен получен: {token[:12]}...\n"
         f"Доступно моделей: {len(models)}\n"
         f"Тестовый ответ модели: {reply[:200]}"
+    )
+
+
+async def _get_or_create_user(
+    session_maker, telegram_id: int, update: Update
+) -> User | None:
+    """Возвращает пользователя по telegram_id, регистрируя его при отсутствии."""
+    async with session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if user is None:
+            username = update.effective_user.username if update.effective_user else None
+            user = User(telegram_id=telegram_id, username=username)
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+    return user
+
+
+async def _deliver(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+    message: object | None,
+    text: str,
+    status_message: object | None = None,
+) -> None:
+    """Шлёт текст результата: для кнопки — правит исходное сообщение, иначе — новое.
+
+    Если задан status_message (временный индикатор «Саммари в процессе создания…»),
+    он удаляется перед отправкой результата.
+    """
+    if message is not None:
+        await context.bot.edit_message_text(
+            chat_id=message.chat_id, message_id=message.message_id, text=text
+        )
+    else:
+        if status_message is not None:
+            try:
+                await status_message.delete()
+            except Exception:
+                logger.exception("Не удалось удалить индикатор саммаризации")
+        await context.bot.send_message(chat_id=user.telegram_id, text=text)
+
+
+async def _summarize_and_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+    external_id: str,
+    message: object | None = None,
+    status_message: object | None = None,
+) -> None:
+    """
+    Выполняет принудительную саммаризацию и доставляет результат пользователю.
+
+    Проверяет месячный лимит, получает текст (при отсутствии — OCR через
+    GigaChat), формирует саммари, обновляет Article и инкрементирует счётчик.
+    При лимите/сбое отправляет пользователю понятное сообщение.
+
+    Args:
+        message: если задано (кнопка — исходное сообщение с кнопкой), результат
+            правится в нём (кнопка исчезает); иначе шлётся новое сообщение.
+        status_message: временный индикатор «Саммари в процессе создания…»,
+            удаляется после доставки результата (используется для команды).
+    """
+    config = context.bot_data["config"]
+    session_maker = _session_maker(context)
+
+    month = datetime.now().strftime("%Y-%m")
+    limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
+
+    async with session_maker() as session:
+        usage = await session.scalar(
+            select(SummarizationUsage).where(
+                SummarizationUsage.user_id == user.id,
+                SummarizationUsage.month == month,
+            )
+        )
+        if usage is not None and usage.count >= limit:
+            await _deliver(
+                context,
+                user,
+                message,
+                (
+                    f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
+                    "Попробуйте в следующем месяце."
+                ),
+                status_message=status_message,
+            )
+            return
+
+    # Переиспользуем уже сохранённое саммари, если оно есть (без повторного LLM).
+    async with session_maker() as session:
+        cached = await session.scalar(
+            select(Article).where(Article.external_id == external_id)
+        )
+    if cached is not None and cached.summary:
+        await _deliver(
+            context,
+            user,
+            message,
+            f"{cached.title or external_id}\n\n{cached.summary}\n\n{cached.url}",
+            status_message=status_message,
+        )
+        return
+
+    # TODO: Рассмотреть платный тариф — бесконечная принудительная саммаризация
+
+    try:
+        text = await get_legal_text(external_id)
+        if not text:
+            logger.info(
+                "Текст для %s отсутствует — используем OCR через GigaChat",
+                external_id,
+            )
+            async with GigaChatClient(
+                GigaChatConfig(
+                    auth_key=config.GIGACHAT_AUTH_KEY,
+                    verify_ssl=config.GIGACHAT_VERIFY_SSL,
+                )
+            ) as ocr_client:
+                text = await ocr_document_text(external_id, client=ocr_client)
+
+        if not text:
+            await _deliver(
+                context,
+                user,
+                message,
+                "Не удалось получить текст закона для саммаризации.",
+                status_message=status_message,
+            )
+            return
+
+        async with Summarizer(
+            SummarizerConfig(
+                auth_key=config.GIGACHAT_AUTH_KEY,
+                model=config.GIGACHAT_MODEL,
+                min_len=config.SUMMARY_MIN_LEN,
+                max_len=config.SUMMARY_MAX_LEN,
+                verify_ssl=config.GIGACHAT_VERIFY_SSL,
+            )
+        ) as summarizer:
+            summary = await summarizer.summarize(text)
+
+        async with session_maker() as session:
+            article = await session.scalar(
+                select(Article).where(Article.external_id == external_id)
+            )
+            if article is not None:
+                article.original_text = text
+                article.summary = summary
+                await session.commit()
+                await session.refresh(article)
+                title = article.title
+                url = article.url
+            else:
+                title = external_id
+                url = f"http://publication.pravo.gov.ru/document/{external_id}"
+
+            usage = await session.scalar(
+                select(SummarizationUsage).where(
+                    SummarizationUsage.user_id == user.id,
+                    SummarizationUsage.month == month,
+                )
+            )
+            if usage is None:
+                usage = SummarizationUsage(user_id=user.id, month=month, count=0)
+                session.add(usage)
+            usage.count += 1
+            await session.commit()
+
+        await _deliver(
+            context,
+            user,
+            message,
+            f"{title}\n\n{summary}\n\n{url}",
+            status_message=status_message,
+        )
+    except Exception:
+        logger.exception("Ошибка принудительной саммаризации %s", external_id)
+        await _deliver(
+            context,
+            user,
+            message,
+            "Не удалось сделать саммари. Попробуйте позже.",
+            status_message=status_message,
+        )
+
+
+async def force_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback-обработчик кнопки «Сделать саммари»."""
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+    await query.answer()
+
+    session_maker = _session_maker(context)
+    telegram_id = update.effective_user.id
+
+    data = query.data or ""
+    if not data.startswith(FORCE_SUMMARIZE_PREFIX):
+        await query.message.reply_text("Неизвестная команда кнопки")
+        return
+    external_id = data[len(FORCE_SUMMARIZE_PREFIX):].strip()
+    if not external_id:
+        await query.message.reply_text("Не удалось определить документ")
+        return
+
+    user = await _get_or_create_user(session_maker, telegram_id, update)
+    if user is None:
+        return
+
+    if query.message is not None:
+        await query.message.edit_text(
+            "⏳ Саммари в процессе создания…", reply_markup=None
+        )
+    await _summarize_and_reply(context, user, external_id, message=query.message)
+
+
+async def notify_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /notify_me <external_id>: шлёт уведомление с кнопкой по закону из БД."""
+    if update.message is None:
+        return
+    session_maker = _session_maker(context)
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Использование: /notify_me <external_id или ссылка>\n"
+            "Например: /notify_me 0001202608060001"
+        )
+        return
+    external_id = _resolve_external_id(args[0])
+    if external_id is None:
+        await update.message.reply_text(
+            "Не удалось определить external_id. Укажите id или ссылку правового портала."
+        )
+        return
+
+    async with session_maker() as session:
+        article = await session.scalar(
+            select(Article).where(Article.external_id == external_id)
+        )
+
+    if article is None:
+        await update.message.reply_text(
+            f"Закон с external_id={external_id} не найден в базе."
+        )
+        return
+
+    text, reply_markup = _build_notification(article)
+    if update.effective_user is None:
+        return
+    await context.bot.send_message(
+        chat_id=update.effective_user.id, text=text, reply_markup=reply_markup
+    )
+
+
+def _resolve_external_id(value: str) -> str | None:
+    """Извлекает external_id из голого id или из ссылки правового портала."""
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("http://") or value.startswith("https://"):
+        path = value.split("?")[0].split("#")[0].rstrip("/")
+        last = path.rsplit("/", 1)[-1]
+        return last if last else None
+    if "/" in value or value.lower().startswith("http"):
+        return None
+    return value
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /summary <id или ссылка>: принудительная саммаризация закона."""
+    if update.message is None or update.effective_user is None:
+        return
+    session_maker = _session_maker(context)
+    telegram_id = update.effective_user.id
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Использование: /summary <external_id или ссылка>\n"
+            "Например: /summary 0001202608060001\n"
+            "или /summary http://publication.pravo.gov.ru/document/0001202608060001"
+        )
+        return
+    external_id = _resolve_external_id(args[0])
+    if external_id is None:
+        await update.message.reply_text(
+            "Не удалось определить external_id. Укажите id или ссылку правового портала."
+        )
+        return
+
+    user = await _get_or_create_user(session_maker, telegram_id, update)
+    if user is None:
+        return
+
+    status_message = None
+    if update.message is not None:
+        status_message = await update.message.reply_text("⏳ Саммари в процессе создания…")
+    await _summarize_and_reply(
+        context, user, external_id, status_message=status_message
     )

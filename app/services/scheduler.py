@@ -20,6 +20,7 @@ import logging
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from app.models import Article, User
@@ -34,6 +35,9 @@ from app.services.rss_parser import (
 from app.services.summarizer import Summarizer, SummarizerConfig
 
 logger = logging.getLogger(__name__)
+
+# Префикс callback_data для кнопки «Сделать саммари»
+FORCE_SUMMARIZE_PREFIX = "force_sum:summary:"
 
 
 async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -163,11 +167,13 @@ async def _notify_users(context, session_maker, article: Article) -> None:
         logger.debug("Активных пользователей для рассылки нет")
         return
 
-    message = _build_notification(article)
+    message, reply_markup = _build_notification(article)
     sent = 0
     for user in users:
         try:
-            await context.bot.send_message(chat_id=user.telegram_id, text=message)
+            await context.bot.send_message(
+                chat_id=user.telegram_id, text=message, reply_markup=reply_markup
+            )
             sent += 1
         except Exception:
             logger.warning(
@@ -178,9 +184,25 @@ async def _notify_users(context, session_maker, article: Article) -> None:
     logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
 
 
-def _build_notification(article: Article) -> str:
-    """Формирует текст уведомления; без саммари — fallback со ссылкой."""
+def _build_notification(article: Article) -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует текст уведомления и кнопку «Сделать саммари»."""
     if article.summary:
-        return f"{article.title}\n\n{article.summary}\n\n{article.url}"
-    # Fallback (vision.md): GigaChat недоступен или нет текста — ссылка на оригинал
-    return f"{article.title}\n\nНе удалось проанализировать этот закон. Оригинал: {article.url}"
+        text = f"{article.title}\n\n{article.summary}\n\n{article.url}"
+    else:
+        # Fallback (vision.md): GigaChat недоступен или нет текста — ссылка на оригинал
+        text = (
+            f"{article.title}\n\n"
+            f"Не удалось проанализировать этот закон. Оригинал: {article.url}"
+        )
+
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Сделать саммари",
+                    callback_data=f"{FORCE_SUMMARIZE_PREFIX}{article.external_id}",
+                )
+            ]
+        ]
+    )
+    return text, markup
