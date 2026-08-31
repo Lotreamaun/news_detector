@@ -6,10 +6,10 @@ import asyncio
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler
 
-from app.bot.handlers import start, test_gigachat
+from app.bot.handlers import help_command, latest, start, test_gigachat
 from app.core.config import Config
 from app.core.database import (
     close_database,
@@ -52,7 +52,7 @@ def _build_application(config: Config) -> Application:
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_shutdown(_on_shutdown)
-        .post_init(_run_initial_check)
+        .post_init(_post_init)
     )
     if config.TELEGRAM_PROXY_URL:
         # Для РФ api.telegram.org часто блокируется, поэтому прокси
@@ -67,6 +67,8 @@ def _build_application(config: Config) -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_gigachat))
+    application.add_handler(CommandHandler("latest", latest))
+    application.add_handler(CommandHandler("help", help_command))
 
     return application
 
@@ -100,6 +102,27 @@ def _schedule_jobs(application: Application, config: Config) -> None:
         name="check_legislation_updates",
     )
     logger.info("Проверка RSS запланирована: каждые %d минут", config.CHECK_INTERVAL_MINUTES)
+
+
+async def _post_init(application: Application) -> None:
+    """post_init: регистрирует список команд и запускает первый прогон проверки."""
+    await _register_commands(application)
+    await _run_initial_check(application)
+
+
+async def _register_commands(application: Application) -> None:
+    """Регистрирует список команд бота (видно при наборе '/' в чате)."""
+    commands = [
+        BotCommand("start", "Регистрация пользователя"),
+        BotCommand("latest", "Последние обработанные законы"),
+        BotCommand("test", "Проверка связи с GigaChat API"),
+        BotCommand("help", "Справка по командам"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("Список команд зарегистрирован")
+    except Exception:
+        logger.exception("Не удалось зарегистрировать список команд")
 
 
 async def _run_initial_check(application: Application) -> None:

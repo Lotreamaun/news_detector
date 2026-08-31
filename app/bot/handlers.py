@@ -4,11 +4,12 @@ Telegram-обработчики команд бота.
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from telegram import Update
+from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 
-from app.models import User
+from app.models import Article, User
 from app.services.gigachat import (
     GigaChatAPIError,
     GigaChatAuthError,
@@ -17,6 +18,14 @@ from app.services.gigachat import (
 )
 
 logger = logging.getLogger(__name__)
+
+HELP_TEXT = (
+    "Доступные команды:\n"
+    "/start — регистрация пользователя\n"
+    "/test — проверка связи с GigaChat API\n"
+    "/latest — последние обработанные законы\n"
+    "/help — эта справка"
+)
 
 
 def _session_maker(context: ContextTypes.DEFAULT_TYPE):
@@ -50,6 +59,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Сейчас сервис в разработке. Доступные команды:\n"
         "/start — регистрация\n"
         "/test — проверка связи с GigaChat API"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /help: отправляет справку по командам."""
+    if update.message is None:
+        return
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /latest: показывает последние обработанные законы."""
+    if update.message is None:
+        return
+
+    async with _session_maker(context)() as session:
+        articles = (
+            await session.scalars(
+                select(Article).order_by(Article.id.desc()).limit(10)
+            )
+        ).all()
+
+    if not articles:
+        await update.message.reply_text("Пока нет обработанных законов")
+        return
+
+    lines: list[str] = []
+    for i, article in enumerate(articles, 1):
+        title = escape_markdown(article.title, version=2)
+        link = article.url
+        block = f"*{i}*\\. {title}\n[Исходный текст]({link})"
+        if article.summary:
+            summary = escape_markdown(article.summary[:200], version=2)
+            block += f"\n_{summary}_"
+        lines.append(block)
+
+    await update.message.reply_text(
+        "\n\n".join(lines), parse_mode="MarkdownV2"
     )
 
 
