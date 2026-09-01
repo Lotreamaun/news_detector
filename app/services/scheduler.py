@@ -20,7 +20,7 @@ import logging
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
@@ -171,7 +171,9 @@ async def _notify_users(context, session_maker, article: Article) -> None:
         logger.debug("Активных пользователей для рассылки нет")
         return
 
-    message, reply_markup = _build_notification(article)
+    message, reply_markup = _build_notification(
+        article, context.bot_data["config"].WEBAPP_URL
+    )
     sent = 0
     for user in users:
         try:
@@ -191,8 +193,13 @@ async def _notify_users(context, session_maker, article: Article) -> None:
     logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
 
 
-def _build_notification(article: Article) -> tuple[str, InlineKeyboardMarkup]:
-    """Формирует MarkdownV2-текст уведомления и кнопку «Сделать саммари»."""
+def _build_notification(
+    article: Article, webapp_url: str | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует MarkdownV2-текст уведомления и кнопки.
+
+    Добавляет кнопку «Полный текст» (Mini-App), если передан webapp_url.
+    """
     title_clean = _normalize_text(article.title) or article.title
     title_esc = escape_markdown(title_clean, version=2)
     if article.summary:
@@ -202,21 +209,32 @@ def _build_notification(article: Article) -> tuple[str, InlineKeyboardMarkup]:
     else:
         # Fallback (vision.md): GigaChat недоступен или нет текста — ссылка на оригинал
         fallback = escape_markdown(
-            "Содержание этого закона пока не доступно в текстовом формате. " \
-            "Откройте оригинал на портале или запросите саммари через бота.", version=2
+            "Содержание этого закона пока не доступно в текстовом формате. "
+            "Откройте оригинал на портале или запросите саммари через бота.",
+            version=2,
         )
         body = f"*{title_esc}*\n\n_{fallback}_"
     url_esc = escape_markdown(article.url, version=2)
     text = f"{body}\n\n[Читать на портале]({url_esc})"
 
-    markup = InlineKeyboardMarkup(
+    buttons: list[list[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(
+                "Сделать саммари",
+                callback_data=f"{FORCE_SUMMARIZE_PREFIX}{article.external_id}",
+            )
+        ]
+    ]
+    # Кнопка «Полный текст» только после саммари (важный закон — по умолчанию, иначе после принудительной)
+    if webapp_url and article.summary:
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    "Сделать саммари",
-                    callback_data=f"{FORCE_SUMMARIZE_PREFIX}{article.external_id}",
+                    "📖 Полный текст",
+                    web_app=WebAppInfo(
+                        url=f"{webapp_url.rstrip('/')}/app?external_id={article.external_id}"
+                    ),
                 )
             ]
-        ]
-    )
-    return text, markup
+        )
+    return text, InlineKeyboardMarkup(buttons)

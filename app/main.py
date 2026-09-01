@@ -13,6 +13,7 @@ from app.bot.handlers import (
     force_summarize,
     help_command,
     latest,
+    myid_command,
     notify_me,
     start,
     summary_command,
@@ -77,6 +78,7 @@ def _build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("test", test_gigachat))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("notify_me", notify_me))
     application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(
@@ -87,7 +89,13 @@ def _build_application(config: Config) -> Application:
 
 
 async def _on_shutdown(application: Application) -> None:
-    """Закрывает пул соединений БД при остановке (graceful shutdown)."""
+    """Закрывает пул соединений БД и останавливает WebApp (graceful shutdown)."""
+    try:
+        from app.webapp import stop_webapp
+
+        await stop_webapp()
+    except Exception:
+        logger.exception("Ошибка остановки WebApp")
     await close_database()
     logger.info("Соединения с БД закрыты")
 
@@ -118,9 +126,22 @@ def _schedule_jobs(application: Application, config: Config) -> None:
 
 
 async def _post_init(application: Application) -> None:
-    """post_init: регистрирует список команд и запускает первый прогон проверки."""
+    """post_init: регистрирует список команд, запускает WebApp и первый прогон проверки."""
     await _register_commands(application)
+    await _start_webapp(application)
     await _run_initial_check(application)
+
+
+async def _start_webapp(application: Application) -> None:
+    """Запускает HTTP-сервер WebApp (если настроен)."""
+    config = application.bot_data["config"]
+    session_maker = application.bot_data["session_maker"]
+    try:
+        from app.webapp import start_webapp
+
+        await start_webapp(config.WEBAPP_HOST, config.WEBAPP_PORT, session_maker)
+    except Exception:
+        logger.exception("Не удалось запустить WebApp")
 
 
 async def _register_commands(application: Application) -> None:
@@ -130,6 +151,7 @@ async def _register_commands(application: Application) -> None:
         BotCommand("latest", "Последние обработанные законы"),
         BotCommand("summary", "Принудительно сделать саммари закона"),
         BotCommand("notify_me", "Отправить тестовое уведомление с кнопкой"),
+        BotCommand("myid", "Показать свой chat_id"),
         BotCommand("test", "Проверка связи с GigaChat API"),
         BotCommand("help", "Справка по командам"),
     ]

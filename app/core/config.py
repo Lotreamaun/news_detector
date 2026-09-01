@@ -98,6 +98,28 @@ def _get_int_env(name: str, default: int) -> int:
     except ValueError as e:
         raise ConfigError(f"Invalid integer for {name}: {raw!r}") from e
 
+
+def _get_int_list_env(name: str) -> tuple[int, ...]:
+    """Читает список telegram chat_id из переменной окружения (через запятую)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        # fallback: одиночный ADMIN_CHAT_ID для удобства
+        single = os.getenv("ADMIN_CHAT_ID", "").strip()
+        if single:
+            raw = single
+    if not raw:
+        return ()
+    ids: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError as e:
+            raise ConfigError(f"Invalid integer in {name}: {part!r}") from e
+    return tuple(ids)
+
 @dataclass(frozen=True, slots=True)  # Генерирует шаблонный код для класса Config
 class Config:
     """
@@ -131,6 +153,14 @@ class Config:
     # Логирование: файл (None — только консоль) и срок хранения при ротации
     LOG_FILE: str | None
     LOG_RETENTION_DAYS: int
+
+    # WebApp (Telegram Mini-App) для просмотра полного текста закона
+    WEBAPP_HOST: str
+    WEBAPP_PORT: int
+    WEBAPP_URL: str
+
+    # Админы с безлимитными саммари (для тестирования)
+    ADMIN_CHAT_IDS: tuple[int, ...]
 
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
@@ -182,6 +212,11 @@ class Config:
         log_file = os.getenv("LOG_FILE", "app.log").strip() or None
         log_retention_days = _get_int_env("LOG_RETENTION_DAYS", 30)
 
+        webapp_host = os.getenv("WEBAPP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        webapp_port = _get_int_env("WEBAPP_PORT", 8080)
+        webapp_url = os.getenv("WEBAPP_URL", "").strip()
+        admin_chat_ids = _get_int_list_env("ADMIN_CHAT_IDS")
+
         # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
             raise ConfigError("CHECK_INTERVAL_MINUTES must be > 0")
@@ -195,6 +230,8 @@ class Config:
             raise ConfigError("FORCE_SUMMARIZE_MONTHLY_LIMIT must be > 0")
         if log_retention_days <= 0:
             raise ConfigError("LOG_RETENTION_DAYS must be > 0")
+        if webapp_port <= 0:
+            raise ConfigError("WEBAPP_PORT must be > 0")
 
         # Возвращаем объект с вычисленными атрибутами
         return cls(
@@ -213,4 +250,8 @@ class Config:
             PRAVO_API_URL=pravo_api_url,
             LOG_FILE=log_file,
             LOG_RETENTION_DAYS=log_retention_days,
+            WEBAPP_HOST=webapp_host,
+            WEBAPP_PORT=webapp_port,
+            WEBAPP_URL=webapp_url,
+            ADMIN_CHAT_IDS=admin_chat_ids,
         )

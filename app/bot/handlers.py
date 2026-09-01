@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import desc, select
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 
@@ -67,12 +67,34 @@ def _full_text_block(article_url: str) -> str:
     return f"[Читать на портале]({original})"
 
 
+def _full_text_button(config, external_id: str) -> InlineKeyboardMarkup | None:
+    """Кнопка «Полный текст», открывающая Mini-App (WebApp) с законом.
+
+    Возвращает None, если WebApp не сконфигурирован (пустой WEBAPP_URL).
+    """
+    base = getattr(config, "WEBAPP_URL", "")
+    if not base or not base.strip():
+        return None
+    url = f"{base.rstrip('/')}/app?external_id={external_id}"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📖 Полный текст", web_app=WebAppInfo(url=url))]]
+    )
+
+
 def _summary_final(
-    title: str, url: str, summary: str | None = None
-) -> str:
-    """Собирает итоговый MarkdownV2-текст саммаризации: заголовок+выжимка+ссылка."""
+    config, title: str, url: str, summary: str | None, external_id: str
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Собирает итог саммаризации: MarkdownV2-текст + кнопку Mini-App (если есть).
+
+    Кнопка «Полный текст» показывается только когда есть саммари (важный закон — сразу,
+    иначе после принудительной саммаризации).
+    """
     header = _format_summary(summary, title)
-    return f"{header}\n\n{_full_text_block(url)}"
+    button = _full_text_button(config, external_id) if summary else None
+    return (
+        f"{header}\n\n{_full_text_block(url)}",
+        button,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,6 +131,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message is None:
         return
     await update.message.reply_text(HELP_TEXT)
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /myid: показывает telegram chat_id для настройки ADMIN_CHAT_IDS."""
+    if update.message is None or update.effective_user is None:
+        return
+    await update.message.reply_text(f"Твой chat_id: {update.effective_user.id}")
 
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -209,6 +238,7 @@ async def _deliver(
     text: str,
     status_message: object | None = None,
     parse_mode: str | None = None,
+    reply_markup=None,
 ) -> None:
     """Шлёт текст результата: для кнопки — правит исходное сообщение, иначе — новое.
 
@@ -221,6 +251,7 @@ async def _deliver(
             message_id=message.message_id,
             text=text,
             parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
     else:
         if status_message is not None:
@@ -229,7 +260,10 @@ async def _deliver(
             except Exception:
                 logger.exception("Не удалось удалить индикатор саммаризации")
         await context.bot.send_message(
-            chat_id=user.telegram_id, text=text, parse_mode=parse_mode
+            chat_id=user.telegram_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
 
 
@@ -256,28 +290,30 @@ async def _summarize_and_reply(
     config = context.bot_data["config"]
     session_maker = _session_maker(context)
 
+    is_admin = user.telegram_id in getattr(config, "ADMIN_CHAT_IDS", ())
     month = datetime.now().strftime("%Y-%m")
     limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
 
-    async with session_maker() as session:
-        usage = await session.scalar(
-            select(SummarizationUsage).where(
-                SummarizationUsage.user_id == user.id,
-                SummarizationUsage.month == month,
+    if not is_admin:
+        async with session_maker() as session:
+            usage = await session.scalar(
+                select(SummarizationUsage).where(
+                    SummarizationUsage.user_id == user.id,
+                    SummarizationUsage.month == month,
+                )
             )
-        )
-        if usage is not None and usage.count >= limit:
-            await _deliver(
-                context,
-                user,
-                message,
-                (
-                    f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
-                    "Попробуйте в следующем месяце."
-                ),
-                status_message=status_message,
-            )
-            return
+            if usage is not None and usage.count >= limit:
+                await _deliver(
+                    context,
+                    user,
+                    message,
+                    (
+                        f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
+                        "Попробуйте в следующем месяце."
+                    ),
+                    status_message=status_message,
+                )
+                return
 
     # Переиспользуем уже сохранённое саммари, если оно есть (без повторного LLM).
     async with session_maker() as session:
@@ -285,8 +321,8 @@ async def _summarize_and_reply(
             select(Article).where(Article.external_id == external_id)
         )
     if cached is not None and cached.summary:
-        final = _summary_final(
-            cached.title or external_id, cached.url, cached.summary
+        final, reply_markup = _summary_final(
+            config, cached.title or external_id, cached.url, cached.summary, external_id
         )
         await _deliver(
             context,
@@ -295,6 +331,7 @@ async def _summarize_and_reply(
             final,
             status_message=status_message,
             parse_mode="MarkdownV2",
+            reply_markup=reply_markup,
         )
         return
 
@@ -351,19 +388,22 @@ async def _summarize_and_reply(
                 title = external_id
                 url = f"http://publication.pravo.gov.ru/document/{external_id}"
 
-            usage = await session.scalar(
-                select(SummarizationUsage).where(
-                    SummarizationUsage.user_id == user.id,
-                    SummarizationUsage.month == month,
+            if not is_admin:
+                usage = await session.scalar(
+                    select(SummarizationUsage).where(
+                        SummarizationUsage.user_id == user.id,
+                        SummarizationUsage.month == month,
+                    )
                 )
-            )
-            if usage is None:
-                usage = SummarizationUsage(user_id=user.id, month=month, count=0)
-                session.add(usage)
-            usage.count += 1
-            await session.commit()
+                if usage is None:
+                    usage = SummarizationUsage(user_id=user.id, month=month, count=0)
+                    session.add(usage)
+                usage.count += 1
+                await session.commit()
+            else:
+                await session.commit()
 
-        final = _summary_final(title, url, summary)
+        final, reply_markup = _summary_final(config, title, url, summary, external_id)
         await _deliver(
             context,
             user,
@@ -371,6 +411,7 @@ async def _summarize_and_reply(
             final,
             status_message=status_message,
             parse_mode="MarkdownV2",
+            reply_markup=reply_markup,
         )
     except Exception:
         logger.exception("Ошибка принудительной саммаризации %s", external_id)
@@ -444,7 +485,9 @@ async def notify_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    text, reply_markup = _build_notification(article)
+    text, reply_markup = _build_notification(
+        article, context.bot_data["config"].WEBAPP_URL
+    )
     if update.effective_user is None:
         return
     await context.bot.send_message(
