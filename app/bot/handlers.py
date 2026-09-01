@@ -17,7 +17,7 @@ from app.services.gigachat import (
     GigaChatClient,
     GigaChatConfig,
 )
-from app.services.rss_parser import get_legal_text, ocr_document_text
+from app.services.rss_parser import _normalize_text, get_legal_text, ocr_document_text
 from app.services.scheduler import FORCE_SUMMARIZE_PREFIX, _build_notification
 from app.services.summarizer import Summarizer, SummarizerConfig
 
@@ -37,6 +37,42 @@ HELP_TEXT = (
 def _session_maker(context: ContextTypes.DEFAULT_TYPE):
     """Достает фабрику сессий, положенную в bot_data при старте приложения."""
     return context.bot_data["session_maker"]
+
+
+def _format_summary(summary: str | None, title: str) -> str:
+    """
+    Оформляет саммари в аккуратную MarkdownV2-разметку.
+
+    Заголовок нормализуется от HTML-артефактов и выделяется жирным,
+    саммари экранируется (MarkdownV2) и нормализуется от артефактов.
+    Возвращает текст с parse_mode="MarkdownV2".
+    """
+    title_clean = _normalize_text(title) or title
+    title_esc = escape_markdown(title_clean, version=2)
+    if not summary:
+        body = f"*{title_esc}*"
+    else:
+        summary_clean = _normalize_text(summary) or summary
+        summary_esc = escape_markdown(summary_clean, version=2)
+        body = f"*{title_esc}*\n\n{summary_esc}"
+    return body
+
+
+def _full_text_block(article_url: str) -> str:
+    """Формирует MarkdownV2-ссылку на оригинал документа на правовом портале.
+
+    Ссылка на оригинал присутствует всегда.
+    """
+    original = escape_markdown(article_url, version=2)
+    return f"[Читать на портале]({original})"
+
+
+def _summary_final(
+    title: str, url: str, summary: str | None = None
+) -> str:
+    """Собирает итоговый MarkdownV2-текст саммаризации: заголовок+выжимка+ссылка."""
+    header = _format_summary(summary, title)
+    return f"{header}\n\n{_full_text_block(url)}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -93,12 +129,11 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines: list[str] = []
     for i, article in enumerate(articles, 1):
-        title = escape_markdown(article.title, version=2)
-        link = article.url
-        block = f"*{i}*\\. {title}\n[Исходный текст]({link})"
-        if article.summary:
-            summary = escape_markdown(article.summary[:200], version=2)
-            block += f"\n_{summary}_"
+        header = _format_summary(
+            (article.summary or "")[:200],
+            f"{i}. {article.title}",
+        )
+        block = f"{header}\n\n{_full_text_block(article.url)}"
         lines.append(block)
 
     await update.message.reply_text(
@@ -173,6 +208,7 @@ async def _deliver(
     message: object | None,
     text: str,
     status_message: object | None = None,
+    parse_mode: str | None = None,
 ) -> None:
     """Шлёт текст результата: для кнопки — правит исходное сообщение, иначе — новое.
 
@@ -181,7 +217,10 @@ async def _deliver(
     """
     if message is not None:
         await context.bot.edit_message_text(
-            chat_id=message.chat_id, message_id=message.message_id, text=text
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            text=text,
+            parse_mode=parse_mode,
         )
     else:
         if status_message is not None:
@@ -189,7 +228,9 @@ async def _deliver(
                 await status_message.delete()
             except Exception:
                 logger.exception("Не удалось удалить индикатор саммаризации")
-        await context.bot.send_message(chat_id=user.telegram_id, text=text)
+        await context.bot.send_message(
+            chat_id=user.telegram_id, text=text, parse_mode=parse_mode
+        )
 
 
 async def _summarize_and_reply(
@@ -244,12 +285,16 @@ async def _summarize_and_reply(
             select(Article).where(Article.external_id == external_id)
         )
     if cached is not None and cached.summary:
+        final = _summary_final(
+            cached.title or external_id, cached.url, cached.summary
+        )
         await _deliver(
             context,
             user,
             message,
-            f"{cached.title or external_id}\n\n{cached.summary}\n\n{cached.url}",
+            final,
             status_message=status_message,
+            parse_mode="MarkdownV2",
         )
         return
 
@@ -318,12 +363,14 @@ async def _summarize_and_reply(
             usage.count += 1
             await session.commit()
 
+        final = _summary_final(title, url, summary)
         await _deliver(
             context,
             user,
             message,
-            f"{title}\n\n{summary}\n\n{url}",
+            final,
             status_message=status_message,
+            parse_mode="MarkdownV2",
         )
     except Exception:
         logger.exception("Ошибка принудительной саммаризации %s", external_id)
@@ -401,7 +448,10 @@ async def notify_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None:
         return
     await context.bot.send_message(
-        chat_id=update.effective_user.id, text=text, reply_markup=reply_markup
+        chat_id=update.effective_user.id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="MarkdownV2",
     )
 
 

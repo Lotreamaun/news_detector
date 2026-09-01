@@ -22,11 +22,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.helpers import escape_markdown
 
 from app.models import Article, User
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.rss_parser import (
     RssError,
+    _normalize_text,
     fetch_documents,
     get_legal_text,
     is_important,
@@ -38,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 # Префикс callback_data для кнопки «Сделать саммари»
 FORCE_SUMMARIZE_PREFIX = "force_sum:summary:"
+
+
 
 
 async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,7 +176,10 @@ async def _notify_users(context, session_maker, article: Article) -> None:
     for user in users:
         try:
             await context.bot.send_message(
-                chat_id=user.telegram_id, text=message, reply_markup=reply_markup
+                chat_id=user.telegram_id,
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode="MarkdownV2",
             )
             sent += 1
         except Exception:
@@ -185,15 +192,22 @@ async def _notify_users(context, session_maker, article: Article) -> None:
 
 
 def _build_notification(article: Article) -> tuple[str, InlineKeyboardMarkup]:
-    """Формирует текст уведомления и кнопку «Сделать саммари»."""
+    """Формирует MarkdownV2-текст уведомления и кнопку «Сделать саммари»."""
+    title_clean = _normalize_text(article.title) or article.title
+    title_esc = escape_markdown(title_clean, version=2)
     if article.summary:
-        text = f"{article.title}\n\n{article.summary}\n\n{article.url}"
+        summary_clean = _normalize_text(article.summary) or article.summary
+        summary_esc = escape_markdown(summary_clean, version=2)
+        body = f"*{title_esc}*\n\n{summary_esc}"
     else:
         # Fallback (vision.md): GigaChat недоступен или нет текста — ссылка на оригинал
-        text = (
-            f"{article.title}\n\n"
-            f"Не удалось проанализировать этот закон. Оригинал: {article.url}"
+        fallback = escape_markdown(
+            "Содержание этого закона пока не доступно в текстовом формате. " \
+            "Откройте оригинал на портале или запросите саммари через бота.", version=2
         )
+        body = f"*{title_esc}*\n\n_{fallback}_"
+    url_esc = escape_markdown(article.url, version=2)
+    text = f"{body}\n\n[Читать на портале]({url_esc})"
 
     markup = InlineKeyboardMarkup(
         [

@@ -239,7 +239,8 @@ async def ocr_document_text(
             logger.warning("GigaChat вернул пустой OCR-ответ для %s", external_id)
             return None
         logger.info("OCR GigaChat извлёк текст для %s (%d символов)", external_id, len(text))
-        return text[:_MAX_DOCUMENT_CHARS]
+        normalized = _normalize_text(text) or text
+        return normalized[:_MAX_DOCUMENT_CHARS]
     except GigaChatError as exc:
         logger.warning("OCR через GigaChat не удался для %s: %s", external_id, exc)
         return None
@@ -336,7 +337,8 @@ def _entry_from_item(item: dict) -> FeedEntry | None:
         logger.warning("Пропускаем элемент API без eoNumber: %r", str(item)[:200])
         return None
 
-    title = (item.get("title") or item.get("complexName") or "").strip()
+    title_raw = (item.get("title") or item.get("complexName") or "").strip()
+    title = _normalize_text(title_raw) or title_raw
     return FeedEntry(
         external_id=external_id,
         title=title,
@@ -422,7 +424,36 @@ def _html_to_text(html: str) -> str | None:
         logger.exception("Ошибка разбора HTML редакции (len=%d)", len(html))
         return None
     text = parser.text()
-    return text or None
+    return _normalize_text(text)
+
+
+def _normalize_text(text: str | None) -> str | None:
+    """
+    Приводит сырой текст (OCR-ответ, саммари) к читаемому виду.
+
+    Убирает HTML-теги и сущности, схлопывает множественные пробелы/табы/
+    неразрывные пробелы и удаляет избыточные пустые строки. Возвращает None
+    только если на входе был пустой/None.
+    """
+    if not text:
+        return None
+
+    # HTML-сущности (в т.ч. &#...;), оставляем обычные амперсанды не-сущностей
+    body = re.sub(r"&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);", " ", text)
+    # Удаляем любые теги, в т.ч. <br>, <br/>, <br /> и остатки разметки
+    body = re.sub(r"<[^>]*>", "", body)
+
+    # Схлопываем пробельные последовательности по строкам
+    lines = [re.sub(r"[ \t\u00a0]+", " ", line).strip() for line in body.splitlines()]
+    # Убираем пустые строки и повторяющиеся пустые строки (оставляем не более одной)
+    result_lines: list[str] = []
+    for line in lines:
+        if line:
+            result_lines.append(line)
+        elif result_lines and not result_lines[-1]:
+            continue
+    cleaned = "\n".join(result_lines)
+    return cleaned or None
 
 
 async def _fetch_with_retries(
