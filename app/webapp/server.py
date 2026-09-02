@@ -27,8 +27,9 @@ HTML_PAGE = r"""<!doctype html>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #222); line-height: 1.6; }
-  .container { max-width: 800px; margin: 0 auto; padding: 16px; }
+  .container { max-width: 800px; margin: 0 auto; padding: 16px; position: relative; }
   .disclaimer { background: #fff3cd; color: #664d03; border: 1px solid #ffecb5; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 14px; }
+  .beta { position: absolute; top: 10px; right: 10px; background: #0d6efd; color: #fff; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 12px; letter-spacing: 0.5px; }
   .title { font-size: 20px; font-weight: 700; margin: 0 0 4px 0; }
   .date { font-size: 13px; color: var(--tg-theme-hint-color, #707579); margin: 0 0 16px 0; }
   .text { word-break: break-word; font-size: 15px; line-height: 1.7; }
@@ -45,7 +46,8 @@ HTML_PAGE = r"""<!doctype html>
 </head>
 <body>
 <div class="container">
-  <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки. Распознано с помощью ИИ.</div>
+  <div class="beta">Beta</div>
+  <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки.</div>
   <h1 id="title" class="title loading">Загрузка…</h1>
   <div id="date" class="date"></div>
   <div id="content" class="text loading">Загрузка текста закона…</div>
@@ -87,28 +89,7 @@ HTML_PAGE = r"""<!doctype html>
     if (m) return m[1];
     return null;
   }
-  function filterSignatureTail(text) {
-    let t = String(text);
-    // хвост начинается с "Подписано ... подписью" / "Электронная подпись" - отрезаем всё до конца
-    const sigIdx = t.search(/подписано[\s\S]{0,80}подписью/i);
-    if (sigIdx !== -1) {
-      t = t.slice(0, sigIdx).trim();
-    } else {
-      // fallback: "Электронная подпись" в конце (последние 30% текста)
-      const tail = t.slice(Math.floor(t.length * 0.7));
-      const m2 = tail.search(/электронная\s+подпись/i);
-      if (m2 !== -1) {
-        const cut = Math.floor(t.length * 0.7) + m2;
-        t = t.slice(0, cut).trim();
-      }
-    }
-    // также отрезаем блок сертификата/владельца если остался без явного "подписано"
-    const certIdx = t.search(/(?:Сертификат|Владелец|Действителен)[\s\S]{0,120}$/i);
-    if (certIdx !== -1 && certIdx > t.length * 0.8) {
-      t = t.slice(0, certIdx).trim();
-    }
-    return t.trim();
-  }
+
   function renderLawText(text) {
     const lines = String(text).split('\n');
     let html = '';
@@ -191,11 +172,9 @@ HTML_PAGE = r"""<!doctype html>
       } catch(e) { dateEl.style.display = 'none'; }
       if (data.is_text_available && data.text) {
         try {
-          const filtered = filterSignatureTail(data.text);
-          contentEl.innerHTML = renderLawText(filtered);
+          contentEl.innerHTML = renderLawText(data.text);
         } catch(e) {
           console.error('render error', e);
-          // фолбэк: показать экранированный текст как есть
           contentEl.textContent = String(data.text);
         }
         contentEl.className = 'text';
