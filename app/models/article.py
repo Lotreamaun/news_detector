@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text  # в string фиксированная длина, в text - произвольная
+from sqlalchemy import DateTime, String, Text, text  # в string фиксированная длина, в text - произвольная
 from sqlalchemy.orm import (
     Mapped, # обертка для типов
     mapped_column # настраивает колонку
@@ -27,6 +27,13 @@ class Article(Base):
     original_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text(), nullable=True)
     url: Mapped[str] = mapped_column(String(2048))  # принятое в практике макс. длина для url
+    level: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="UNKNOWN",
+        server_default=text("'UNKNOWN'"),
+        index=True,
+    )
     published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),  # нужно сохранять дату вместе с часовым поясом
         nullable=True,

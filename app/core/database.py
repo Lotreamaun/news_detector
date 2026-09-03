@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,  # Функция для создания объекта движка
 )
 
-from app.models import Base, Article, User  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
+from app.models import Base, Article, User, UserFilter  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
 
 _engine: Optional[AsyncEngine] = None  # приватная переменная для движка
 _async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None  # для сессий
