@@ -16,6 +16,7 @@ from app.services.gigachat import (
     GigaChatAuthError,
     GigaChatClient,
     GigaChatConfig,
+    GigaChatError,
 )
 from app.services.rss_parser import _normalize_text, get_legal_text, ocr_document_text
 from app.services.scheduler import FORCE_SUMMARIZE_PREFIX, _build_notification
@@ -275,6 +276,24 @@ def _full_text_button(config, external_id: str) -> InlineKeyboardMarkup | None:
     url = f"{base.rstrip('/')}/app?external_id={external_id}"
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("📖 Полный текст", web_app=WebAppInfo(url=url))]]
+    )
+
+
+def _summary_refused(
+    config, title: str, url: str, fallback: str, external_id: str
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Собирает уведомление с фолбэком вместо саммари при отказе языковой модели.
+
+    Фолбэк встраивается в тело уведомления на место саммари: остаются название,
+    ссылка на портал и кнопка «Полный текст» (WebApp).
+    """
+    title_clean = _normalize_text(title) or title
+    title_esc = escape_markdown(title_clean, version=2)
+    fallback_esc = escape_markdown(fallback, version=2)
+    header = f"*{title_esc}*\n\n_{fallback_esc}_"
+    return (
+        f"{header}\n\n{_full_text_block(url)}",
+        _full_text_button(config, external_id),
     )
 
 
@@ -626,6 +645,17 @@ async def _summarize_and_reply(
             )
             return
 
+        # Сохраняем распознанный текст сразу (до саммаризации), чтобы он был
+        # доступен в WebApp независимо от исхода саммари — даже при отказе LLM.
+        async with session_maker() as session:
+            art = await session.scalar(
+                select(Article).where(Article.external_id == external_id)
+            )
+            if art is not None:
+                if not art.original_text:
+                    art.original_text = text
+                    await session.commit()
+
         async with Summarizer(
             SummarizerConfig(
                 auth_key=config.GIGACHAT_AUTH_KEY,
@@ -668,6 +698,36 @@ async def _summarize_and_reply(
                 await session.commit()
 
         final, reply_markup = _summary_final(config, title, url, summary, external_id)
+        await _deliver(
+            context,
+            user,
+            message,
+            final,
+            status_message=status_message,
+            parse_mode="MarkdownV2",
+            reply_markup=reply_markup,
+        )
+    except GigaChatError as exc:
+        logger.warning("Саммаризация %s: языковая модель %s", external_id, exc)
+        async with session_maker() as session:
+            art = await session.scalar(
+                select(Article).where(Article.external_id == external_id)
+            )
+        title = (art.title if art else None) or external_id
+        url = (
+            (art.url if art else None)
+            or f"http://publication.pravo.gov.ru/document/{external_id}"
+        )
+        if "отказался" in str(exc) or "пустой ответ" in str(exc):
+            fallback = (
+                "Языковая модель отказалась сформировать саммари для этого документа. "
+                "Распознанный текст доступен по кнопке «Полный текст»."
+            )
+        else:
+            fallback = "Не удалось сделать саммари. Попробуйте позже."
+        final, reply_markup = _summary_refused(
+            config, title, url, fallback, external_id
+        )
         await _deliver(
             context,
             user,

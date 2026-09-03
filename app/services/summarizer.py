@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
+from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError, classify_reply
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,11 @@ class Summarizer:
         )
 
         summary = reply.strip()
+        _kind = classify_reply(summary)
+        if _kind == "refusal":
+            raise GigaChatError("GigaChat отказался делать саммари (чувствительная тема)")
+        if _kind == "empty":
+            raise GigaChatError("GigaChat вернул пустой ответ — саммари не получено")
         self._check_length(summary)
 
         if len(summary) > self._config.max_len:
