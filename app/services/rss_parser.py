@@ -29,7 +29,7 @@ from html.parser import HTMLParser
 
 import aiohttp
 
-from app.services.gigachat import GigaChatClient, GigaChatError
+from app.services.gigachat import GigaChatClient, GigaChatError, classify_reply
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,53 @@ _REDTEXT_NOT_READY_MARKER = "Подготовка текста редакции"
 # GUID типа документа «Федеральный конституционный закон» в справочнике
 # publication.pravo.gov.ru (тот же идентификатор, что documentTypeId в API).
 _FKZ_DOCUMENT_TYPE_ID = "93273da3-3133-4acf-96c2-4adc1ae70e19"
+# GUID для Конституции и ФЗ — уточнятся по мере наблюдения API, пока заглушки
+_CONSTITUTION_DOCUMENT_TYPE_ID = "constitution-guid-placeholder"
+_FZ_DOCUMENT_TYPE_ID = "82a8bf1c-3bc7-47ed-827f-7affd43a7f27"
+
+# Маппинг documentTypeId → уровень силы (для фильтра law-force-filter)
+LEVEL_MAP: dict[str, str] = {
+    _FKZ_DOCUMENT_TYPE_ID: "FKZ",
+    _CONSTITUTION_DOCUMENT_TYPE_ID: "CONSTITUTION",
+    _FZ_DOCUMENT_TYPE_ID: "FZ",
+}
+
+
+def classify_level(document_type_id: str | None) -> str:
+    """Определяет уровень силы по documentTypeId, fallback UNKNOWN."""
+    if not document_type_id:
+        return "UNKNOWN"
+    cleaned = str(document_type_id).strip()
+    return LEVEL_MAP.get(cleaned, "UNKNOWN")
+
+
+def classify_level_for_title(title: str | None, document_type_id: str | None = None) -> str:
+    """Определяет уровень с fallback по заголовку (для FZ/Конституции, пока GUID не известны)."""
+    lvl = classify_level(document_type_id)
+    if lvl != "UNKNOWN":
+        return lvl
+    if not title:
+        return "UNKNOWN"
+    low = title.lower()
+    if "конституц" in low:
+        return "CONSTITUTION"
+    if "федеральный закон" in low or low.strip().startswith("фз ") or " фз " in f" {low} ":
+        return "FZ"
+    if "указ президента" in low:
+        return "DECREE"
+    if "постановление правительства" in low:
+        # региональное если есть маркер региона в заголовке
+        if any(x in low for x in ["республики", "края", "области", "луганск", "ингушет", "забайкал", "чуваш"]):
+            return "REGIONAL"
+        return "GOV_RESOLUTION"
+    if "приказ" in low:
+        if any(x in low for x in ["республики", "края", "области"]):
+            return "REGIONAL"
+        if "российской федерации" in low or "главного управления" in low or "министерства" in low:
+            return "DEPARTMENTAL"
+    if any(x in low for x in ["указ главы", "губернатора", "главы "]):
+        return "REGIONAL"
+    return "UNKNOWN"
 
 # Промпт для OCR-фоллбэка: просим выписать весь текст закона со сканов
 _OCR_PROMPT = (
@@ -93,11 +140,11 @@ class FeedEntry:
 
 async def fetch_documents(api_url: str) -> list[FeedEntry]:
     """
-    Загружает список документов из JSON API публикаций.
+    Загружает список документов из JSON API публикаций (одна страница).
 
     Args:
         api_url: URL API документов (например, ``PRAVO_API_URL`` из конфигурации,
-            ``.../api/Documents?PeriodType=daily``).
+            ``.../api/documents?periodType=daily``).
 
     Returns:
         Список ``FeedEntry``. Пустой список, если в ответе нет документов.
@@ -107,27 +154,59 @@ async def fetch_documents(api_url: str) -> list[FeedEntry]:
         ParseError: ответ не JSON или не содержит список ``items``.
     """
     raw = await _fetch_with_retries(api_url, what="API документов")
-
     if not isinstance(raw, str):
         raise ParseError(f"Ожидался текст JSON, получено {type(raw).__name__}: {api_url}")
-
     try:
         data = json.loads(raw)
     except ValueError as exc:
         raise ParseError(f"Ответ API не является JSON: {api_url}") from exc
-
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise ParseError(f"Ответ API не содержит список items: {api_url}")
-
     result: list[FeedEntry] = []
     for item in items:
         entry = _entry_from_item(item)
         if entry is not None:
             result.append(entry)
-
     logger.info("Получено %d документов из API (%s)", len(result), api_url)
     return result
+
+
+async def fetch_day(day: datetime | str, api_url: str, *, document_type_ids: list[str] | None = None) -> list[FeedEntry]:
+    """
+    Загружает документы за конкретный календарный день через
+    ``periodType=day&date=<dd.mm.yyyy>`` (для бэкфилла 30 дней).
+
+    Args:
+        day: день для выборки (date/datetime или строка ``dd.mm.yyyy``).
+        api_url: URL API документов (базовый ``.../api/documents``).
+        document_type_ids: GUID видов актов для серверного фильтра
+            (повторяющийся ``documentTypes=``). Если задан — возвращаются
+            только документы этих типов (например ФЗ и ФКЗ), иначе все за день.
+
+    Returns:
+        Список ``FeedEntry`` за указанный день.
+    """
+    if isinstance(day, str):
+        day_str = day
+    else:
+        day_str = day.strftime("%d.%m.%Y")
+    # Сбрасываем query из базового URL: periodType=day должен быть единственным
+    # (в PRAVO_API_URL уже есть ?PeriodType=daily, иначе он перекроет day).
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(api_url)
+    url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    url = f"{url}?periodType=day&date={day_str}&pageSize=200"
+    for tid in (document_type_ids or []):
+        url += f"&documentTypes={tid}"
+    try:
+        entries = await fetch_documents(url)
+    except RssError as exc:
+        logger.warning("Не удалось получить документы за день %s: %s", day_str, exc)
+        return []
+    logger.info("Бэкфилл день %s: %d документов", day_str, len(entries))
+    return entries
 
 
 async def get_legal_text(
@@ -192,11 +271,10 @@ def is_important(entry: FeedEntry) -> bool:
     """
     «Важные» акты, которым полагается OCR-фоллбэк при отсутствии текста.
 
-    Сейчас важными считаются федеральные конституционные законы (ФКЗ).
-    TODO: расширить перечень (значимые ФЗ, поправки к Конституции) по
-    document_type_id / signatory_authority_id — см. Этап 4 в docs/PLAN.md.
+    Для MVP — Конституция, ФКЗ и ФЗ (обрабатываются автоматически, без кнопки).
     """
-    return entry.document_type_id == _FKZ_DOCUMENT_TYPE_ID
+    lvl = classify_level_for_title(entry.title, entry.document_type_id)
+    return lvl in ("CONSTITUTION", "FKZ", "FZ")
 
 
 async def ocr_document_text(
@@ -235,8 +313,12 @@ async def ocr_document_text(
             max_tokens=_MAX_OCR_TOKENS,
         )
         text = reply.strip()
-        if not text:
+        _kind = classify_reply(text)
+        if _kind == "empty":
             logger.warning("GigaChat вернул пустой OCR-ответ для %s", external_id)
+            return None
+        if _kind == "refusal":
+            logger.warning("GigaChat отказался распознавать текст для %s", external_id)
             return None
         logger.info("OCR GigaChat извлёк текст для %s (%d символов)", external_id, len(text))
         normalized = _normalize_text(text) or text

@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, time, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 
 from telegram import BotCommand, Update
@@ -13,11 +14,10 @@ from app.bot.handlers import (
     force_summarize,
     help_command,
     latest,
-    myid_command,
-    notify_me,
+    level_wizard_handler,
+    show_example,
     start,
     summary_command,
-    test_gigachat,
 )
 from app.core.config import Config
 from app.core.database import (
@@ -74,12 +74,11 @@ def _build_application(config: Config) -> Application:
     application.bot_data["session_maker"] = get_session_maker()
     application.bot_data["config"] = config
 
+    application.add_handler(level_wizard_handler)
+    application.add_handler(CallbackQueryHandler(show_example, pattern=r"^show_example$"))
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("test", test_gigachat))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("myid", myid_command))
-    application.add_handler(CommandHandler("notify_me", notify_me))
     application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(
         CallbackQueryHandler(force_summarize, pattern=r"^force_sum:summary:")
@@ -148,11 +147,9 @@ async def _register_commands(application: Application) -> None:
     """Регистрирует список команд бота (видно при наборе '/' в чате)."""
     commands = [
         BotCommand("start", "Регистрация пользователя"),
-        BotCommand("latest", "Последние обработанные законы"),
+        BotCommand("latest", "Последние ФКЗ/ФЗ за 30 дней"),
         BotCommand("summary", "Принудительно сделать саммари закона"),
-        BotCommand("notify_me", "Отправить тестовое уведомление с кнопкой"),
-        BotCommand("myid", "Показать свой chat_id"),
-        BotCommand("test", "Проверка связи с GigaChat API"),
+        BotCommand("settings", "Настройка фильтров"),
         BotCommand("help", "Справка по командам"),
     ]
     try:
@@ -165,9 +162,10 @@ async def _register_commands(application: Application) -> None:
 async def _run_initial_check(application: Application) -> None:
     """Прогоняет проверку публикаций сразу после старта бота (post_init).
 
+    Определяет, нужен ли бэкфилл 30 дней, и не спамит ли старыми законами.
     PTB/APScheduler не умеют запускать run_repeating мгновенно (first=0 не
     работает — документированная ловушка), поэтому первый прогон делаем
-    вручную через job.run. Идемпотентность по external_id защищает от дублей.
+    вручную через job.run.
     """
     job_queue = application.job_queue
     if job_queue is None:
@@ -176,8 +174,51 @@ async def _run_initial_check(application: Application) -> None:
     if not job:
         logger.warning("Job проверки публикаций не найден — первый прогон пропущен")
         return
-    logger.info("Первый прогон проверки публикаций сразу после старта")
-    await job[0].run(application)
+
+    now = datetime.now(timezone.utc).date()
+    start = now - timedelta(days=30)
+    since = datetime.combine(start, time.min, tzinfo=timezone.utc)
+
+    try:
+        from app.models import Article, User
+        from sqlalchemy import func, select
+
+        session_maker = application.bot_data["session_maker"]
+        async with session_maker() as session:
+            has_articles = await session.scalar(
+                select(Article.id).limit(1)
+            )
+            has_users = await session.scalar(
+                select(User.id).limit(1)
+            )
+            has_federal_in_window = await session.scalar(
+                select(func.count(Article.id))
+                .where(Article.published_at >= since)
+                .where(Article.level.in_(["FKZ", "FZ"]))
+            )
+            application.bot_data["needs_backfill"] = not has_federal_in_window
+
+            # подавление рассылки старых законов: пустая БД или нет пользователей
+            if has_articles is None or has_users is None:
+                application.bot_data["is_first_run"] = True
+            else:
+                application.bot_data["is_first_run"] = False
+    except Exception:
+        logger.exception("Не удалось определить is_first_run/needs_backfill, считаем False")
+        application.bot_data["is_first_run"] = False
+        application.bot_data["needs_backfill"] = False
+
+    logger.info(
+        "Первый прогон после старта (is_first_run=%s, needs_backfill=%s)",
+        application.bot_data.get("is_first_run"),
+        application.bot_data.get("needs_backfill"),
+    )
+    try:
+        await job[0].run(application)
+    finally:
+        # бэкфилл идемпотентны и выполняются только при старте
+        application.bot_data["is_first_run"] = False
+        application.bot_data["needs_backfill"] = False
 
 
 def main() -> None:
