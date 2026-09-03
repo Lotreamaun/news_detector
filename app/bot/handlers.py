@@ -3,12 +3,12 @@ Telegram-обработчики команд бота.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import desc, select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.helpers import escape_markdown
-from telegram.ext import ContextTypes
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
 from app.models import Article, SummarizationUsage, User
 from app.services.gigachat import (
@@ -25,18 +25,215 @@ logger = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "Доступные команды:\n"
-    "/start — регистрация пользователя\n"
-    "/test — проверка связи с GigaChat API\n"
-    "/latest — последние обработанные законы\n"
-    "/summary <external_id> — принудительно сделать саммари закона\n"
-    "/notify_me <external_id> — отправить тестовое уведомление с кнопкой\n"
+    "/start — регистрация и настройка фильтров\n"
+    "/latest — последние федеральные законы (ФКЗ/ФЗ) за 30 дней\n"
+    "/settings — настройка фильтров\n"
+    "/summary <id или ссылка> — принудительно сделать саммари\n"
     "/help — эта справка"
 )
+
+
+LEVELS: list[str] = ["CONSTITUTION", "FKZ", "FZ", "DECREE", "GOV_RESOLUTION", "DEPARTMENTAL", "REGIONAL"]
+LEVEL_LABELS: dict[str, str] = {
+    "CONSTITUTION": "Конституция",
+    "FKZ": "ФКЗ",
+    "FZ": "ФЗ",
+    "DECREE": "Указы",
+    "GOV_RESOLUTION": "Постановления",
+    "DEPARTMENTAL": "Ведомственные",
+    "REGIONAL": "Региональные",
+}
+DEFAULT_LEVELS: set[str] = {"CONSTITUTION", "FKZ", "FZ"}
+AUTO_LEVELS: set[str] = {"CONSTITUTION", "FKZ", "FZ"}
+LEVEL_STATE: int = 0
 
 
 def _session_maker(context: ContextTypes.DEFAULT_TYPE):
     """Достает фабрику сессий, положенную в bot_data при старте приложения."""
     return context.bot_data["session_maker"]
+
+
+def _build_level_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
+    """Строит клавиатуру для выбора уровней силы."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for lvl in LEVELS:
+        label = LEVEL_LABELS[lvl]
+        mark = "☑" if lvl in selected else "☐"
+        row.append(InlineKeyboardButton(f"{label} {mark}", callback_data=f"level:{lvl}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Выбрать всё", callback_data="levels:all")])
+    rows.append([InlineKeyboardButton("Далее", callback_data="levels:next")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _get_user_levels(session_maker, user_id: int) -> set[str]:
+    """Возвращает выбранные уровни пользователя, пусто = Все."""
+    from app.models.user_filter import UserFilter
+
+    async with session_maker() as session:
+        result = await session.scalars(select(UserFilter.level).where(UserFilter.user_id == user_id))
+        levels = set(result.all())
+    return levels
+
+
+def _window_start(days: int) -> datetime:
+    """Начало окна «n дней» — полночь дня (n)-дня назад (календарная граница).
+
+    Иначе ``now - 30d`` (с временем суток) отсекает закон, опубликованный
+    утром ровно 30 дней назад (midnight < since).
+    """
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days)
+    return datetime.combine(start, time.min, tzinfo=timezone.utc)
+
+
+async def _save_user_levels(session_maker, user_id: int, levels: set[str]) -> None:
+    """Сохраняет уровни (пусто = Все). DELETE+INSERT."""
+    from app.models.user_filter import UserFilter
+
+    async with session_maker() as session:
+        # удалить старые
+        old = await session.scalars(select(UserFilter).where(UserFilter.user_id == user_id))
+        for obj in old.all():
+            await session.delete(obj)
+        # вставить новые (пусто = Все, не вставляем ничего)
+        for lvl in levels:
+            if lvl in LEVELS:
+                session.add(UserFilter(user_id=user_id, level=lvl))
+        await session.commit()
+
+
+# ── Визард «Сила» ────────────────────────────────────────────────────────
+
+async def _show_level_step(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    """Показывает шаг выбора силы, инициализирует context.user_data['levels']."""
+    session_maker = _session_maker(context)
+    levels = await _get_user_levels(session_maker, user_id)
+    # пусто = Все → по умолчанию все включены
+    if not levels:
+        levels = set(LEVELS)
+    context.user_data["levels"] = levels
+    context.user_data["wizard_user_id"] = user_id
+    text = "Шаг 1/1 — Сила закона:\nВыберите какие акты получать (можно несколько):"
+    markup = _build_level_keyboard(levels)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+    elif update.message:
+        await update.message.reply_text(text=text, reply_markup=markup)
+    return LEVEL_STATE
+
+
+async def level_wizard_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point для /start (новый) и /settings — показывает приветствие визарда."""
+    if update.effective_user is None:
+        return ConversationHandler.END
+    telegram_id = update.effective_user.id
+    session_maker = _session_maker(context)
+    user = await _get_or_create_user(session_maker, telegram_id, update)
+    if user is None:
+        return ConversationHandler.END
+    # Для /start нового — уже зарегистрировали выше, но здесь универсально
+    text = (
+        "Настроим подписку (30 сек):\n"
+        "Выберите по силе — какие законы получать."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Настроить", callback_data="wizard:setup")],
+            [InlineKeyboardButton("Пропустить → Все", callback_data="wizard:skip")],
+        ]
+    )
+    if update.message:
+        await update.message.reply_text(text=text, reply_markup=markup)
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+    return LEVEL_STATE
+
+
+async def level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает toggle уровня, Выбрать всё и Далее."""
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return LEVEL_STATE
+    data = query.data or ""
+    levels: set[str] = context.user_data.get("levels", set(LEVELS))
+    user_id: int = context.user_data.get("wizard_user_id") or 0
+    # если user_id не в context (рестарт), достаём из БД
+    if not user_id:
+        session_maker = _session_maker(context)
+        user = await _get_or_create_user(session_maker, update.effective_user.id, update)
+        user_id = user.id if user else 0
+        context.user_data["wizard_user_id"] = user_id
+
+    if data == "wizard:skip":
+        await _save_user_levels(_session_maker(context), user_id, set())
+        await query.answer()
+        await query.edit_message_text("Готово! Фильтр — «Все уровни». Изменить: /settings")
+        return ConversationHandler.END
+    if data == "wizard:setup":
+        # показать шаг Сила
+        return await _show_level_step(update, context, user_id)
+    if data.startswith("level:"):
+        lvl = data.split(":", 1)[1]
+        if lvl in LEVELS:
+            if lvl in levels:
+                levels.remove(lvl)
+            else:
+                levels.add(lvl)
+            context.user_data["levels"] = levels
+        await query.answer()
+        await query.edit_message_text(
+            text="Шаг 1/1 — Сила закона:\nВыберите какие акты получать (можно несколько):",
+            reply_markup=_build_level_keyboard(levels),
+        )
+        return LEVEL_STATE
+    if data == "levels:all":
+        # toggle все: если все выбраны → снять, иначе выбрать все
+        if len(levels) == len(LEVELS):
+            levels = set()
+        else:
+            levels = set(LEVELS)
+        context.user_data["levels"] = levels
+        await query.answer()
+        await query.edit_message_text(
+            text="Шаг 1/1 — Сила закона:\nВыберите какие акты получать (можно несколько):",
+            reply_markup=_build_level_keyboard(levels),
+        )
+        return LEVEL_STATE
+    if data == "levels:next":
+        # пусто = Все (не сохраняем ничего)
+        to_save = levels if len(levels) != len(LEVELS) else set()
+        # если пусто после toggle (сняли всё) — считаем Все
+        if not to_save and len(levels) == 0:
+            to_save = set()
+        await _save_user_levels(_session_maker(context), user_id, to_save)
+        await query.answer()
+        if not to_save:
+            await query.edit_message_text("Готово! Фильтр — «Все уровни». Изменить: /settings")
+        else:
+            labels = ", ".join(LEVEL_LABELS[l] for l in sorted(to_save))
+            await query.edit_message_text(f"Готово! Выбрано: {labels}. Изменить: /settings")
+        return ConversationHandler.END
+
+    await query.answer()
+    return LEVEL_STATE
+
+
+async def level_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена визарда."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Настройка отменена. /settings — изменить позже.")
+    elif update.message:
+        await update.message.reply_text("Настройка отменена. /settings — изменить позже.")
+    return ConversationHandler.END
 
 
 def _format_summary(summary: str | None, title: str) -> str:
@@ -101,29 +298,131 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обработчик /start: регистрирует пользователя в БД и приветствует.
 
-    Пользователь считается зарегистрированным один раз — при повторном
-    /start запись не дублируется (проверка по уникальному telegram_id).
+    Для нового пользователя предлагает визард настройки фильтров.
     """
     if update.effective_user is None or update.message is None:
         return
     telegram_id = update.effective_user.id
     username = update.effective_user.username
 
+    is_new = False
     async with _session_maker(context)() as session:
         user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
         if user is None:
-            session.add(User(telegram_id=telegram_id, username=username))
+            from app.models.user_filter import UserFilter
+
+            user = User(telegram_id=telegram_id, username=username)
+            session.add(user)
+            await session.flush()
+            # дефолт для нового юзера — Конституция + ФКЗ + ФЗ
+            for lvl in DEFAULT_LEVELS:
+                session.add(UserFilter(user_id=user.id, level=lvl))
             await session.commit()
+            await session.refresh(user)
             logger.info("Зарегистрирован новый пользователь telegram_id=%s", telegram_id)
+            is_new = True
         else:
             logger.info("Пользователь telegram_id=%s уже зарегистрирован", telegram_id)
 
-    await update.message.reply_text(
-        "Привет! Я буду присылать саммари новых законов с pravo.gov.ru.\n"
-        "Сейчас сервис в разработке. Доступные команды:\n"
-        "/start — регистрация\n"
-        "/test — проверка связи с GigaChat API"
+    if is_new:
+        markup = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Настроить", callback_data="wizard:setup")],
+                [InlineKeyboardButton("Пропустить → Все", callback_data="wizard:skip")],
+                [InlineKeyboardButton("🔍 Показать пример уведомления", callback_data="show_example")],
+            ]
+        )
+        await update.message.reply_text(
+            "Привет! Присылаю саммари новых законов по твоим фильтрам.\n"
+            "Например, юристу по крипте — оставь только ФЗ, остальное сними.\n"
+            "Начни с /settings — выбери силу, или жми /latest — последние ФКЗ/ФЗ за 30 дней.",
+            reply_markup=markup,
+        )
+    else:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔍 Показать пример уведомления", callback_data="show_example")]]
+        )
+        await update.message.reply_text(
+            "Привет! Присылаю саммари новых законов по твоим фильтрам.\n"
+            "Команды:\n"
+            "/latest — последние ФКЗ/ФЗ за 30 дней\n"
+            "/settings — настройка фильтров\n"
+            "/summary <id> — принудительно саммари\n"
+            "/help — справка",
+            reply_markup=markup,
+        )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /settings: показывает текущие фильтры и вход в визард."""
+    if update.message is None or update.effective_user is None:
+        return
+    telegram_id = update.effective_user.id
+    session_maker = _session_maker(context)
+    user = await _get_or_create_user(session_maker, telegram_id, update)
+    if user is None:
+        return
+    levels = await _get_user_levels(session_maker, user.id)
+    if not levels:
+        cur = "Все уровни"
+    else:
+        cur = ", ".join(LEVEL_LABELS[l] for l in sorted(levels))
+    text = f"Текущий фильтр по силе: {cur}\nНажмите чтобы изменить:"
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Изменить фильтр по силе", callback_data="wizard:setup")]]
     )
+    await update.message.reply_text(text=text, reply_markup=markup)
+
+
+async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает тестовое уведомление — один из последних FZ, как в проде."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    session_maker = _session_maker(context)
+    # последний принятый ФЗ (сначала по level, затем по заголовку для старых с UNKNOWN)
+    since = _window_start(days=30)
+    async with session_maker() as session:
+        article = await session.scalar(
+            select(Article)
+            .where(Article.level == "FZ")
+            .where(Article.published_at >= since)
+            .order_by(Article.published_at.desc())
+            .limit(1)
+        )
+        if article is None:
+            article = await session.scalar(
+                select(Article).where(Article.level == "FZ").order_by(Article.id.desc()).limit(1)
+            )
+        if article is None:
+            # fallback для старых записей с level=UNKNOWN но заголовок "Федеральный закон"
+            article = await session.scalar(
+                select(Article)
+                .where(Article.title.ilike("%Федеральный закон%"))
+                .where(Article.published_at >= since)
+                .order_by(Article.published_at.desc())
+                .limit(1)
+            )
+        if article is None:
+            article = await session.scalar(
+                select(Article).where(Article.title.ilike("%Федеральный закон%")).order_by(Article.id.desc()).limit(1)
+            )
+    if article is None:
+        await query.message.reply_text("Пока нет законов для примера. Попробуйте позже: /latest")
+        return
+    text, reply_markup = _build_notification(article, context.bot_data["config"].WEBAPP_URL)
+    # шлём как тестовое уведомление в тот же чат
+    try:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2",
+        )
+    except Exception:
+        logger.exception("Не удалось отправить пример уведомления")
+        await query.message.reply_text("Не удалось показать пример. Попробуйте /latest")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,30 +432,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_TEXT)
 
 
-async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /myid: показывает telegram chat_id для настройки ADMIN_CHAT_IDS."""
-    if update.message is None or update.effective_user is None:
-        return
-    await update.message.reply_text(f"Твой chat_id: {update.effective_user.id}")
-
-
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /latest: показывает последние обработанные законы."""
+    """Обработчик /latest: последние ФКЗ/ФЗ за 30 дней (без учёта фильтров юзера)."""
     if update.message is None:
         return
 
-    async with _session_maker(context)() as session:
-        articles = (
-            await session.scalars(
-                select(Article).order_by(Article.id.desc()).limit(10)
-            )
-        ).all()
+    session_maker = _session_maker(context)
+
+    since = _window_start(days=30)
+    stmt = (
+        select(Article)
+        .where(Article.published_at >= since)
+        .where(Article.level.in_(["FKZ", "FZ"]))
+        .order_by(Article.published_at.desc())
+        .limit(10)
+    )
+
+    async with session_maker() as session:
+        articles = (await session.scalars(stmt)).all()
 
     if not articles:
-        await update.message.reply_text("Пока нет обработанных законов")
+        await update.message.reply_text("Пока нет федеральных законов за последние 30 дней")
         return
 
-    lines: list[str] = []
+    header_title = escape_markdown("Федеральные законы за последние 30 дней", version=2)
+    lines: list[str] = [f"*{header_title}*"]
     for i, article in enumerate(articles, 1):
         header = _format_summary(
             (article.summary or "")[:200],
@@ -167,52 +467,6 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "\n\n".join(lines), parse_mode="MarkdownV2"
-    )
-
-
-async def test_gigachat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработчик /test: smoke-тест подключения к GigaChat API.
-
-    Получает access-токен, список моделей и отправляет короткий запрос.
-    При ошибке не падает, а отвечает пользователю понятным текстом.
-    """
-    if update.message is None:
-        return
-    config = context.bot_data["config"]
-
-    client = GigaChatClient(
-        GigaChatConfig(
-            auth_key=config.GIGACHAT_AUTH_KEY,
-            model=config.GIGACHAT_MODEL,
-            verify_ssl=config.GIGACHAT_VERIFY_SSL,
-        )
-    )
-
-    try:
-        async with client:
-            token = await client.get_access_token()
-            models = await client.get_models()
-            reply = await client.complete(
-                [{"role": "user", "content": "Ответь одним словом: привет"}]
-            )
-    except GigaChatAuthError as exc:
-        await update.message.reply_text(f"Ошибка авторизации GigaChat:\n{exc}")
-        return
-    except GigaChatAPIError as exc:
-        await update.message.reply_text(f"Ошибка GigaChat API:\n{exc}")
-        return
-    except Exception as exc:
-        # Любая другая ошибка — не молчим, показываем пользователю
-        logger.exception("Неожиданная ошибка в /test")
-        await update.message.reply_text(f"Неожиданная ошибка:\n{exc}")
-        return
-
-    await update.message.reply_text(
-        "GigaChat работает.\n"
-        f"Токен получен: {token[:12]}...\n"
-        f"Доступно моделей: {len(models)}\n"
-        f"Тестовый ответ модели: {reply[:200]}"
     )
 
 
@@ -294,7 +548,17 @@ async def _summarize_and_reply(
     month = datetime.now().strftime("%Y-%m")
     limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
 
-    if not is_admin:
+    # авто-уровни без лимита (Конституция/ФКЗ/ФЗ) — проверяем по уже сохранённой статье
+    auto_bypass = False
+    try:
+        async with session_maker() as session:
+            lvl = await session.scalar(select(Article.level).where(Article.external_id == external_id))
+            if lvl in AUTO_LEVELS:
+                auto_bypass = True
+    except Exception:
+        pass
+
+    if not is_admin and not auto_bypass:
         async with session_maker() as session:
             usage = await session.scalar(
                 select(SummarizationUsage).where(
@@ -388,7 +652,7 @@ async def _summarize_and_reply(
                 title = external_id
                 url = f"http://publication.pravo.gov.ru/document/{external_id}"
 
-            if not is_admin:
+            if not is_admin and not auto_bypass:
                 usage = await session.scalar(
                     select(SummarizationUsage).where(
                         SummarizationUsage.user_id == user.id,
@@ -454,50 +718,6 @@ async def force_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _summarize_and_reply(context, user, external_id, message=query.message)
 
 
-async def notify_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /notify_me <external_id>: шлёт уведомление с кнопкой по закону из БД."""
-    if update.message is None:
-        return
-    session_maker = _session_maker(context)
-
-    args = context.args or []
-    if not args:
-        await update.message.reply_text(
-            "Использование: /notify_me <external_id или ссылка>\n"
-            "Например: /notify_me 0001202608060001"
-        )
-        return
-    external_id = _resolve_external_id(args[0])
-    if external_id is None:
-        await update.message.reply_text(
-            "Не удалось определить external_id. Укажите id или ссылку правового портала."
-        )
-        return
-
-    async with session_maker() as session:
-        article = await session.scalar(
-            select(Article).where(Article.external_id == external_id)
-        )
-
-    if article is None:
-        await update.message.reply_text(
-            f"Закон с external_id={external_id} не найден в базе."
-        )
-        return
-
-    text, reply_markup = _build_notification(
-        article, context.bot_data["config"].WEBAPP_URL
-    )
-    if update.effective_user is None:
-        return
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode="MarkdownV2",
-    )
-
-
 def _resolve_external_id(value: str) -> str | None:
     """Извлекает external_id из голого id или из ссылки правового портала."""
     value = value.strip()
@@ -544,3 +764,26 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _summarize_and_reply(
         context, user, external_id, status_message=status_message
     )
+
+
+# ── ConversationHandler для визарда «Сила» ───────────────────────────────
+level_wizard_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("settings", level_wizard_entry),
+        CallbackQueryHandler(level_choice, pattern=r"^wizard:(setup|skip)$"),
+    ],
+    states={
+        LEVEL_STATE: [
+            CallbackQueryHandler(level_choice, pattern=r"^(level:|levels:|wizard:)"),
+        ],
+    },
+    fallbacks=[
+        CommandHandler("cancel", level_cancel),
+        CallbackQueryHandler(level_cancel, pattern=r"^level:cancel$"),
+    ],
+    per_user=True,
+    per_chat=True,
+    per_message=False,
+    name="level_wizard",
+    persistent=False,
+)
