@@ -67,7 +67,8 @@ def _build_level_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("Выбрать всё", callback_data="levels:all")])
+    all_label = "Снять всё" if len(selected) == len(LEVELS) else "Выбрать всё"
+    rows.append([InlineKeyboardButton(all_label, callback_data="levels:all")])
     rows.append([InlineKeyboardButton("Далее", callback_data="levels:next")])
     return InlineKeyboardMarkup(rows)
 
