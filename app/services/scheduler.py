@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import re
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -26,7 +29,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
-from app.models import Article, User
+from app.models import Article, User, UserFilter
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.rss_parser import (
     RssError,
@@ -46,7 +49,14 @@ logger = logging.getLogger(__name__)
 # Префикс callback_data для кнопки «Сделать саммари»
 FORCE_SUMMARIZE_PREFIX = "force_sum:summary:"
 
+# Уровни правовой силы, документы которых всегда доставляются немедленно отдельным
+# сообщением, независимо от их числа за цикл (тот же набор, что is_important()
+# в rss_parser.py и AUTO_LEVELS в handlers.py)
+IMPORTANT_LEVELS = {"CONSTITUTION", "FKZ", "FZ"}
 
+# Мягкий технический потолок числа external_id в URL кнопки «Дайджест» — защита от
+# переполнения ссылки в «громкий» день; документы сверх потолка доступны через /latest
+DIGEST_ID_CAP = 30
 
 
 async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -74,6 +84,7 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     logger.info("В API %d документов, из них новых: %d", len(entries), len(new_entries))
 
+    processed_articles: list[Article] = []
     async with Summarizer(
         SummarizerConfig(
             auth_key=config.GIGACHAT_AUTH_KEY,
@@ -84,7 +95,12 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     ) as summarizer:
         for entry in new_entries:
-            await _process_entry(context, session_maker, summarizer, entry)
+            article = await _process_entry(context, session_maker, summarizer, entry)
+            if article is not None:
+                processed_articles.append(article)
+
+    if processed_articles:
+        await _notify_users_batch(context, session_maker, processed_articles)
 
 
 async def _run_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -141,8 +157,8 @@ async def _filter_new_entries(session_maker, entries: list) -> list:
     return [entry for entry in entries if entry.external_id not in existing]
 
 
-async def _process_entry(context, session_maker, summarizer: Summarizer, entry) -> None:
-    """Обрабатывает один новый документ: текст -> саммари -> БД -> рассылка."""
+async def _process_entry(context, session_maker, summarizer: Summarizer, entry) -> Article | None:
+    """Обрабатывает один новый документ: текст -> саммари -> БД. Рассылка — отдельным проходом."""
     logger.info("Обработка нового документа %s: %s", entry.external_id, entry.title)
 
     try:
@@ -175,13 +191,10 @@ async def _process_entry(context, session_maker, summarizer: Summarizer, entry) 
             except GigaChatError as exc:
                 logger.warning("Не удалось сделать саммари для %s: %s", entry.external_id, exc)
 
-        article = await _save_article(session_maker, entry, text, summary)
-        if article is None:
-            return  # дубль (гонка) — документ уже сохранил другой запуск
-
-        await _notify_users(context, session_maker, article)
+        return await _save_article(session_maker, entry, text, summary)
     except Exception:
         logger.exception("Ошибка обработки документа %s", entry.external_id)
+        return None
 
 
 async def _save_article(session_maker, entry, text: str | None, summary: str | None) -> Article | None:
@@ -213,11 +226,18 @@ async def _save_article(session_maker, entry, text: str | None, summary: str | N
     return article
 
 
-async def _notify_users(context, session_maker, article: Article) -> None:
-    """Рассылает уведомление о документе всем активным пользователям с учётом фильтра по силе."""
+async def _notify_users_batch(context, session_maker, articles: list[Article]) -> None:
+    """Рассылает уведомления о всех новых документах цикла каждому пользователю.
+
+    Для каждого пользователя список фильтруется по его ``UserFilter``, затем делится
+    на важные (``IMPORTANT_LEVELS``) и остальные. Важные доставляются отдельным
+    индивидуальным сообщением каждая (``_build_notification``), независимо от их
+    числа. Остальные: 1 подходящий — тоже индивидуальное сообщение, 2+ — один
+    тизер дайджеста (``_build_digest``) с кнопкой «Дайджест».
+    """
     # на первом прогоне после деплоя не спамим старыми законами
     if context.bot_data.get("is_first_run"):
-        logger.info("is_first_run — пропуск рассылки для %s (только сохранение)", article.external_id)
+        logger.info("is_first_run — пропуск рассылки для %d документов (только сохранение)", len(articles))
         return
 
     async with session_maker() as session:
@@ -231,95 +251,111 @@ async def _notify_users(context, session_maker, article: Article) -> None:
         logger.debug("Активных пользователей для рассылки нет")
         return
 
-    message, reply_markup = _build_notification(
-        article, context.bot_data["config"].WEBAPP_URL
-    )
+    webapp_url = context.bot_data["config"].WEBAPP_URL
     sent = 0
     for user in users:
         # фильтр по силе: пусто = Все, дефолт [Конституция,FKZ,FZ] уже в БД, но на всякий — пусто = Все
         # для нового юзера без настройки дефолт уже записан как 3 уровня, так что пусто действительно значит Все
         try:
-            from app.models.user_filter import UserFilter
-
             async with session_maker() as s2:
                 lvls = await s2.scalars(select(UserFilter.level).where(UserFilter.user_id == user.id))
                 levels = set(lvls.all())
             if levels:
-                # UNKNOWN только для Все (пусто)
-                if article.level == "UNKNOWN":
-                    logger.debug("Пропуск %s для %s: UNKNOWN только для Все", article.external_id, user.telegram_id)
-                    continue
-                # дефолт [Конституция,FKZ,FZ] — это не пусто, проверяем вхождение
-                if article.level not in levels:
-                    logger.debug(
-                        "Пропуск %s для %s: фильтр %s не содержит %s",
-                        article.external_id,
-                        user.telegram_id,
-                        levels,
-                        article.level,
-                    )
-                    continue
+                # UNKNOWN только для Все (пусто); дефолт [Конституция,FKZ,FZ] — не пусто, проверяем вхождение
+                matched = [a for a in articles if a.level != "UNKNOWN" and a.level in levels]
+            else:
+                matched = list(articles)
         except Exception:
             logger.exception("Ошибка проверки фильтра для %s", user.telegram_id)
-            # при ошибке — отправляем как раньше (fail open)
-        try:
-            await context.bot.send_message(
-                chat_id=user.telegram_id,
-                text=message,
-                reply_markup=reply_markup,
-                parse_mode="MarkdownV2",
-            )
-            sent += 1
-            # анти-спам пауза между пользователями
-            await asyncio.sleep(0.05)
-        except Exception as exc:
-            # обработка Telegram лимитов
-            msg = str(exc).lower()
-            if "retry after" in msg or "too many requests" in msg or "429" in msg:
-                # парсим RetryAfter если есть
-                retry_after = 2
-                try:
-                    import re
+            matched = list(articles)  # при ошибке — отправляем как раньше (fail open)
 
-                    m = re.search(r"retry after (\d+)", msg)
-                    if m:
-                        retry_after = int(m.group(1)) + 1
-                except Exception:
-                    pass
-                logger.warning("429 для %s, sleep %sс", user.telegram_id, retry_after)
-                await asyncio.sleep(retry_after)
-                try:
-                    await context.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=message,
-                        reply_markup=reply_markup,
-                        parse_mode="MarkdownV2",
-                    )
-                    sent += 1
-                except Exception:
-                    logger.warning(
-                        "Повторная отправка не удалась для %s",
-                        user.telegram_id,
-                        exc_info=True,
-                    )
-                    continue
-            elif "forbidden" in msg or "blocked" in msg or "403" in msg:
-                logger.warning("403 для %s — деактивируем", user.telegram_id)
-                try:
-                    async with session_maker() as s3:
-                        u = await s3.scalar(select(User).where(User.telegram_id == user.telegram_id))
-                        if u:
-                            u.is_active = False
-                            await s3.commit()
-                except Exception:
-                    logger.exception("Не удалось деактивировать %s", user.telegram_id)
-            else:
+        if not matched:
+            logger.debug("Пропуск рассылки для %s: нет подходящих документов", user.telegram_id)
+            continue
+
+        important = [a for a in matched if a.level in IMPORTANT_LEVELS]
+        rest = [a for a in matched if a.level not in IMPORTANT_LEVELS]
+
+        messages: list[tuple[str, InlineKeyboardMarkup]] = [
+            _build_notification(a, webapp_url) for a in important
+        ]
+        if len(rest) == 1:
+            messages.append(_build_notification(rest[0], webapp_url))
+        elif len(rest) >= 2:
+            messages.append(_build_digest(rest, webapp_url))
+
+        user_sent = False
+        for message, reply_markup in messages:
+            if await _send_notification(context, session_maker, user, message, reply_markup):
+                user_sent = True
+            # анти-спам пауза между отправками (и между пользователями)
+            await asyncio.sleep(0.05)
+
+        if user_sent:
+            sent += 1
+
+    logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
+
+
+async def _send_notification(context, session_maker, user: User, message: str, reply_markup) -> bool:
+    """Отправляет одно сообщение пользователю с обработкой лимита 429 и блокировки 403.
+
+    Возвращает True, если сообщение в итоге доставлено.
+    """
+    try:
+        await context.bot.send_message(
+            chat_id=user.telegram_id,
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2",
+        )
+        return True
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "retry after" in msg or "too many requests" in msg or "429" in msg:
+            # парсим RetryAfter если есть
+            retry_after = 2
+            try:
+                m = re.search(r"retry after (\d+)", msg)
+                if m:
+                    retry_after = int(m.group(1)) + 1
+            except Exception:
+                pass
+            logger.warning("429 для %s, sleep %sс", user.telegram_id, retry_after)
+            await asyncio.sleep(retry_after)
+            try:
+                await context.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=message,
+                    reply_markup=reply_markup,
+                    parse_mode="MarkdownV2",
+                )
+                return True
+            except Exception:
                 logger.warning(
-                    "Не удалось отправить уведомление пользователю %s",
+                    "Повторная отправка не удалась для %s",
+                    user.telegram_id,
+                    exc_info=True,
+                )
+                return False
+        elif "forbidden" in msg or "blocked" in msg or "403" in msg:
+            logger.warning("403 для %s — деактивируем", user.telegram_id)
+            try:
+                async with session_maker() as s3:
+                    u = await s3.scalar(select(User).where(User.telegram_id == user.telegram_id))
+                    if u:
+                        u.is_active = False
+                        await s3.commit()
+            except Exception:
+                logger.exception("Не удалось деактивировать %s", user.telegram_id)
+            return False
+        else:
+            logger.warning(
+                "Не удалось отправить уведомление пользователю %s",
                 user.telegram_id,
                 exc_info=True,
             )
-    logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
+            return False
 
 
 def _build_notification(
@@ -372,4 +408,53 @@ def _build_notification(
     # Если кнопок нет (саммари есть, но webapp не настроен) — вернуть пустую разметку
     if not buttons:
         return text, InlineKeyboardMarkup([])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _build_digest(
+    articles: list[Article], webapp_url: str | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует MarkdownV2-тизер дайджеста: до 3 случайных документов + кнопка «Дайджест».
+
+    Показывает не больше 3 случайно выбранных ``articles`` (все, если их не больше
+    3), пронумерованных (1., 2., ...) — полный заголовок, саммари при наличии,
+    ссылка на портал — плюс общее число документов дайджеста. Кнопка «Дайджест»
+    открывает WebApp со всеми ``articles``,
+    подходящими пользователю за цикл, до ``DIGEST_ID_CAP`` штук (остаток доступен
+    через /latest); без ``webapp_url`` кнопка не добавляется, текст не меняется.
+    """
+    header_esc = escape_markdown(f"Приняли новые законы — {len(articles)}", version=2)
+    lines: list[str] = [f"*{header_esc}*"]
+
+    sample = articles if len(articles) <= 3 else random.sample(articles, 3)
+    for i, article in enumerate(sample, 1):
+        title_clean = _normalize_text(article.title) or article.title
+        title_esc = escape_markdown(f"{i}. {title_clean}", version=2)
+        url_esc = escape_markdown(article.url, version=2)
+        if article.summary:
+            summary_clean = _normalize_text(article.summary) or article.summary
+            summary_esc = escape_markdown(summary_clean, version=2)
+            block = f"*{title_esc}*\n{summary_esc}\n[Читать на портале]({url_esc})"
+        else:
+            block = f"*{title_esc}*\n[Читать на портале]({url_esc})"
+        lines.append(block)
+
+    if len(sample) < len(articles):
+        lines.append(escape_markdown("Все документы — в полном списке по кнопке ниже", version=2))
+
+    text = "\n\n".join(lines)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    if webapp_url:
+        capped = articles[:DIGEST_ID_CAP]
+        ids_param = ",".join(quote(a.external_id, safe="") for a in capped)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📖 Дайджест",
+                    web_app=WebAppInfo(url=f"{webapp_url.rstrip('/')}/app?ids={ids_param}"),
+                )
+            ]
+        )
+
     return text, InlineKeyboardMarkup(buttons)

@@ -2,8 +2,14 @@
 
 Запускается вместе с ботом (main.py -> post_init) на WEBAPP_HOST:WEBAPP_PORT
 и отдаёт два роута:
-  GET /app?external_id=<id>            — HTML-страница фронтенда
+  GET /app?external_id=<id>            — HTML-страница фронтенда, один документ
+  GET /app?ids=<id1>,<id2>,...         — та же страница, аккордеон из нескольких
+                                          документов (кнопка «Полные тексты» дайджеста)
   GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available}
+
+Режим ``ids`` переиспользует существующий ``/full_text`` (по одному запросу на
+документ), а не отдельный batch-эндпоинт — проще и достаточно для размеров
+дайджеста, ограниченных ``DIGEST_ID_CAP`` в scheduler.py.
 """
 
 from __future__ import annotations
@@ -42,16 +48,30 @@ HTML_PAGE = r"""<!doctype html>
   .link a { color: var(--tg-theme-link-color, #2688d4); text-decoration: none; word-break: break-all; }
   .error { color: #842029; background: #f8d7da; border: 1px solid #f5c2c7; border-radius: 8px; padding: 12px; }
   .loading { color: #555; }
+  .digest-hint { color: var(--tg-theme-hint-color, #707579); font-size: 13px; margin: 0 0 10px 0; }
+  .doc { border: 1px solid var(--tg-theme-hint-color, #ddd); border-radius: 8px; margin-bottom: 10px; }
+  .doc summary { cursor: pointer; padding: 12px; font-weight: 600; list-style: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc summary::-webkit-details-marker { display: none; }
+  .doc summary::before { content: "▸ "; }
+  .doc[open] summary::before { content: "▾ "; }
+  .doc-body { padding: 0 12px 12px 12px; }
+  .doc-title { font-weight: 700; margin: 0 0 8px 0; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="beta">Beta</div>
   <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки.</div>
-  <h1 id="title" class="title loading">Загрузка…</h1>
-  <div id="date" class="date"></div>
-  <div id="content" class="text loading">Загрузка текста закона…</div>
-  <div id="link" class="link"></div>
+  <div id="single">
+    <h1 id="title" class="title loading">Загрузка…</h1>
+    <div id="date" class="date"></div>
+    <div id="content" class="text loading">Загрузка текста закона…</div>
+    <div id="link" class="link"></div>
+  </div>
+  <div id="digest" style="display:none">
+    <div class="digest-hint">👆 Нажмите на закон, чтобы посмотреть текст</div>
+    <div id="digest-list"></div>
+  </div>
 </div>
 <script>
 (function() {
@@ -132,6 +152,70 @@ HTML_PAGE = r"""<!doctype html>
   }
 
   const params = new URLSearchParams(window.location.search);
+  const idsParam = params.get('ids');
+  if (idsParam) {
+    document.getElementById('single').style.display = 'none';
+    const digestEl = document.getElementById('digest');
+    const digestListEl = document.getElementById('digest-list');
+    digestEl.style.display = 'block';
+    const ids = idsParam.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    if (!ids.length) {
+      digestListEl.innerHTML = '<div class="error">Не переданы документы дайджеста. URL: ' + escapeHtml(window.location.href) + '</div>';
+      return;
+    }
+    ids.forEach(function(rawId) {
+      let id = rawId;
+      try { id = decodeURIComponent(rawId); } catch (e) { /* оставляем как есть */ }
+      const details = document.createElement('details');
+      details.className = 'doc';
+      const summary = document.createElement('summary');
+      summary.textContent = 'Загрузка…';
+      const body = document.createElement('div');
+      body.className = 'doc-body loading';
+      body.textContent = 'Загрузка текста закона…';
+      details.appendChild(summary);
+      details.appendChild(body);
+      digestListEl.appendChild(details);
+
+      fetch(window.location.origin + '/full_text?external_id=' + encodeURIComponent(id))
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          const title = data.title || id;
+          summary.textContent = title;
+          // полный заголовок дублируется в теле секции — <summary> обрезается CSS-эллипсисом
+          let html = '<div class="doc-title">' + escapeHtml(title) + '</div>';
+          try {
+            const d = extractSigningDate(data.text || '', data.title || '');
+            if (d) html += '<div class="date">Дата подписания: ' + escapeHtml(d) + '</div>';
+          } catch (e) { /* дата не критична */ }
+          if (data.is_text_available && data.text) {
+            try {
+              html += renderLawText(data.text);
+            } catch (e) {
+              console.error('render error', e);
+              html += '<p>' + escapeHtml(String(data.text)) + '</p>';
+            }
+          } else {
+            html += '<p class="error">Текст этого закона пока недоступен в текстовом формате. Откройте оригинал на портале.</p>';
+          }
+          if (data.url) {
+            html += '<div class="link"><a href="' + String(data.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener">Читать на портале</a></div>';
+          }
+          body.innerHTML = html;
+          body.className = 'doc-body';
+        })
+        .catch(function(err) {
+          summary.textContent = id;
+          body.textContent = 'Не удалось загрузить текст: ' + err.message;
+          body.className = 'doc-body error';
+        });
+    });
+    return;
+  }
+
   let externalId = params.get('external_id');
   if (!externalId) {
     const m = window.location.href.match(/[?&]external_id=([^&]+)/);
