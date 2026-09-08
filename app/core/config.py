@@ -214,7 +214,7 @@ class Config:
             os.getenv("PRAVO_API_URL", "").strip()
             or _DEFAULT_PRAVO_API_URL
         )
-        log_file = os.getenv("LOG_FILE", "app.log").strip() or None
+        log_file = os.getenv("LOG_FILE", "logs/app.log").strip() or None
         log_retention_days = _get_int_env("LOG_RETENTION_DAYS", 30)
 
         webapp_host = os.getenv("WEBAPP_HOST", "127.0.0.1").strip() or "127.0.0.1"

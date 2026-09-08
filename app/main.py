@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import os
 from datetime import datetime, time, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_logging(config: Config) -> None:
-    """Консоль + файл (app.log) с суточной ротацией и хранением 30 дней."""
+    """Консоль + файл (logs/app.log) с суточной ротацией и хранением 30 дней."""
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     root = logging.getLogger()
@@ -46,6 +47,9 @@ def _configure_logging(config: Config) -> None:
     root.addHandler(console)
 
     if config.LOG_FILE:
+        log_dir = os.path.dirname(config.LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         file_handler = TimedRotatingFileHandler(
             config.LOG_FILE,
             when="midnight",  # ротация каждый день в полночь
