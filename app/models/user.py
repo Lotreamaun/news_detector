@@ -28,9 +28,16 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger(), unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # если пользователь заблокирует бота, здесь просто поменяется флаг на False
-    is_active: Mapped[bool] = mapped_column(Boolean(), 
-    default=True, 
+    is_active: Mapped[bool] = mapped_column(Boolean(),
+    default=True,
     server_default=text("1")
+    )
+    # подтверждение подписки на обязательный Telegram-канал (гейт для новых регистраций,
+    # server_default=True сохраняет текущее поведение для уже существующих строк)
+    channel_verified: Mapped[bool] = mapped_column(
+        Boolean(),
+        default=True,
+        server_default=text("1"),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

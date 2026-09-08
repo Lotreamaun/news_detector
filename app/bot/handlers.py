@@ -11,6 +11,7 @@ from telegram.helpers import escape_markdown
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
 from app.models import Article, SummarizationUsage, User
+from app.services.channel_subscription import is_subscribed
 from app.services.gigachat import (
     GigaChatAPIError,
     GigaChatAuthError,
@@ -331,7 +332,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if user is None:
             from app.models.user_filter import UserFilter
 
-            user = User(telegram_id=telegram_id, username=username)
+            user = User(telegram_id=telegram_id, username=username, channel_verified=False)
             session.add(user)
             await session.flush()
             # дефолт для нового юзера — Конституция + ФКЗ + ФЗ
@@ -346,16 +347,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_new:
         markup = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Настроить", callback_data="wizard:setup")],
-                [InlineKeyboardButton("Пропустить → Все", callback_data="wizard:skip")],
-                [InlineKeyboardButton("🔍 Показать пример уведомления", callback_data="show_example")],
-            ]
+            [[InlineKeyboardButton("Как это работает?", callback_data="onboarding:example")]]
         )
         await update.message.reply_text(
-            "Привет! Присылаю саммари новых законов по твоим фильтрам.\n"
-            "Например, юристу по крипте — оставь только ФЗ, остальное сними.\n"
-            "Начни с /settings — выбери силу, или жми /latest — последние ФКЗ/ФЗ за 30 дней.",
+            "Привет! Я слежу за новыми российскими законами и присылаю короткие саммари, когда выходит что-то важное.",
             reply_markup=markup,
         )
     else:
@@ -394,12 +389,12 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(text=text, reply_markup=markup)
 
 
-async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает тестовое уведомление — один из последних FZ, как в проде."""
-    query = update.callback_query
-    if query is None:
-        return
-    await query.answer()
+async def _send_example_notification(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Шлёт тестовое уведомление — один из последних FZ, как в проде.
+
+    Переиспользуется и обычной кнопкой «Показать пример», и онбордингом
+    нового пользователя («Как это работает?»).
+    """
     session_maker = _session_maker(context)
     # последний принятый ФЗ (сначала по level, затем по заголовку для старых с UNKNOWN)
     since = _window_start(days=30)
@@ -443,6 +438,70 @@ async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         logger.exception("Не удалось отправить пример уведомления")
         await query.message.reply_text("Не удалось показать пример. Попробуйте /latest")
+
+
+async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback-обработчик кнопки «Показать пример уведомления»."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    await _send_example_notification(query, context)
+
+
+async def onboarding_show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Онбординг нового пользователя: «Как это работает?» → тестовое уведомление → гейт подписки."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    await _send_example_notification(query, context)
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
+    )
+    await query.message.reply_text(
+        "Чтобы получать такие уведомления регулярно, подпишись на канал и нажми «Проверить подписку».",
+        reply_markup=markup,
+    )
+
+
+async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback-обработчик кнопки «Проверить подписку» на обязательный канал."""
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+
+    config = context.bot_data["config"]
+    telegram_id = update.effective_user.id
+
+    subscribed = await is_subscribed(context.bot, telegram_id, config.REQUIRED_CHANNEL_ID)
+
+    if not subscribed:
+        await query.answer("Подписка не найдена")
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
+        )
+        await query.edit_message_text(
+            "Подписка на канал не найдена. Подпишитесь и нажмите «Проверить подписку» ещё раз.",
+            reply_markup=markup,
+        )
+        return
+
+    await query.answer()
+    session_maker = _session_maker(context)
+    async with session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if user is not None:
+            user.channel_verified = True
+            await session.commit()
+
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Настроить", callback_data="wizard:setup")],
+            [InlineKeyboardButton("Пропустить → Все", callback_data="wizard:skip")],
+        ]
+    )
+    await query.edit_message_text("Подписка подтверждена! Настроим фильтры:", reply_markup=markup)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -2,6 +2,7 @@
 Конфигурация сервиса News Detector
 """
 
+import logging
 import os  # Импорт стандартного модуля os. Дает доступ к переменным окружения через os.getenv
 from dataclasses import dataclass
     # Декоратор @dataclass генерирует шаблонный код в классе, 
@@ -162,6 +163,10 @@ class Config:
     # Админы с безлимитными саммари (для тестирования)
     ADMIN_CHAT_IDS: tuple[int, ...]
 
+    # Обязательный Telegram-канал для гейта подписки (numeric chat id или @username).
+    # Пусто = гейт отключён (см. app/services/channel_subscription.py).
+    REQUIRED_CHANNEL_ID: str | None
+
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
         # Загружает переменные из .env
@@ -216,6 +221,11 @@ class Config:
         webapp_port = _get_int_env("WEBAPP_PORT", 8080)
         webapp_url = os.getenv("WEBAPP_URL", "").strip()
         admin_chat_ids = _get_int_list_env("ADMIN_CHAT_IDS")
+        required_channel_id = os.getenv("REQUIRED_CHANNEL_ID", "").strip() or None
+        if required_channel_id is None:
+            logging.getLogger(__name__).warning(
+                "REQUIRED_CHANNEL_ID не задан, гейт подписки на канал отключён"
+            )
 
         # Проверяем насколько логичные значения
         if check_interval_minutes <= 0:
@@ -254,4 +264,5 @@ class Config:
             WEBAPP_PORT=webapp_port,
             WEBAPP_URL=webapp_url,
             ADMIN_CHAT_IDS=admin_chat_ids,
+            REQUIRED_CHANNEL_ID=required_channel_id,
         )

@@ -4,7 +4,9 @@
 
 from typing import Optional  # аннотация типа: переманная может содержать тип или быть None
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,  # Класс-тип для соединения в рамках транзакции
     AsyncEngine,  # Класс-тип для движка: отвечает за связь с БД
     AsyncSession,  # Класс-тип для сессии (один сеанс работы)
     async_sessionmaker,  # Фабрика для создания сессий
@@ -103,3 +105,20 @@ async def init_db_schema() -> None:
         # run_sync запускает синхронную функцию create_all
         # Base.metadata.create_all: SQLite смотри все модели и создает таблицы, которых еще нет в БД
         await connection.run_sync(Base.metadata.create_all)
+        await _ensure_channel_verified_column(connection)
+
+
+async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``channel_verified`` в уже существующую таблицу ``users``.
+
+    ``create_all`` не трогает существующие таблицы (только ``CREATE TABLE IF NOT EXISTS``),
+    поэтому новая колонка на БД, созданной до этого change, не появится сама — добавляем
+    её вручную и идемпотентно (безопасно при повторных запусках).
+    """
+    result = await connection.execute(text("PRAGMA table_info(users)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "channel_verified" not in columns:
+        await connection.execute(
+            text("ALTER TABLE users ADD COLUMN channel_verified BOOLEAN NOT NULL DEFAULT 1")
+        )

@@ -11,10 +11,12 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 from app.bot.handlers import (
+    check_subscription,
     force_summarize,
     help_command,
     latest,
     level_wizard_handler,
+    onboarding_show_example,
     show_example,
     start,
     summary_command,
@@ -76,6 +78,10 @@ def _build_application(config: Config) -> Application:
 
     application.add_handler(level_wizard_handler)
     application.add_handler(CallbackQueryHandler(show_example, pattern=r"^show_example$"))
+    application.add_handler(
+        CallbackQueryHandler(onboarding_show_example, pattern=r"^onboarding:example$")
+    )
+    application.add_handler(CallbackQueryHandler(check_subscription, pattern=r"^check_subscription$"))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("help", help_command))

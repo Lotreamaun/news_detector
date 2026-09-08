@@ -222,7 +222,9 @@ async def _notify_users(context, session_maker, article: Article) -> None:
 
     async with session_maker() as session:
         users = (
-            await session.scalars(select(User).where(User.is_active.is_(True)))
+            await session.scalars(
+                select(User).where(User.is_active.is_(True), User.channel_verified.is_(True))
+            )
         ).all()
 
     if not users:
