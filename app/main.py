@@ -14,6 +14,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 from app.bot.handlers import (
     check_subscription,
     force_summarize,
+    force_summarize_digest,
     help_command,
     latest,
     level_wizard_handler,
@@ -21,6 +22,7 @@ from app.bot.handlers import (
     show_example,
     start,
     summary_command,
+    test_digest_command,
 )
 from app.core.config import Config
 from app.core.database import (
@@ -93,6 +95,10 @@ def _build_application(config: Config) -> Application:
     application.add_handler(
         CallbackQueryHandler(force_summarize, pattern=r"^force_sum:summary:")
     )
+    application.add_handler(
+        CallbackQueryHandler(force_summarize_digest, pattern=r"^force_sum:digest:")
+    )
+    application.add_handler(CommandHandler("test_digest", test_digest_command))
 
     return application
 

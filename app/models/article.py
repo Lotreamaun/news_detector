@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text, text  # в string фиксированная длина, в text - произвольная
+from sqlalchemy import Boolean, DateTime, String, Text, text  # в string фиксированная длина, в text - произвольная
 from sqlalchemy.orm import (
     Mapped, # обертка для типов
     mapped_column # настраивает колонку
@@ -37,4 +37,13 @@ class Article(Base):
     published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),  # нужно сохранять дату вместе с часовым поясом
         nullable=True,
+    )
+    # False = ожидает рассылки; каждый цикл проверки подхватывает все notified=False
+    # статьи (включая «зависшие» после падения процесса между сохранением и рассылкой),
+    # а не только сохранённые в текущем цикле — см. app/services/scheduler.py
+    notified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("0"),
     )

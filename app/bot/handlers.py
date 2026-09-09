@@ -19,8 +19,13 @@ from app.services.gigachat import (
     GigaChatConfig,
     GigaChatError,
 )
-from app.services.rss_parser import _normalize_text, get_legal_text, ocr_document_text
-from app.services.scheduler import FORCE_SUMMARIZE_PREFIX, _build_notification
+from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text, get_legal_text, ocr_document_text
+from app.services.scheduler import (
+    DIGEST_SUMMARIZE_PREFIX,
+    FORCE_SUMMARIZE_PREFIX,
+    _build_digest,
+    _build_notification,
+)
 from app.services.summarizer import Summarizer, SummarizerConfig
 
 logger = logging.getLogger(__name__)
@@ -45,8 +50,8 @@ LEVEL_LABELS: dict[str, str] = {
     "DEPARTMENTAL": "Ведомственные",
     "REGIONAL": "Региональные",
 }
-DEFAULT_LEVELS: set[str] = {"CONSTITUTION", "FKZ", "FZ"}
-AUTO_LEVELS: set[str] = {"CONSTITUTION", "FKZ", "FZ"}
+DEFAULT_LEVELS: set[str] = set(IMPORTANT_LEVELS)
+AUTO_LEVELS: frozenset[str] = IMPORTANT_LEVELS
 LEVEL_STATE: int = 0
 
 
@@ -836,6 +841,107 @@ async def force_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "⏳ Саммари в процессе создания…", reply_markup=None
         )
     await _summarize_and_reply(context, user, external_id, message=query.message)
+
+
+async def force_summarize_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback-обработчик кнопки «Сделать саммари №N» внутри тизера дайджеста.
+
+    В отличие от force_summarize, НЕ правит исходное сообщение (там ещё 1-2
+    других пункта дайджеста) — результат уходит отдельным новым сообщением,
+    как при команде /summary.
+    """
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+    await query.answer()
+
+    session_maker = _session_maker(context)
+    telegram_id = update.effective_user.id
+
+    data = query.data or ""
+    if not data.startswith(DIGEST_SUMMARIZE_PREFIX):
+        return
+    external_id = data[len(DIGEST_SUMMARIZE_PREFIX):].strip()
+    if not external_id:
+        return
+
+    user = await _get_or_create_user(session_maker, telegram_id, update)
+    if user is None:
+        return
+
+    status_message = None
+    if query.message is not None:
+        status_message = await query.message.reply_text("⏳ Саммари в процессе создания…")
+    await _summarize_and_reply(context, user, external_id, status_message=status_message)
+
+
+async def test_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отладочная команда /test_digest real <N>: строит тизер дайджеста из N реальных
+    статей БД (`_build_digest`, тот же код, что и в проде) и присылает его только
+    вызвавшему администратору — НЕ запускает `_notify_users_batch` и не рассылает
+    остальным подписчикам.
+    """
+    if update.message is None or update.effective_user is None:
+        return
+    config = context.bot_data["config"]
+    telegram_id = update.effective_user.id
+    if telegram_id not in getattr(config, "ADMIN_CHAT_IDS", ()):
+        await update.message.reply_text("Команда доступна только администраторам.")
+        return
+
+    args = context.args or []
+    if len(args) < 2 or args[0] != "real":
+        await update.message.reply_text(
+            "Использование: /test_digest real <N>\nНапример: /test_digest real 4"
+        )
+        return
+    try:
+        count = int(args[1])
+    except ValueError:
+        await update.message.reply_text("N должно быть числом. Например: /test_digest real 4")
+        return
+    if count < 1:
+        await update.message.reply_text("N должно быть не меньше 1.")
+        return
+
+    session_maker = _session_maker(context)
+    async with session_maker() as session:
+        # предпочитаем не важные уровни — именно они уходят в дайджест (2+) в проде
+        primary = list(
+            (
+                await session.scalars(
+                    select(Article)
+                    .where(Article.level.notin_(IMPORTANT_LEVELS))
+                    .order_by(Article.id.desc())
+                    .limit(count)
+                )
+            ).all()
+        )
+        if len(primary) < count:
+            exclude_ids = [a.id for a in primary]
+            extra = list(
+                (
+                    await session.scalars(
+                        select(Article)
+                        .where(Article.id.notin_(exclude_ids))
+                        .order_by(Article.id.desc())
+                        .limit(count - len(primary))
+                    )
+                ).all()
+            )
+            primary += extra
+        articles = primary
+
+    if not articles:
+        await update.message.reply_text("В БД нет ни одной статьи для теста.")
+        return
+
+    text, reply_markup = _build_digest(articles, config.WEBAPP_URL)
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "[test_digest] Использовано "
+        f"{len(articles)} реальных статей: " + ", ".join(a.external_id for a in articles)
+    )
 
 
 def _resolve_external_id(value: str) -> str | None:

@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import re
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
@@ -32,6 +31,7 @@ from telegram.helpers import escape_markdown
 from app.models import Article, User, UserFilter
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.rss_parser import (
+    IMPORTANT_LEVELS,
     RssError,
     _normalize_text,
     classify_level,
@@ -46,17 +46,20 @@ from app.services.summarizer import Summarizer, SummarizerConfig
 
 logger = logging.getLogger(__name__)
 
-# Префикс callback_data для кнопки «Сделать саммари»
+# Префикс callback_data для кнопки «Сделать саммари» в одиночном уведомлении
+# (правит существующее сообщение — уместно, когда сообщение об одном документе)
 FORCE_SUMMARIZE_PREFIX = "force_sum:summary:"
-
-# Уровни правовой силы, документы которых всегда доставляются немедленно отдельным
-# сообщением, независимо от их числа за цикл (тот же набор, что is_important()
-# в rss_parser.py и AUTO_LEVELS в handlers.py)
-IMPORTANT_LEVELS = {"CONSTITUTION", "FKZ", "FZ"}
+# Префикс для той же кнопки внутри тизера дайджеста: результат уходит НОВЫМ
+# сообщением (не правит текст тизера — иначе стёрлись бы остальные пункты)
+DIGEST_SUMMARIZE_PREFIX = "force_sum:digest:"
 
 # Мягкий технический потолок числа external_id в URL кнопки «Дайджест» — защита от
 # переполнения ссылки в «громкий» день; документы сверх потолка доступны через /latest
 DIGEST_ID_CAP = 30
+
+# Порядок значимости уровней внутри дайджеста (не входящих в IMPORTANT_LEVELS),
+# от более значимого к менее — используется только для сортировки тизера/кнопки
+_REST_LEVEL_ORDER = ("DECREE", "GOV_RESOLUTION", "DEPARTMENTAL", "REGIONAL")
 
 
 async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -74,33 +77,34 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         entries = await fetch_documents(config.PRAVO_API_URL)
+        new_entries = await _filter_new_entries(session_maker, entries)
     except RssError:
-        logger.exception("Проверка отменена: не удалось загрузить/разобрать API")
+        logger.exception("Не удалось загрузить/разобрать API — пропускаем эту часть цикла")
+        new_entries = []
+    else:
+        logger.info("В API %d документов, из них новых: %d", len(entries), len(new_entries))
+
+    if new_entries:
+        async with Summarizer(
+            SummarizerConfig(
+                auth_key=config.GIGACHAT_AUTH_KEY,
+                model=config.GIGACHAT_MODEL,
+                min_len=config.SUMMARY_MIN_LEN,
+                max_len=config.SUMMARY_MAX_LEN,
+                verify_ssl=config.GIGACHAT_VERIFY_SSL,
+            )
+        ) as summarizer:
+            for entry in new_entries:
+                await _process_entry(context, session_maker, summarizer, entry)
+
+    # Рассылаем ВСЕ ещё не разосланные статьи, а не только сохранённые в этом
+    # цикле — так подхватываются и «зависшие» после падения процесса между
+    # сохранением и рассылкой (см. Article.notified).
+    pending = await _fetch_pending_articles(session_maker)
+    if not pending:
         return
-
-    new_entries = await _filter_new_entries(session_maker, entries)
-    if not new_entries:
-        logger.info("В API %d документов, новых нет — рассылка не требуется", len(entries))
-        return
-    logger.info("В API %d документов, из них новых: %d", len(entries), len(new_entries))
-
-    processed_articles: list[Article] = []
-    async with Summarizer(
-        SummarizerConfig(
-            auth_key=config.GIGACHAT_AUTH_KEY,
-            model=config.GIGACHAT_MODEL,
-            min_len=config.SUMMARY_MIN_LEN,
-            max_len=config.SUMMARY_MAX_LEN,
-            verify_ssl=config.GIGACHAT_VERIFY_SSL,
-        )
-    ) as summarizer:
-        for entry in new_entries:
-            article = await _process_entry(context, session_maker, summarizer, entry)
-            if article is not None:
-                processed_articles.append(article)
-
-    if processed_articles:
-        await _notify_users_batch(context, session_maker, processed_articles)
+    await _notify_users_batch(context, session_maker, pending)
+    await _mark_notified(session_maker, [a.id for a in pending])
 
 
 async def _run_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,7 +138,8 @@ async def _run_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Бэкфилл день %s не удался: %s, продолжаем", day, exc)
             continue
         for entry in entries:
-            article = await _save_article(session_maker, entry, None, None)
+            # notified=True: бэкфилл истории не должен рассылаться пользователям
+            article = await _save_article(session_maker, entry, None, None, notified=True)
             if article is not None:
                 stored += 1
         await asyncio.sleep(0.2)
@@ -155,6 +160,25 @@ async def _filter_new_entries(session_maker, entries: list) -> list:
             ).all()
         )
     return [entry for entry in entries if entry.external_id not in existing]
+
+
+async def _fetch_pending_articles(session_maker) -> list[Article]:
+    """Возвращает все ещё не разосланные статьи (``notified=False``), не только новые за цикл."""
+    async with session_maker() as session:
+        return list(
+            (await session.scalars(select(Article).where(Article.notified.is_(False)))).all()
+        )
+
+
+async def _mark_notified(session_maker, article_ids: list[int]) -> None:
+    """Помечает статьи как разосланные — вызывается после успешного завершения рассылки."""
+    if not article_ids:
+        return
+    async with session_maker() as session:
+        await session.execute(
+            update(Article).where(Article.id.in_(article_ids)).values(notified=True)
+        )
+        await session.commit()
 
 
 async def _process_entry(context, session_maker, summarizer: Summarizer, entry) -> Article | None:
@@ -197,8 +221,14 @@ async def _process_entry(context, session_maker, summarizer: Summarizer, entry) 
         return None
 
 
-async def _save_article(session_maker, entry, text: str | None, summary: str | None) -> Article | None:
-    """Сохраняет документ в БД; None, если запись уже существует (гонка)."""
+async def _save_article(
+    session_maker, entry, text: str | None, summary: str | None, *, notified: bool = False
+) -> Article | None:
+    """Сохраняет документ в БД; None, если запись уже существует (гонка).
+
+    ``notified=True`` — только для бэкфилла: статья считается уже разосланной
+    (точнее, никогда не подлежащей рассылке) сразу при сохранении.
+    """
     level = classify_level_for_title(entry.title, entry.document_type_id)
     article = Article(
         external_id=entry.external_id,
@@ -208,6 +238,7 @@ async def _save_article(session_maker, entry, text: str | None, summary: str | N
         url=entry.url,
         level=level,
         published_at=entry.published_at,
+        notified=notified,
     )
     try:
         async with session_maker() as session:
@@ -227,8 +258,11 @@ async def _save_article(session_maker, entry, text: str | None, summary: str | N
 
 
 async def _notify_users_batch(context, session_maker, articles: list[Article]) -> None:
-    """Рассылает уведомления о всех новых документах цикла каждому пользователю.
+    """Рассылает уведомления о всех ``articles``, ожидающих рассылки, каждому пользователю.
 
+    ``articles`` — не обязательно только новые документы текущего цикла: сюда же
+    попадают статьи, «зависшие» с прошлого цикла из-за сбоя между сохранением и
+    рассылкой (см. ``Article.notified`` и ``_fetch_pending_articles``).
     Для каждого пользователя список фильтруется по его ``UserFilter``, затем делится
     на важные (``IMPORTANT_LEVELS``) и остальные. Важные доставляются отдельным
     индивидуальным сообщением каждая (``_build_notification``), независимо от их
@@ -247,60 +281,80 @@ async def _notify_users_batch(context, session_maker, articles: list[Article]) -
             )
         ).all()
 
-    if not users:
-        logger.debug("Активных пользователей для рассылки нет")
-        return
+        if not users:
+            logger.debug("Активных пользователей для рассылки нет")
+            return
+
+        # фильтры всех пользователей одним запросом вместо запроса на пользователя
+        filters_by_user: dict[int, set[str]] = {}
+        try:
+            rows = await session.execute(
+                select(UserFilter.user_id, UserFilter.level).where(
+                    UserFilter.user_id.in_([u.id for u in users])
+                )
+            )
+            for user_id, level in rows.all():
+                filters_by_user.setdefault(user_id, set()).add(level)
+        except Exception:
+            logger.exception("Ошибка загрузки фильтров пользователей — рассылаем всем без фильтра")
+            filters_by_user = {}
 
     webapp_url = context.bot_data["config"].WEBAPP_URL
     sent = 0
     for user in users:
         # фильтр по силе: пусто = Все, дефолт [Конституция,FKZ,FZ] уже в БД, но на всякий — пусто = Все
         # для нового юзера без настройки дефолт уже записан как 3 уровня, так что пусто действительно значит Все
-        try:
-            async with session_maker() as s2:
-                lvls = await s2.scalars(select(UserFilter.level).where(UserFilter.user_id == user.id))
-                levels = set(lvls.all())
-            if levels:
-                # UNKNOWN только для Все (пусто); дефолт [Конституция,FKZ,FZ] — не пусто, проверяем вхождение
-                matched = [a for a in articles if a.level != "UNKNOWN" and a.level in levels]
-            else:
-                matched = list(articles)
-        except Exception:
-            logger.exception("Ошибка проверки фильтра для %s", user.telegram_id)
-            matched = list(articles)  # при ошибке — отправляем как раньше (fail open)
+        levels = filters_by_user.get(user.id, set())
+        if levels:
+            # UNKNOWN только для Все (пусто); дефолт [Конституция,FKZ,FZ] — не пусто, проверяем вхождение
+            matched = [a for a in articles if a.level != "UNKNOWN" and a.level in levels]
+        else:
+            matched = list(articles)
 
         if not matched:
             logger.debug("Пропуск рассылки для %s: нет подходящих документов", user.telegram_id)
             continue
 
-        important = [a for a in matched if a.level in IMPORTANT_LEVELS]
-        rest = [a for a in matched if a.level not in IMPORTANT_LEVELS]
+        try:
+            important = [a for a in matched if a.level in IMPORTANT_LEVELS]
+            rest = [a for a in matched if a.level not in IMPORTANT_LEVELS]
 
-        messages: list[tuple[str, InlineKeyboardMarkup]] = [
-            _build_notification(a, webapp_url) for a in important
-        ]
-        if len(rest) == 1:
-            messages.append(_build_notification(rest[0], webapp_url))
-        elif len(rest) >= 2:
-            messages.append(_build_digest(rest, webapp_url))
+            messages: list[tuple[str, InlineKeyboardMarkup]] = [
+                _build_notification(a, webapp_url) for a in important
+            ]
+            if len(rest) == 1:
+                messages.append(_build_notification(rest[0], webapp_url))
+            elif len(rest) >= 2:
+                messages.append(_build_digest(rest, webapp_url))
 
-        user_sent = False
-        for message, reply_markup in messages:
-            if await _send_notification(context, session_maker, user, message, reply_markup):
-                user_sent = True
-            # анти-спам пауза между отправками (и между пользователями)
-            await asyncio.sleep(0.05)
+            user_sent = False
+            for message, reply_markup in messages:
+                result = await _send_notification(context, session_maker, user, message, reply_markup)
+                if result is None:
+                    # пользователь заблокировал бота и деактивирован — дальше слать нечего
+                    break
+                if result:
+                    user_sent = True
+                # анти-спам пауза между отправками (и между пользователями)
+                await asyncio.sleep(0.05)
 
-        if user_sent:
-            sent += 1
+            if user_sent:
+                sent += 1
+        except Exception:
+            # Не даём сбою на одном пользователе (например, при построении сообщения)
+            # прервать рассылку остальным
+            logger.exception("Ошибка рассылки пользователю %s — пропуск", user.telegram_id)
+            continue
 
     logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
 
 
-async def _send_notification(context, session_maker, user: User, message: str, reply_markup) -> bool:
+async def _send_notification(context, session_maker, user: User, message: str, reply_markup) -> bool | None:
     """Отправляет одно сообщение пользователю с обработкой лимита 429 и блокировки 403.
 
-    Возвращает True, если сообщение в итоге доставлено.
+    Возвращает True, если сообщение в итоге доставлено, False при обычной неудаче,
+    None — если пользователь заблокировал бота (деактивирован, дальнейшая отправка
+    ему в этом цикле бессмысленна).
     """
     try:
         await context.bot.send_message(
@@ -348,7 +402,7 @@ async def _send_notification(context, session_maker, user: User, message: str, r
                         await s3.commit()
             except Exception:
                 logger.exception("Не удалось деактивировать %s", user.telegram_id)
-            return False
+            return None
         else:
             logger.warning(
                 "Не удалось отправить уведомление пользователю %s",
@@ -411,22 +465,40 @@ def _build_notification(
     return text, InlineKeyboardMarkup(buttons)
 
 
+def _digest_sort_key(article: Article) -> tuple[int, str]:
+    """Ключ сортировки тизера: по значимости уровня, затем по алфавиту заголовка."""
+    rank = (
+        _REST_LEVEL_ORDER.index(article.level)
+        if article.level in _REST_LEVEL_ORDER
+        else len(_REST_LEVEL_ORDER)
+    )
+    title = _normalize_text(article.title) or article.title or ""
+    return (rank, title)
+
+
 def _build_digest(
     articles: list[Article], webapp_url: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Формирует MarkdownV2-тизер дайджеста: до 3 случайных документов + кнопка «Дайджест».
+    """Формирует MarkdownV2-тизер дайджеста: до 3 самых значимых документов + кнопка «Дайджест».
 
-    Показывает не больше 3 случайно выбранных ``articles`` (все, если их не больше
-    3), пронумерованных (1., 2., ...) — полный заголовок, саммари при наличии,
-    ссылка на портал — плюс общее число документов дайджеста. Кнопка «Дайджест»
-    открывает WebApp со всеми ``articles``,
-    подходящими пользователю за цикл, до ``DIGEST_ID_CAP`` штук (остаток доступен
-    через /latest); без ``webapp_url`` кнопка не добавляется, текст не меняется.
+    Документы группы сортируются по значимости уровня (``_REST_LEVEL_ORDER``), при
+    равенстве — по алфавиту заголовка. Показывает не больше 3 первых по этому
+    порядку (все, если их не больше 3), пронумерованных (1., 2., ...) — полный
+    заголовок, саммари при наличии, ссылка на портал — плюс общее число документов
+    дайджеста. Кнопка «Дайджест» открывает WebApp с документами группы в том же
+    порядке, до ``DIGEST_ID_CAP`` штук (остаток доступен через /latest) — благодаря
+    общей сортировке документы тизера всегда попадают и в список кнопки; без
+    ``webapp_url`` кнопка не добавляется, текст не меняется. Для документов из
+    тизера без саммари добавляется кнопка «Сделать саммари №N» — в отличие от
+    одиночного уведомления, её нажатие не правит это сообщение (иначе стёрлись
+    бы остальные пункты тизера), а присылает результат отдельным сообщением.
     """
-    header_esc = escape_markdown(f"Приняли новые законы — {len(articles)}", version=2)
+    ordered = sorted(articles, key=_digest_sort_key)
+    header_esc = escape_markdown(f"Приняли новые законы — {len(ordered)}", version=2)
     lines: list[str] = [f"*{header_esc}*"]
 
-    sample = articles if len(articles) <= 3 else random.sample(articles, 3)
+    sample = ordered[:3]
+    summary_buttons: list[list[InlineKeyboardButton]] = []
     for i, article in enumerate(sample, 1):
         title_clean = _normalize_text(article.title) or article.title
         title_esc = escape_markdown(f"{i}. {title_clean}", version=2)
@@ -437,16 +509,24 @@ def _build_digest(
             block = f"*{title_esc}*\n{summary_esc}\n[Читать на портале]({url_esc})"
         else:
             block = f"*{title_esc}*\n[Читать на портале]({url_esc})"
+            summary_buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Сделать саммари №{i}",
+                        callback_data=f"{DIGEST_SUMMARIZE_PREFIX}{article.external_id}",
+                    )
+                ]
+            )
         lines.append(block)
 
-    if len(sample) < len(articles):
+    if webapp_url and len(sample) < len(ordered):
         lines.append(escape_markdown("Все документы — в полном списке по кнопке ниже", version=2))
 
     text = "\n\n".join(lines)
 
-    buttons: list[list[InlineKeyboardButton]] = []
+    buttons: list[list[InlineKeyboardButton]] = list(summary_buttons)
     if webapp_url:
-        capped = articles[:DIGEST_ID_CAP]
+        capped = ordered[:DIGEST_ID_CAP]
         ids_param = ",".join(quote(a.external_id, safe="") for a in capped)
         buttons.append(
             [

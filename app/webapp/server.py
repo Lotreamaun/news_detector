@@ -151,6 +151,35 @@ HTML_PAGE = r"""<!doctype html>
     return html || '<p>' + escapeHtml(String(text)) + '</p>';
   }
 
+  function renderResult(data) {
+    // общая логика для одиночного документа и одного пункта дайджеста:
+    // дата подписания, текст/фолбэк недоступности, ссылка на портал
+    let dateText = null;
+    try {
+      dateText = extractSigningDate(data.text || '', data.title || '');
+    } catch (e) { /* дата не критична */ }
+
+    const isAvailable = !!(data.is_text_available && data.text);
+    let contentHtml;
+    if (isAvailable) {
+      try {
+        contentHtml = renderLawText(data.text);
+      } catch (e) {
+        console.error('render error', e);
+        contentHtml = '<p>' + escapeHtml(String(data.text)) + '</p>';
+      }
+    } else {
+      contentHtml = 'Текст этого закона пока недоступен в текстовом формате. Откройте оригинал на портале.';
+    }
+
+    let linkHtml = '';
+    if (data.url) {
+      linkHtml = '<a href="' + String(data.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener">Читать на портале</a>';
+    }
+
+    return { dateText: dateText, contentHtml: contentHtml, isAvailable: isAvailable, linkHtml: linkHtml };
+  }
+
   const params = new URLSearchParams(window.location.search);
   const idsParam = params.get('ids');
   if (idsParam) {
@@ -185,25 +214,12 @@ HTML_PAGE = r"""<!doctype html>
         .then(function(data) {
           const title = data.title || id;
           summary.textContent = title;
+          const r = renderResult(data);
           // полный заголовок дублируется в теле секции — <summary> обрезается CSS-эллипсисом
           let html = '<div class="doc-title">' + escapeHtml(title) + '</div>';
-          try {
-            const d = extractSigningDate(data.text || '', data.title || '');
-            if (d) html += '<div class="date">Дата подписания: ' + escapeHtml(d) + '</div>';
-          } catch (e) { /* дата не критична */ }
-          if (data.is_text_available && data.text) {
-            try {
-              html += renderLawText(data.text);
-            } catch (e) {
-              console.error('render error', e);
-              html += '<p>' + escapeHtml(String(data.text)) + '</p>';
-            }
-          } else {
-            html += '<p class="error">Текст этого закона пока недоступен в текстовом формате. Откройте оригинал на портале.</p>';
-          }
-          if (data.url) {
-            html += '<div class="link"><a href="' + String(data.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener">Читать на портале</a></div>';
-          }
+          if (r.dateText) html += '<div class="date">Дата подписания: ' + escapeHtml(r.dateText) + '</div>';
+          html += r.isAvailable ? r.contentHtml : '<p class="error">' + escapeHtml(r.contentHtml) + '</p>';
+          if (r.linkHtml) html += '<div class="link">' + r.linkHtml + '</div>';
           body.innerHTML = html;
           body.className = 'doc-body';
         })
@@ -243,31 +259,24 @@ HTML_PAGE = r"""<!doctype html>
     .then(data => {
       titleEl.textContent = data.title || externalId;
       titleEl.className = 'title';
+      const r = renderResult(data);
       // дата подписания сверху после заголовка
-      try {
-        const d = extractSigningDate(data.text || '', data.title || '');
-        if (d) {
-          dateEl.textContent = 'Дата подписания: ' + d;
-          dateEl.style.display = 'block';
-        } else {
-          dateEl.textContent = '';
-          dateEl.style.display = 'none';
-        }
-      } catch(e) { dateEl.style.display = 'none'; }
-      if (data.is_text_available && data.text) {
-        try {
-          contentEl.innerHTML = renderLawText(data.text);
-        } catch(e) {
-          console.error('render error', e);
-          contentEl.textContent = String(data.text);
-        }
+      if (r.dateText) {
+        dateEl.textContent = 'Дата подписания: ' + r.dateText;
+        dateEl.style.display = 'block';
+      } else {
+        dateEl.textContent = '';
+        dateEl.style.display = 'none';
+      }
+      if (r.isAvailable) {
+        contentEl.innerHTML = r.contentHtml;
         contentEl.className = 'text';
       } else {
-        contentEl.textContent = 'Текст этого закона пока недоступен в текстовом формате. Откройте оригинал на портале.';
+        contentEl.textContent = r.contentHtml;
         contentEl.className = 'error';
       }
-      if (data.url) {
-        linkEl.innerHTML = '<a href=\"' + data.url.replace(/\"/g, '&quot;') + '\" target=\"_blank\" rel=\"noopener\">Читать на портале</a>';
+      if (r.linkHtml) {
+        linkEl.innerHTML = r.linkHtml;
       }
     })
     .catch(err => {

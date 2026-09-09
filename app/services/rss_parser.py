@@ -67,6 +67,12 @@ LEVEL_MAP: dict[str, str] = {
     _FZ_DOCUMENT_TYPE_ID: "FZ",
 }
 
+# Единственный источник правды для «важных» уровней (Конституция/ФКЗ/ФЗ):
+# OCR-фоллбэк здесь (is_important), немедленная доставка без дайджеста
+# (scheduler.IMPORTANT_LEVELS) и обход месячного лимита /summary (handlers.AUTO_LEVELS)
+# должны всегда совпадать — оба места импортируют этот набор, а не дублируют его.
+IMPORTANT_LEVELS: frozenset[str] = frozenset({"CONSTITUTION", "FKZ", "FZ"})
+
 
 def classify_level(document_type_id: str | None) -> str:
     """Определяет уровень силы по documentTypeId, fallback UNKNOWN."""
@@ -274,7 +280,7 @@ def is_important(entry: FeedEntry) -> bool:
     Для MVP — Конституция, ФКЗ и ФЗ (обрабатываются автоматически, без кнопки).
     """
     lvl = classify_level_for_title(entry.title, entry.document_type_id)
-    return lvl in ("CONSTITUTION", "FKZ", "FZ")
+    return lvl in IMPORTANT_LEVELS
 
 
 async def ocr_document_text(

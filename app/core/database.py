@@ -106,6 +106,7 @@ async def init_db_schema() -> None:
         # Base.metadata.create_all: SQLite смотри все модели и создает таблицы, которых еще нет в БД
         await connection.run_sync(Base.metadata.create_all)
         await _ensure_channel_verified_column(connection)
+        await _ensure_article_notified_column(connection)
 
 
 async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
@@ -122,3 +123,20 @@ async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
         await connection.execute(
             text("ALTER TABLE users ADD COLUMN channel_verified BOOLEAN NOT NULL DEFAULT 1")
         )
+
+
+async def _ensure_article_notified_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``notified`` в уже существующую таблицу ``articles``.
+
+    Статьи, обработанные до появления этой колонки, помечаются ``notified=1``
+    сразу — иначе вся история статей на существующей БД разом попадёт в
+    первую рассылку после обновления и уйдёт пользователям повторно.
+    """
+    result = await connection.execute(text("PRAGMA table_info(articles)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "notified" not in columns:
+        await connection.execute(
+            text("ALTER TABLE articles ADD COLUMN notified BOOLEAN NOT NULL DEFAULT 0")
+        )
+        await connection.execute(text("UPDATE articles SET notified = 1"))
