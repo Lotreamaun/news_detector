@@ -31,6 +31,7 @@ from app.core.database import (
     init_database,
     init_db_schema,
 )
+from app.services.backup import resolve_sqlite_path, run_backup_job
 from app.services.scheduler import check_legislation_updates
 
 logger = logging.getLogger(__name__)
@@ -139,12 +140,29 @@ def _schedule_jobs(application: Application, config: Config) -> None:
     )
     logger.info("Проверка RSS запланирована: каждые %d минут", config.CHECK_INTERVAL_MINUTES)
 
+    if resolve_sqlite_path(config.DATABASE_URL) is None:
+        logger.warning(
+            "DATABASE_URL не указывает на SQLite — автоматический файловый бэкап БД "
+            "недоступен, задача бэкапа не запланирована"
+        )
+    else:
+        backup_interval_seconds = config.DB_BACKUP_INTERVAL_HOURS * 3600
+        # first не задаём по той же причине (run_repeating(first=0) не срабатывает
+        # мгновенно) — первый бэкап делает _run_initial_backup из _post_init.
+        job_queue.run_repeating(
+            run_backup_job,
+            interval=backup_interval_seconds,
+            name="backup_database",
+        )
+        logger.info("Бэкап БД запланирован: каждые %d ч.", config.DB_BACKUP_INTERVAL_HOURS)
+
 
 async def _post_init(application: Application) -> None:
-    """post_init: регистрирует список команд, запускает WebApp и первый прогон проверки."""
+    """post_init: регистрирует список команд, запускает WebApp и первые прогоны проверки/бэкапа."""
     await _register_commands(application)
     await _start_webapp(application)
     await _run_initial_check(application)
+    await _run_initial_backup(application)
 
 
 async def _start_webapp(application: Application) -> None:
@@ -235,6 +253,18 @@ async def _run_initial_check(application: Application) -> None:
         # бэкфилл идемпотентны и выполняются только при старте
         application.bot_data["is_first_run"] = False
         application.bot_data["needs_backfill"] = False
+
+
+async def _run_initial_backup(application: Application) -> None:
+    """Делает первый бэкап БД сразу после старта (обход run_repeating(first=0))."""
+    job_queue = application.job_queue
+    if job_queue is None:
+        return
+    job = job_queue.get_jobs_by_name("backup_database")
+    if not job:
+        logger.warning("Job бэкапа БД не найден — первый бэкап пропущен")
+        return
+    await job[0].run(application)
 
 
 def main() -> None:

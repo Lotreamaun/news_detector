@@ -167,6 +167,11 @@ class Config:
     # Пусто = гейт отключён (см. app/services/channel_subscription.py).
     REQUIRED_CHANNEL_ID: str | None
 
+    # Резервное копирование БД (см. app/services/backup.py)
+    DB_BACKUP_DIR: str
+    DB_BACKUP_INTERVAL_HOURS: int
+    DB_BACKUP_RETENTION_COUNT: int
+
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
         # Загружает переменные из .env
@@ -222,6 +227,10 @@ class Config:
         webapp_url = os.getenv("WEBAPP_URL", "").strip()
         admin_chat_ids = _get_int_list_env("ADMIN_CHAT_IDS")
         required_channel_id = os.getenv("REQUIRED_CHANNEL_ID", "").strip() or None
+
+        db_backup_dir = os.getenv("DB_BACKUP_DIR", "./data/backups").strip() or "./data/backups"
+        db_backup_interval_hours = _get_int_env("DB_BACKUP_INTERVAL_HOURS", 24)
+        db_backup_retention_count = _get_int_env("DB_BACKUP_RETENTION_COUNT", 7)
         if required_channel_id is None:
             logging.getLogger(__name__).warning(
                 "REQUIRED_CHANNEL_ID не задан, гейт подписки на канал отключён"
@@ -242,6 +251,10 @@ class Config:
             raise ConfigError("LOG_RETENTION_DAYS must be > 0")
         if webapp_port <= 0:
             raise ConfigError("WEBAPP_PORT must be > 0")
+        if db_backup_interval_hours <= 0:
+            raise ConfigError("DB_BACKUP_INTERVAL_HOURS must be > 0")
+        if db_backup_retention_count <= 0:
+            raise ConfigError("DB_BACKUP_RETENTION_COUNT must be > 0")
 
         # Возвращаем объект с вычисленными атрибутами
         return cls(
@@ -265,4 +278,7 @@ class Config:
             WEBAPP_URL=webapp_url,
             ADMIN_CHAT_IDS=admin_chat_ids,
             REQUIRED_CHANNEL_ID=required_channel_id,
+            DB_BACKUP_DIR=db_backup_dir,
+            DB_BACKUP_INTERVAL_HOURS=db_backup_interval_hours,
+            DB_BACKUP_RETENTION_COUNT=db_backup_retention_count,
         )
