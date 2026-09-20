@@ -107,6 +107,7 @@ async def init_db_schema() -> None:
         await connection.run_sync(Base.metadata.create_all)
         await _ensure_channel_verified_column(connection)
         await _ensure_article_notified_column(connection)
+        await _ensure_is_demo_column(connection)
 
 
 async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
@@ -140,3 +141,18 @@ async def _ensure_article_notified_column(connection: AsyncConnection) -> None:
             text("ALTER TABLE articles ADD COLUMN notified BOOLEAN NOT NULL DEFAULT 0")
         )
         await connection.execute(text("UPDATE articles SET notified = 1"))
+
+
+async def _ensure_is_demo_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``is_demo`` в уже существующую таблицу ``articles``.
+
+    Отмечает заранее подготовленную статью-пример для онбординга (см.
+    ``app/services/demo_article.py``), а не результат парсинга ленты.
+    """
+    result = await connection.execute(text("PRAGMA table_info(articles)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "is_demo" not in columns:
+        await connection.execute(
+            text("ALTER TABLE articles ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
+        )

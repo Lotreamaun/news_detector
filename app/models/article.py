@@ -47,3 +47,11 @@ class Article(Base):
         default=False,
         server_default=text("0"),
     )
+    # Заранее подготовленная статья-пример для онбординга (см. app/services/demo_article.py),
+    # не результат парсинга ленты — исключается из /latest.
+    is_demo: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("0"),
+    )

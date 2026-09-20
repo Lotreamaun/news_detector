@@ -428,6 +428,12 @@ async def _send_example_notification(query, context: ContextTypes.DEFAULT_TYPE) 
             article = await session.scalar(
                 select(Article).where(Article.title.ilike("%Федеральный закон%")).order_by(Article.id.desc()).limit(1)
             )
+        if article is None:
+            # Последний фолбэк: заранее подготовленная демо-статья (реальные
+            # законы всегда в приоритете — см. app/services/demo_article.py)
+            article = await session.scalar(
+                select(Article).where(Article.is_demo == True).limit(1)  # noqa: E712
+            )
     if article is None:
         await query.message.reply_text("Пока нет законов для примера. Попробуйте позже: /latest")
         return
@@ -528,6 +534,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         select(Article)
         .where(Article.published_at >= since)
         .where(Article.level.in_(["FKZ", "FZ"]))
+        .where(Article.is_demo.is_(False))
         .order_by(Article.published_at.desc())
         .limit(10)
     )

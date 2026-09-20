@@ -32,6 +32,15 @@ from app.core.database import (
     init_db_schema,
 )
 from app.services.backup import resolve_sqlite_path, run_backup_job
+from app.services.demo_article import (
+    DEMO_ARTICLE_EXTERNAL_ID,
+    DEMO_ARTICLE_LEVEL,
+    DEMO_ARTICLE_PUBLISHED_AT,
+    DEMO_ARTICLE_SUMMARY,
+    DEMO_ARTICLE_TEXT,
+    DEMO_ARTICLE_TITLE,
+    DEMO_ARTICLE_URL,
+)
 from app.services.scheduler import check_legislation_updates
 
 logger = logging.getLogger(__name__)
@@ -162,6 +171,7 @@ async def _post_init(application: Application) -> None:
     await _register_commands(application)
     await _start_webapp(application)
     await _run_initial_check(application)
+    await _ensure_demo_article(application)
     await _run_initial_backup(application)
 
 
@@ -253,6 +263,44 @@ async def _run_initial_check(application: Application) -> None:
         # бэкфилл идемпотентны и выполняются только при старте
         application.bot_data["is_first_run"] = False
         application.bot_data["needs_backfill"] = False
+
+
+async def _ensure_demo_article(application: Application) -> None:
+    """Вставляет заранее подготовленную демо-статью для онбординга, если её ещё нет.
+
+    Идемпотентно, по аналогии с ``needs_backfill``: строка вставляется один
+    раз по ``external_id``, напрямую через сессию (в обход
+    ``scheduler``/``_notify_users``), с ``notified=True`` — иначе она уйдёт
+    всем подписчикам как настоящая новость при ближайшем цикле проверки.
+    """
+    try:
+        from app.models import Article
+        from sqlalchemy import select
+
+        session_maker = application.bot_data["session_maker"]
+        async with session_maker() as session:
+            exists = await session.scalar(
+                select(Article.id).where(Article.external_id == DEMO_ARTICLE_EXTERNAL_ID)
+            )
+            if exists is not None:
+                return
+            session.add(
+                Article(
+                    external_id=DEMO_ARTICLE_EXTERNAL_ID,
+                    title=DEMO_ARTICLE_TITLE,
+                    original_text=DEMO_ARTICLE_TEXT,
+                    summary=DEMO_ARTICLE_SUMMARY,
+                    url=DEMO_ARTICLE_URL,
+                    level=DEMO_ARTICLE_LEVEL,
+                    published_at=DEMO_ARTICLE_PUBLISHED_AT,
+                    notified=True,
+                    is_demo=True,
+                )
+            )
+            await session.commit()
+        logger.info("Демо-статья для онбординга добавлена в БД")
+    except Exception:
+        logger.exception("Не удалось добавить демо-статью для онбординга")
 
 
 async def _run_initial_backup(application: Application) -> None:
