@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+RUN mkdir -p data logs
+
 ENV PYTHONPATH=.
 
 EXPOSE 8080
