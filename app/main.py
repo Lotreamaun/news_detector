@@ -19,6 +19,7 @@ from app.bot.handlers import (
     latest,
     level_wizard_handler,
     onboarding_show_example,
+    require_channel_verified,
     show_example,
     start,
     summary_command,
@@ -92,6 +93,10 @@ def _build_application(config: Config) -> Application:
     application.bot_data["session_maker"] = get_session_maker()
     application.bot_data["config"] = config
 
+    # Allowlist гейта подписки: только сам /start и экраны онбординга/подтверждения
+    # подписки. Всё остальное регистрируется через require_channel_verified —
+    # default-deny, чтобы новый хендлер без явного исключения был защищён
+    # автоматически (см. openspec/changes/enforce-channel-subscription-gate).
     application.add_handler(level_wizard_handler)
     application.add_handler(CallbackQueryHandler(show_example, pattern=r"^show_example$"))
     application.add_handler(
@@ -99,16 +104,16 @@ def _build_application(config: Config) -> Application:
     )
     application.add_handler(CallbackQueryHandler(check_subscription, pattern=r"^check_subscription$"))
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("latest", latest))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("summary", summary_command))
+    application.add_handler(CommandHandler("latest", require_channel_verified(latest)))
+    application.add_handler(CommandHandler("help", require_channel_verified(help_command)))
+    application.add_handler(CommandHandler("summary", require_channel_verified(summary_command)))
     application.add_handler(
-        CallbackQueryHandler(force_summarize, pattern=r"^force_sum:summary:")
+        CallbackQueryHandler(require_channel_verified(force_summarize), pattern=r"^force_sum:summary:")
     )
     application.add_handler(
-        CallbackQueryHandler(force_summarize_digest, pattern=r"^force_sum:digest:")
+        CallbackQueryHandler(require_channel_verified(force_summarize_digest), pattern=r"^force_sum:digest:")
     )
-    application.add_handler(CommandHandler("test_digest", test_digest_command))
+    application.add_handler(CommandHandler("test_digest", require_channel_verified(test_digest_command)))
 
     return application
 

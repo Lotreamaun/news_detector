@@ -330,6 +330,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     telegram_id = update.effective_user.id
     username = update.effective_user.username
+    config = context.bot_data["config"]
 
     is_new = False
     async with _session_maker(context)() as session:
@@ -358,6 +359,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Привет! Я слежу за новыми российскими законами и присылаю короткие саммари, когда выходит что-то важное.",
             reply_markup=markup,
         )
+    elif config.REQUIRED_CHANNEL_ID and not user.channel_verified:
+        # Уже зарегистрирован, но пропустил подтверждение подписки на онбординге —
+        # показываем баннер подписки, а не приветствие со списком команд, которыми
+        # он всё равно не сможет воспользоваться (все они защищены гейтом).
+        text, markup = _subscribe_prompt()
+        await update.message.reply_text(text, reply_markup=markup)
     else:
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔍 Показать пример уведомления", callback_data="show_example")]]
@@ -460,6 +467,22 @@ async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _send_example_notification(query, context)
 
 
+def _subscribe_prompt() -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и кнопка «Проверить подписку» — единая точка правды.
+
+    Используется и онбордингом («Как это работает?»), и гейтом подписки
+    (см. ``_require_channel_verified``), чтобы формулировка не расходилась.
+    """
+    text = (
+        "Чтобы получать такие уведомления регулярно, подпишись на канал "
+        "@hellolawyer_jobs и нажми «Проверить подписку»."
+    )
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
+    )
+    return text, markup
+
+
 async def onboarding_show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Онбординг нового пользователя: «Как это работает?» → тестовое уведомление → гейт подписки."""
     query = update.callback_query
@@ -467,13 +490,8 @@ async def onboarding_show_example(update: Update, context: ContextTypes.DEFAULT_
         return
     await query.answer()
     await _send_example_notification(query, context)
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
-    )
-    await query.message.reply_text(
-        "Чтобы получать такие уведомления регулярно, подпишись на канал @hellolawyer_jobs и нажми «Проверить подписку».",
-        reply_markup=markup,
-    )
+    text, markup = _subscribe_prompt()
+    await query.message.reply_text(text, reply_markup=markup)
 
 
 async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,6 +531,45 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
     )
     await query.edit_message_text("Подписка подтверждена! Настроим фильтры:", reply_markup=markup)
+
+
+def require_channel_verified(handler):
+    """Оборачивает обработчик проверкой ``channel_verified`` перед вызовом.
+
+    Default-deny: применяется при регистрации ко всем обработчикам в
+    ``app/main.py``, кроме явного allowlist'а (онбординг). Если
+    ``REQUIRED_CHANNEL_ID`` не задан — гейт отключён, проверка пропускается.
+    Читает закешированный флаг из БД (как ``scheduler.py``), без live-запроса
+    к Bot API на каждую команду. Исключений по ролям (включая
+    ``ADMIN_CHAT_IDS``) нет.
+    """
+
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        config = context.bot_data["config"]
+        if not config.REQUIRED_CHANNEL_ID:
+            return await handler(update, context, *args, **kwargs)
+
+        telegram_id = update.effective_user.id if update.effective_user else None
+        if telegram_id is None:
+            return await handler(update, context, *args, **kwargs)
+
+        session_maker = _session_maker(context)
+        async with session_maker() as session:
+            user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+
+        if user is not None and user.channel_verified:
+            return await handler(update, context, *args, **kwargs)
+
+        text, markup = _subscribe_prompt()
+        if update.callback_query is not None:
+            await update.callback_query.answer()
+            await update.callback_query.message.reply_text(text, reply_markup=markup)
+        elif update.message is not None:
+            await update.message.reply_text(text, reply_markup=markup)
+        return None
+
+    wrapped.__name__ = getattr(handler, "__name__", "wrapped")
+    return wrapped
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1000,10 +1057,14 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ── ConversationHandler для визарда «Сила» ───────────────────────────────
+# Гейт подписки применяется только на entry_points (сам /settings и запуск
+# визарда сразу после онбординга) — состояния диалога (level_choice в states)
+# остаются без обёртки, иначе пользователь, уже прошедший гейт и начавший
+# диалог, будет неожиданно заблокирован посреди шага (design.md — Risks).
 level_wizard_handler = ConversationHandler(
     entry_points=[
-        CommandHandler("settings", level_wizard_entry),
-        CallbackQueryHandler(level_choice, pattern=r"^wizard:(setup|skip)$"),
+        CommandHandler("settings", require_channel_verified(level_wizard_entry)),
+        CallbackQueryHandler(require_channel_verified(level_choice), pattern=r"^wizard:(setup|skip)$"),
     ],
     states={
         LEVEL_STATE: [
