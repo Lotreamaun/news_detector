@@ -471,7 +471,7 @@ async def onboarding_show_example(update: Update, context: ContextTypes.DEFAULT_
         [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
     )
     await query.message.reply_text(
-        "Чтобы получать такие уведомления регулярно, подпишись на канал и нажми «Проверить подписку».",
+        "Чтобы получать такие уведомления регулярно, подпишись на канал @hellolawyer_jobs и нажми «Проверить подписку».",
         reply_markup=markup,
     )
 
