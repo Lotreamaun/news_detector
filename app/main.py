@@ -47,9 +47,28 @@ from app.services.scheduler import check_legislation_updates
 logger = logging.getLogger(__name__)
 
 
+class _SecretMaskingFormatter(logging.Formatter):
+    """Заменяет токен бота на *** в готовой строке лога, включая трейсбек."""
+
+    def __init__(self, fmt: str, secret: str) -> None:
+        super().__init__(fmt)
+        self._secret = secret
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not self._secret:
+            return text
+        return text.replace(self._secret, "***")
+
+
 def _configure_logging(config: Config) -> None:
     """Консоль + файл (logs/app.log) с суточной ротацией и хранением 30 дней."""
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Токен бота попадает в URL Bot API, а PTB на DEBUG логирует этот URL
+    # (Set Bot API URL: .../bot<TOKEN>) — маскируем на выходе любого хендлера.
+    formatter = _SecretMaskingFormatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        secret=config.TELEGRAM_BOT_TOKEN,
+    )
 
     root = logging.getLogger()
     root.setLevel(config.LOG_LEVEL)
@@ -72,6 +91,11 @@ def _configure_logging(config: Config) -> None:
         file_handler.setLevel(config.LOG_LEVEL)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
+
+    # httpx на INFO пишет URL каждого запроса, а в URL Bot API лежит токен бота
+    # (/bot<TOKEN>/getUpdates). Уровень фиксирован, чтобы LOG_LEVEL не вернул утечку.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _build_application(config: Config) -> Application:
