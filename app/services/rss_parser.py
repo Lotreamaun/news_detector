@@ -47,6 +47,8 @@ _ACTUAL_BASE_URL = "http://actual.pravo.gov.ru:8000/api/ebpi"
 # Страница и PDF документа на publication.pravo.gov.ru
 _PUBLICATION_DOCUMENT_URL = "http://publication.pravo.gov.ru/document/{eo}"
 _PUBLICATION_PDF_URL = "http://publication.pravo.gov.ru/file/pdf?eoNumber={eo}"
+# Метаданные одного документа (те же поля, что у элементов ленты)
+_PUBLICATION_METADATA_URL = "http://publication.pravo.gov.ru/api/Document"
 
 _HEADERS = {"User-Agent": "news_detector/0.1 (+legal-bot)"}
 
@@ -213,6 +215,50 @@ async def fetch_day(day: datetime | str, api_url: str, *, document_type_ids: lis
         return []
     logger.info("Бэкфилл день %s: %d документов", day_str, len(entries))
     return entries
+
+
+async def fetch_document(external_id: str) -> FeedEntry | None:
+    """
+    Получает метаданные одного документа (название, вид акта) по eoNumber.
+
+    Нужна для законов не из ленты: ``/api/Document?eoNumber=<id>`` отдаёт
+    объект с теми же полями, что и элементы ``/api/Documents``.
+
+    Args:
+        external_id: eoNumber документа.
+
+    Returns:
+        ``FeedEntry`` или ``None``, если документ не найден, ответ не разобран
+        или произошла сетевая ошибка. Никогда не бросает исключений.
+    """
+    try:
+        raw = await _fetch_with_retries(
+            _PUBLICATION_METADATA_URL,
+            what=f"метаданные {external_id}",
+            params={"eoNumber": external_id},
+        )
+    except RssError as exc:
+        logger.warning("Не удалось получить метаданные %s: %s", external_id, exc)
+        return None
+
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not data.get("eoNumber"):
+        message = data.get("message") if isinstance(data, dict) else None
+        logger.info(
+            "Метаданные %s не получены: %s",
+            external_id, message or f"неожиданный ответ {str(raw)[:200]!r}",
+        )
+        return None
+
+    entry = _entry_from_item(data)
+    if entry is None or not entry.title:
+        logger.info("Метаданные %s без названия", external_id)
+        return None
+    logger.info("Получены метаданные %s: %s", external_id, entry.title[:100])
+    return entry
 
 
 async def get_legal_text(
