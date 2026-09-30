@@ -287,32 +287,111 @@ def _full_text_button(config, external_id: str) -> InlineKeyboardMarkup | None:
 
 
 def _summary_refused(
-    config, title: str, url: str, fallback: str, external_id: str
+    config,
+    title: str,
+    url: str,
+    fallback: str,
+    external_id: str,
+    with_webapp_button: bool = True,
+    *,
+    title_known: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Собирает уведомление с фолбэком вместо саммари при отказе языковой модели.
+    """Собирает уведомление с фолбэком вместо саммари при неудачной саммаризации.
 
-    Фолбэк встраивается в тело уведомления на место саммари: остаются название,
-    ссылка на портал и кнопка «Полный текст» (WebApp).
+    Фолбэк встраивается в тело уведомления на место саммари: остаются название
+    и ссылка на портал. Кнопка «Полный текст» (WebApp) добавляется только если
+    with_webapp_button=True — есть смысл показывать её лишь тогда, когда текст
+    закона реально доступен (например, отказ LLM, но не отсутствие текста).
+    title_known=False — заголовок на самом деле не известен (title == external_id),
+    жирным его не показываем (вводит в заблуждение) — вместо этого id отдельной строкой.
     """
-    title_clean = _normalize_text(title) or title
-    title_esc = escape_markdown(title_clean, version=2)
     fallback_esc = escape_markdown(fallback, version=2)
-    header = f"*{title_esc}*\n\n_{fallback_esc}_"
+    if title_known:
+        title_clean = _normalize_text(title) or title
+        title_esc = escape_markdown(title_clean, version=2)
+        header = f"*{title_esc}*\n\n_{fallback_esc}_"
+    else:
+        id_esc = escape_markdown(external_id, version=2)
+        header = f"_{fallback_esc}_\n\nid: {id_esc}"
     return (
         f"{header}\n\n{_full_text_block(url)}",
-        _full_text_button(config, external_id),
+        _full_text_button(config, external_id) if with_webapp_button else None,
     )
 
 
+def _summary_refused_plain(fallback: str, external_id: str, url: str) -> str:
+    """Простое служебное сообщение о неудачной саммаризации без псевдозаголовка.
+
+    Используется вместо notification-style _summary_refused, когда закон вообще
+    не найден в БД (cached is None) — показывать external_id жирным как будто
+    это заголовок закона было бы вводящим в заблуждение. Без MarkdownV2, чтобы
+    не экранировать id/ссылку вручную (Telegram сам делает ссылку кликабельной
+    в обычном тексте).
+    """
+    return f"{fallback}\n\nid: {external_id}\nЧитать на портале: {url}"
+
+
+async def _deliver_summary_failure(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+    message: object | None,
+    status_message: object | None,
+    config,
+    cached: Article | None,
+    title: str,
+    url: str,
+    external_id: str,
+    fallback: str,
+) -> None:
+    """Доставляет сообщение о неудачной принудительной саммаризации.
+
+    Закон уже известен (cached задан) — notification-style через _summary_refused
+    (заголовок + причина + ссылка). Закон не найден в БД вообще (cached is None,
+    реалистично только для /summary с произвольным external_id) — простое
+    служебное сообщение: показать заголовок в этом случае нечего.
+    """
+    if cached is not None:
+        final, reply_markup = _summary_refused(
+            config, title, url, fallback, external_id, with_webapp_button=False
+        )
+        await _deliver(
+            context,
+            user,
+            message,
+            final,
+            status_message=status_message,
+            parse_mode="MarkdownV2",
+            reply_markup=reply_markup,
+        )
+    else:
+        final = _summary_refused_plain(fallback, external_id, url)
+        await _deliver(context, user, message, final, status_message=status_message)
+
+
 def _summary_final(
-    config, title: str, url: str, summary: str | None, external_id: str
+    config,
+    title: str,
+    url: str,
+    summary: str | None,
+    external_id: str,
+    *,
+    title_known: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Собирает итог саммаризации: MarkdownV2-текст + кнопку Mini-App (если есть).
 
     Кнопка «Полный текст» показывается только когда есть саммари (важный закон — сразу,
-    иначе после принудительной саммаризации).
+    иначе после принудительной саммаризации). title_known=False — закон не был известен
+    системе до этого вызова (создан на лету через /summary по external_id вне ленты):
+    title в этом случае — не настоящее название, а сам external_id; показывать его
+    жирным как заголовок было бы вводящим в заблуждение (тот же принцип, что и в
+    _summary_refused_plain для фолбэков) — вместо этого просто саммари + id для сверки.
     """
-    header = _format_summary(summary, title)
+    if title_known:
+        header = _format_summary(summary, title)
+    else:
+        summary_esc = escape_markdown(_normalize_text(summary) or summary or "", version=2)
+        id_esc = escape_markdown(external_id, version=2)
+        header = f"{summary_esc}\n\nid: {id_esc}" if summary_esc else f"id: {id_esc}"
     button = _full_text_button(config, external_id) if summary else None
     return (
         f"{header}\n\n{_full_text_block(url)}",
@@ -706,6 +785,18 @@ async def _summarize_and_reply(
     except Exception:
         pass
 
+    # Переиспользуем уже сохранённое саммари, если оно есть (без повторного LLM);
+    # title/url тоже берём отсюда для всех фолбэк-сообщений об ошибке ниже.
+    async with session_maker() as session:
+        cached = await session.scalar(
+            select(Article).where(Article.external_id == external_id)
+        )
+    title = (cached.title if cached else None) or external_id
+    url = (
+        (cached.url if cached else None)
+        or f"http://publication.pravo.gov.ru/document/{external_id}"
+    )
+
     if not is_admin and not auto_bypass:
         async with session_maker() as session:
             usage = await session.scalar(
@@ -715,23 +806,16 @@ async def _summarize_and_reply(
                 )
             )
             if usage is not None and usage.count >= limit:
-                await _deliver(
-                    context,
-                    user,
-                    message,
-                    (
-                        f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
-                        "Попробуйте в следующем месяце."
-                    ),
-                    status_message=status_message,
+                fallback = (
+                    f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
+                    "Попробуйте в следующем месяце."
+                )
+                await _deliver_summary_failure(
+                    context, user, message, status_message,
+                    config, cached, title, url, external_id, fallback,
                 )
                 return
 
-    # Переиспользуем уже сохранённое саммари, если оно есть (без повторного LLM).
-    async with session_maker() as session:
-        cached = await session.scalar(
-            select(Article).where(Article.external_id == external_id)
-        )
     if cached is not None and cached.summary:
         final, reply_markup = _summary_final(
             config, cached.title or external_id, cached.url, cached.summary, external_id
@@ -765,12 +849,13 @@ async def _summarize_and_reply(
                 text = await ocr_document_text(external_id, client=ocr_client)
 
         if not text:
-            await _deliver(
-                context,
-                user,
-                message,
-                "Не удалось получить текст закона для саммаризации.",
-                status_message=status_message,
+            fallback = (
+                "Не удалось получить текст закона для саммаризации 😢\n"
+                f"Попробуйте позже: /summary {external_id}"
+            )
+            await _deliver_summary_failure(
+                context, user, message, status_message,
+                config, cached, title, url, external_id, fallback,
             )
             return
 
@@ -800,6 +885,7 @@ async def _summarize_and_reply(
             article = await session.scalar(
                 select(Article).where(Article.external_id == external_id)
             )
+            title_known = article is not None
             if article is not None:
                 article.original_text = text
                 article.summary = summary
@@ -808,8 +894,22 @@ async def _summarize_and_reply(
                 title = article.title
                 url = article.url
             else:
+                # Закон не из дневной ленты (не отслеживался ботом) — создаём запись,
+                # чтобы повторный /summary для этого же id переиспользовал саммари, а не
+                # бил в LLM заново. notified=True — иначе ближайший цикл шедулера разошлёт
+                # её всем подписчикам как будто это новая публикация (см. Article.notified).
                 title = external_id
                 url = f"http://publication.pravo.gov.ru/document/{external_id}"
+                article = Article(
+                    external_id=external_id,
+                    title=title,
+                    url=url,
+                    original_text=text,
+                    summary=summary,
+                    notified=True,
+                )
+                session.add(article)
+                await session.commit()
 
             if not is_admin and not auto_bypass:
                 usage = await session.scalar(
@@ -826,7 +926,9 @@ async def _summarize_and_reply(
             else:
                 await session.commit()
 
-        final, reply_markup = _summary_final(config, title, url, summary, external_id)
+        final, reply_markup = _summary_final(
+            config, title, url, summary, external_id, title_known=title_known
+        )
         await _deliver(
             context,
             user,
@@ -842,11 +944,29 @@ async def _summarize_and_reply(
             art = await session.scalar(
                 select(Article).where(Article.external_id == external_id)
             )
-        title = (art.title if art else None) or external_id
-        url = (
-            (art.url if art else None)
-            or f"http://publication.pravo.gov.ru/document/{external_id}"
-        )
+            title_known = art is not None
+            if art is not None:
+                if not art.original_text:
+                    art.original_text = text
+                    await session.commit()
+                title = art.title
+                url = art.url
+            else:
+                # Тот же случай, что и в успешном пути: закон не из ленты, но текст
+                # реально получен — сохраняем, чтобы не терять его и не показывать
+                # external_id как будто это заголовок (см. _summary_final).
+                title = external_id
+                url = f"http://publication.pravo.gov.ru/document/{external_id}"
+                session.add(
+                    Article(
+                        external_id=external_id,
+                        title=title,
+                        url=url,
+                        original_text=text,
+                        notified=True,
+                    )
+                )
+                await session.commit()
         if "отказался" in str(exc) or "пустой ответ" in str(exc):
             fallback = (
                 "Языковая модель отказалась сформировать саммари для этого документа. "
@@ -855,7 +975,7 @@ async def _summarize_and_reply(
         else:
             fallback = "Не удалось сделать саммари. Попробуйте позже."
         final, reply_markup = _summary_refused(
-            config, title, url, fallback, external_id
+            config, title, url, fallback, external_id, title_known=title_known
         )
         await _deliver(
             context,
@@ -868,12 +988,10 @@ async def _summarize_and_reply(
         )
     except Exception:
         logger.exception("Ошибка принудительной саммаризации %s", external_id)
-        await _deliver(
-            context,
-            user,
-            message,
-            "Не удалось сделать саммари. Попробуйте позже.",
-            status_message=status_message,
+        fallback = "Не удалось сделать саммари. Попробуйте позже."
+        await _deliver_summary_failure(
+            context, user, message, status_message,
+            config, cached, title, url, external_id, fallback,
         )
 
 
