@@ -19,7 +19,15 @@ from app.services.gigachat import (
     GigaChatConfig,
     GigaChatError,
 )
-from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text, get_legal_text, ocr_document_text
+from app.services.rss_parser import (
+    IMPORTANT_LEVELS,
+    FeedEntry,
+    _normalize_text,
+    classify_level_for_title,
+    fetch_document,
+    get_legal_text,
+    ocr_document_text,
+)
 from app.services.scheduler import (
     DIGEST_SUMMARIZE_PREFIX,
     FORCE_SUMMARIZE_PREFIX,
@@ -319,12 +327,35 @@ def _summary_refused(
     )
 
 
+def _has_real_title(article: Article | None, external_id: str) -> bool:
+    """True, если у записи настоящее название, а не псевдозаголовок (пусто или == external_id)."""
+    return article is not None and bool(article.title) and article.title != external_id
+
+
+def _apply_document_metadata(
+    article: Article, entry: FeedEntry | None, external_id: str
+) -> None:
+    """Проставляет записи название, ссылку и уровень из метаданных портала.
+
+    entry=None (портал не ответил / не знает документ) — оставляем псевдозаголовок
+    external_id и канонический url; уровень не трогаем.
+    """
+    if entry is None:
+        article.title = article.title or external_id
+        article.url = article.url or f"http://publication.pravo.gov.ru/document/{external_id}"
+        return
+    article.title = entry.title
+    article.url = entry.url
+    article.level = classify_level_for_title(entry.title, entry.document_type_id)
+
+
 def _summary_refused_plain(fallback: str, external_id: str, url: str) -> str:
     """Простое служебное сообщение о неудачной саммаризации без псевдозаголовка.
 
-    Используется вместо notification-style _summary_refused, когда закон вообще
-    не найден в БД (cached is None) — показывать external_id жирным как будто
-    это заголовок закона было бы вводящим в заблуждение. Без MarkdownV2, чтобы
+    Используется вместо notification-style _summary_refused, когда настоящего
+    названия нет: записи нет в БД или у неё псевдозаголовок (см. _has_real_title) —
+    показывать external_id жирным как будто это заголовок закона было бы
+    вводящим в заблуждение. Без MarkdownV2, чтобы
     не экранировать id/ссылку вручную (Telegram сам делает ссылку кликабельной
     в обычном тексте).
     """
@@ -345,12 +376,13 @@ async def _deliver_summary_failure(
 ) -> None:
     """Доставляет сообщение о неудачной принудительной саммаризации.
 
-    Закон уже известен (cached задан) — notification-style через _summary_refused
-    (заголовок + причина + ссылка). Закон не найден в БД вообще (cached is None,
-    реалистично только для /summary с произвольным external_id) — простое
-    служебное сообщение: показать заголовок в этом случае нечего.
+    У записи настоящее название — notification-style через _summary_refused
+    (заголовок + причина + ссылка). Записи нет в БД (реалистично только для
+    /summary с произвольным external_id) или у неё псевдозаголовок (title ==
+    external_id, портал не отдал метаданные) — простое служебное сообщение:
+    показать заголовок в этом случае нечего.
     """
-    if cached is not None:
+    if _has_real_title(cached, external_id):
         final, reply_markup = _summary_refused(
             config, title, url, fallback, external_id, with_webapp_button=False
         )
@@ -380,8 +412,8 @@ def _summary_final(
     """Собирает итог саммаризации: MarkdownV2-текст + кнопку Mini-App (если есть).
 
     Кнопка «Полный текст» показывается только когда есть саммари (важный закон — сразу,
-    иначе после принудительной саммаризации). title_known=False — закон не был известен
-    системе до этого вызова (создан на лету через /summary по external_id вне ленты):
+    иначе после принудительной саммаризации). title_known=False — у записи псевдозаголовок
+    (закон не из ленты, а портал не отдал метаданные, см. _has_real_title):
     title в этом случае — не настоящее название, а сам external_id; показывать его
     жирным как заголовок было бы вводящим в заблуждение (тот же принцип, что и в
     _summary_refused_plain для фолбэков) — вместо этого просто саммари + id для сверки.
@@ -775,22 +807,30 @@ async def _summarize_and_reply(
     month = datetime.now().strftime("%Y-%m")
     limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
 
-    # авто-уровни без лимита (Конституция/ФКЗ/ФЗ) — проверяем по уже сохранённой статье
-    auto_bypass = False
-    try:
-        async with session_maker() as session:
-            lvl = await session.scalar(select(Article.level).where(Article.external_id == external_id))
-            if lvl in AUTO_LEVELS:
-                auto_bypass = True
-    except Exception:
-        pass
-
     # Переиспользуем уже сохранённое саммари, если оно есть (без повторного LLM);
     # title/url тоже берём отсюда для всех фолбэк-сообщений об ошибке ниже.
     async with session_maker() as session:
         cached = await session.scalar(
             select(Article).where(Article.external_id == external_id)
         )
+
+    # Лечение записи с псевдозаголовком (закон не из ленты, сохранённый раньше
+    # без метаданных): один раз пробуем получить настоящие название/ссылку/уровень.
+    if cached is not None and not _has_real_title(cached, external_id):
+        entry = await fetch_document(external_id)
+        if entry is not None:
+            async with session_maker() as session:
+                art = await session.scalar(
+                    select(Article).where(Article.external_id == external_id)
+                )
+                if art is not None:
+                    _apply_document_metadata(art, entry, external_id)
+                    await session.commit()
+                    cached = art
+
+    # авто-уровни без лимита (Конституция/ФКЗ/ФЗ) — по уже сохранённой (и вылеченной) статье
+    auto_bypass = cached is not None and cached.level in AUTO_LEVELS
+
     title = (cached.title if cached else None) or external_id
     url = (
         (cached.url if cached else None)
@@ -818,7 +858,8 @@ async def _summarize_and_reply(
 
     if cached is not None and cached.summary:
         final, reply_markup = _summary_final(
-            config, cached.title or external_id, cached.url, cached.summary, external_id
+            config, cached.title or external_id, cached.url, cached.summary, external_id,
+            title_known=_has_real_title(cached, external_id),
         )
         await _deliver(
             context,
@@ -885,31 +926,29 @@ async def _summarize_and_reply(
             article = await session.scalar(
                 select(Article).where(Article.external_id == external_id)
             )
-            title_known = article is not None
             if article is not None:
                 article.original_text = text
                 article.summary = summary
                 await session.commit()
                 await session.refresh(article)
-                title = article.title
-                url = article.url
             else:
                 # Закон не из дневной ленты (не отслеживался ботом) — создаём запись,
                 # чтобы повторный /summary для этого же id переиспользовал саммари, а не
                 # бил в LLM заново. notified=True — иначе ближайший цикл шедулера разошлёт
                 # её всем подписчикам как будто это новая публикация (см. Article.notified).
-                title = external_id
-                url = f"http://publication.pravo.gov.ru/document/{external_id}"
+                # Название/ссылку/уровень берём с портала; не ответил — псевдозаголовок.
                 article = Article(
                     external_id=external_id,
-                    title=title,
-                    url=url,
                     original_text=text,
                     summary=summary,
                     notified=True,
                 )
+                _apply_document_metadata(article, await fetch_document(external_id), external_id)
                 session.add(article)
                 await session.commit()
+            title_known = _has_real_title(article, external_id)
+            title = article.title
+            url = article.url
 
             if not is_admin and not auto_bypass:
                 usage = await session.scalar(
@@ -944,29 +983,25 @@ async def _summarize_and_reply(
             art = await session.scalar(
                 select(Article).where(Article.external_id == external_id)
             )
-            title_known = art is not None
             if art is not None:
                 if not art.original_text:
                     art.original_text = text
                     await session.commit()
-                title = art.title
-                url = art.url
             else:
                 # Тот же случай, что и в успешном пути: закон не из ленты, но текст
                 # реально получен — сохраняем, чтобы не терять его и не показывать
                 # external_id как будто это заголовок (см. _summary_final).
-                title = external_id
-                url = f"http://publication.pravo.gov.ru/document/{external_id}"
-                session.add(
-                    Article(
-                        external_id=external_id,
-                        title=title,
-                        url=url,
-                        original_text=text,
-                        notified=True,
-                    )
+                art = Article(
+                    external_id=external_id,
+                    original_text=text,
+                    notified=True,
                 )
+                _apply_document_metadata(art, await fetch_document(external_id), external_id)
+                session.add(art)
                 await session.commit()
+            title_known = _has_real_title(art, external_id)
+            title = art.title
+            url = art.url
         if "отказался" in str(exc) or "пустой ответ" in str(exc):
             fallback = (
                 "Языковая модель отказалась сформировать саммари для этого документа. "
