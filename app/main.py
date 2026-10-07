@@ -269,7 +269,9 @@ async def _run_initial_check(application: Application) -> None:
                 .where(Article.published_at >= since)
                 .where(Article.level.in_(["FKZ", "FZ"]))
             )
-            application.bot_data["needs_backfill"] = not has_federal_in_window
+            application.bot_data["needs_backfill"] = (
+                application.bot_data["config"].BACKFILL_ENABLED and not has_federal_in_window
+            )
 
             # подавление рассылки старых законов: пустая БД или нет пользователей
             if has_articles is None or has_users is None:

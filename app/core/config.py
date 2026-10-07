@@ -145,6 +145,9 @@ class Config:
     GIGACHAT_MODEL: str
     GIGACHAT_VERIFY_SSL: bool
 
+    # Бэкфилл за 30 дней при старте, если в БД нет ФКЗ/ФЗ за это окно (false — пропускать)
+    BACKFILL_ENABLED: bool
+
     # Прокси для Telegram Bot API (если api.telegram.org недоступен напрямую)
     TELEGRAM_PROXY_URL: str | None
 
@@ -212,6 +215,7 @@ class Config:
             os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
         )
         gigachat_verify_ssl = _get_bool_env("GIGACHAT_VERIFY_SSL", False)
+        backfill_enabled = _get_bool_env("BACKFILL_ENABLED", True)
 
         telegram_proxy_url = os.getenv("TELEGRAM_PROXY_URL", "").strip() or None
 
@@ -269,6 +273,7 @@ class Config:
             GIGACHAT_SCOPE=gigachat_scope,
             GIGACHAT_MODEL=gigachat_model,
             GIGACHAT_VERIFY_SSL=gigachat_verify_ssl,
+            BACKFILL_ENABLED=backfill_enabled,
             TELEGRAM_PROXY_URL=telegram_proxy_url,
             PRAVO_API_URL=pravo_api_url,
             LOG_FILE=log_file,
