@@ -211,7 +211,7 @@ async def _start_webapp(application: Application) -> None:
     try:
         from app.webapp import start_webapp
 
-        await start_webapp(config.WEBAPP_HOST, config.WEBAPP_PORT, session_maker)
+        await start_webapp(config.WEBAPP_HOST, config.WEBAPP_PORT, session_maker, config)
     except Exception:
         logger.exception("Не удалось запустить WebApp")
 
