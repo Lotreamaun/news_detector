@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3  # сколько раз повторить запрос при временной ошибке
 _REQUEST_TIMEOUT = 30.0  # таймаут HTTP-запроса в секундах
+_PAGE_SIZE = 200  # документов на страницу API (допустимы 100 и 200)
+_MAX_PAGES = 20  # потолок страниц за один запрос периода
 # Ограничиваем текст, чтобы не кормить LLM и не хранить гигантов
 _MAX_DOCUMENT_CHARS = 50_000
 # Лимит PDF для GigaChat: файл грузится как текстовый документ (40 МБ)
@@ -146,31 +149,60 @@ class FeedEntry:
     document_date: datetime | None  # дата самого акта
 
 
-async def fetch_documents(api_url: str) -> list[FeedEntry]:
-    """
-    Загружает список документов из JSON API публикаций (одна страница).
+def _page_url(api_url: str, index: int) -> str:
+    """Подставляет в URL ``pageSize`` и номер страницы ``index`` (чужие значения перезаписываются)."""
+    parts = urlsplit(api_url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() not in ("pagesize", "index")]
+    query += [("pageSize", str(_PAGE_SIZE)), ("index", str(index))]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
-    Args:
-        api_url: URL API документов (например, ``PRAVO_API_URL`` из конфигурации,
-            ``.../api/documents?periodType=daily``).
 
-    Returns:
-        Список ``FeedEntry``. Пустой список, если в ответе нет документов.
-
-    Raises:
-        FetchError: не удалось загрузить API после всех попыток.
-        ParseError: ответ не JSON или не содержит список ``items``.
-    """
-    raw = await _fetch_with_retries(api_url, what="API документов")
+def _parse_page(raw: object, url: str) -> dict:
+    """Разбирает ответ API страницы в словарь с ``items``."""
     if not isinstance(raw, str):
-        raise ParseError(f"Ожидался текст JSON, получено {type(raw).__name__}: {api_url}")
+        raise ParseError(f"Ожидался текст JSON, получено {type(raw).__name__}: {url}")
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        raise ParseError(f"Ответ API не является JSON: {api_url}") from exc
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        raise ParseError(f"Ответ API не содержит список items: {api_url}")
+        raise ParseError(f"Ответ API не является JSON: {url}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise ParseError(f"Ответ API не содержит список items: {url}")
+    return data
+
+
+async def fetch_documents(api_url: str) -> list[FeedEntry]:
+    """
+    Загружает список документов из JSON API публикаций (все страницы ответа).
+
+    Args:
+        api_url: URL API документов (например, ``PRAVO_API_URL`` из конфигурации,
+            ``.../api/documents?periodType=daily``). ``pageSize`` и ``index``
+            в нём перезаписываются.
+
+    Returns:
+        Список ``FeedEntry``. Пустой список, если в ответе нет документов.
+        Если страница N>1 не загрузилась, возвращаются документы остальных страниц.
+
+    Raises:
+        FetchError: не удалось загрузить первую страницу после всех попыток.
+        ParseError: первая страница не JSON или не содержит список ``items``.
+    """
+    first_url = _page_url(api_url, 1)
+    data = _parse_page(await _fetch_with_retries(first_url, what="API документов"), first_url)
+    items: list[object] = list(data["items"])
+    pages = data.get("pagesTotalCount")
+    pages = pages if isinstance(pages, int) else 1
+    if pages > _MAX_PAGES:
+        logger.warning("API сообщает %d страниц, загружаем только %d (%s)", pages, _MAX_PAGES, api_url)
+        pages = _MAX_PAGES
+    for index in range(2, pages + 1):
+        page_url = _page_url(api_url, index)
+        try:
+            page = _parse_page(await _fetch_with_retries(page_url, what=f"API документов, страница {index}"), page_url)
+        except RssError as exc:
+            logger.warning("Страница %d/%d не загружена, пропускаем: %s", index, pages, exc)
+            continue
+        items.extend(page["items"])
     result: list[FeedEntry] = []
     for item in items:
         entry = _entry_from_item(item)
@@ -201,11 +233,9 @@ async def fetch_day(day: datetime | str, api_url: str, *, document_type_ids: lis
         day_str = day.strftime("%d.%m.%Y")
     # Сбрасываем query из базового URL: periodType=day должен быть единственным
     # (в PRAVO_API_URL уже есть ?PeriodType=daily, иначе он перекроет day).
-    from urllib.parse import urlsplit, urlunsplit
-
     parts = urlsplit(api_url)
     url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    url = f"{url}?periodType=day&date={day_str}&pageSize=200"
+    url = f"{url}?periodType=day&date={day_str}"
     for tid in (document_type_ids or []):
         url += f"&documentTypes={tid}"
     try:
