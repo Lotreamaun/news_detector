@@ -1,11 +1,14 @@
 """HTTP-сервер Mini-App для просмотра полного текста закона.
 
 Запускается вместе с ботом (main.py -> post_init) на WEBAPP_HOST:WEBAPP_PORT
-и отдаёт два роута:
+и отдаёт роуты:
   GET /app?external_id=<id>            — HTML-страница фронтенда, один документ
   GET /app?ids=<id1>,<id2>,...         — та же страница, аккордеон из нескольких
                                           документов (кнопка «Полные тексты» дайджеста)
-  GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available}
+  GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available, summary}
+  POST /summarize                      — принудительная саммаризация из карточки дайджеста
+                                          (JSON {external_id, init_data}); пользователь
+                                          определяется по подписанному Telegram initData
 
 Режим ``ids`` переиспользует существующий ``/full_text`` (по одному запросу на
 документ), а не отдельный batch-эндпоинт — проще и достаточно для размеров
@@ -14,14 +17,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
+import time
+from urllib.parse import parse_qsl
 
 from aiohttp import web
 from sqlalchemy import select
 
-from app.models import Article
+from app.models import Article, User
+from app.services.force_summary import force_summarize
 
 logger = logging.getLogger(__name__)
+
+CORS = {"Access-Control-Allow-Origin": "*"}
+INIT_DATA_MAX_AGE = 24 * 60 * 60  # страница дайджеста может долго висеть открытой
 
 HTML_PAGE = r"""<!doctype html>
 <html lang="ru">
@@ -32,6 +44,8 @@ HTML_PAGE = r"""<!doctype html>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   * { box-sizing: border-box; }
+  :root { --sum-accent: var(--tg-theme-button-color, #2688d4); --sum-bg: rgba(38, 136, 212, 0.12); --sum-border: rgba(38, 136, 212, 0.45); }
+  @supports (color: color-mix(in srgb, red, blue)) { :root { --sum-bg: color-mix(in srgb, var(--sum-accent) 14%, transparent); --sum-border: color-mix(in srgb, var(--sum-accent) 45%, transparent); } }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #222); line-height: 1.6; }
   .container { max-width: 800px; margin: 0 auto; padding: 16px; position: relative; }
   .disclaimer { background: #fff3cd; color: #664d03; border: 1px solid #ffecb5; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 14px; }
@@ -50,10 +64,26 @@ HTML_PAGE = r"""<!doctype html>
   .loading { color: #555; }
   .digest-hint { color: var(--tg-theme-hint-color, #707579); font-size: 13px; margin: 0 0 10px 0; }
   .doc { border: 1px solid var(--tg-theme-hint-color, #ddd); border-radius: 8px; margin-bottom: 10px; }
-  .doc summary { cursor: pointer; padding: 12px; font-weight: 600; list-style: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc summary { cursor: pointer; padding: 12px; font-weight: 600; list-style: none; }
   .doc summary::-webkit-details-marker { display: none; }
-  .doc summary::before { content: "▸ "; }
-  .doc[open] summary::before { content: "▾ "; }
+  .doc-head-title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc-head-title::before { content: "▸ "; }
+  .doc[open] .doc-head-title::before { content: "▾ "; }
+  .sum { background: var(--sum-bg); border: 1px solid var(--sum-border); border-radius: 8px; padding: 8px 10px; margin: 8px 0 12px 0; font-size: 14px; font-weight: 400; line-height: 1.5; word-break: break-word; }
+  .sum-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--sum-accent); margin-bottom: 2px; }
+  .sum-preview { margin: 8px 0 0 0; }
+  .doc[open] .sum-preview { display: none; }
+  .sum-action { margin: 8px 0 12px 0; }
+  .sum-btn { display: inline-flex; align-items: center; gap: 8px; background: var(--tg-theme-button-color, #2688d4); color: var(--tg-theme-button-text-color, #fff); border: 0; border-radius: 8px; padding: 8px 14px; font-size: 14px; line-height: 20px; cursor: pointer; transition: background .15s, color .15s, box-shadow .15s, transform .12s; }
+  .sum-btn:active:not(:disabled) { transform: scale(.98); }
+  .sum-btn:disabled { cursor: default; }
+  /* нажатое состояние (loading): та же плашка, что и у готового саммари (.sum) — плашка «вырастает» из кнопки */
+  .sum-btn.busy { background: var(--sum-bg); color: var(--sum-accent); box-shadow: inset 0 0 0 1px var(--sum-border); }
+  /* чётный размер и целая высота строки — центр вращения попадает на целый пиксель, спиннер не «гуляет» */
+  .sum-btn .spin { width: 14px; height: 14px; flex: none; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; will-change: transform; animation: sum-spin .8s linear infinite; }
+  @keyframes sum-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .sum-btn .spin { animation: none; } }
+  .sum-status { font-size: 13px; color: var(--tg-theme-hint-color, #707579); margin-top: 6px; }
   .doc-body { padding: 0 12px 12px 12px; }
   .doc-title { font-weight: 700; margin: 0 0 8px 0; }
 </style>
@@ -69,7 +99,7 @@ HTML_PAGE = r"""<!doctype html>
     <div id="link" class="link"></div>
   </div>
   <div id="digest" style="display:none">
-    <div class="digest-hint">👆 Нажмите на закон, чтобы посмотреть текст</div>
+    <div class="digest-hint">👇 Нажмите на закон, чтобы посмотреть текст</div>
     <div id="digest-list"></div>
   </div>
 </div>
@@ -169,7 +199,7 @@ HTML_PAGE = r"""<!doctype html>
         contentHtml = '<p>' + escapeHtml(String(data.text)) + '</p>';
       }
     } else {
-      contentHtml = 'Текст этого закона пока недоступен в текстовом формате. Откройте оригинал на портале.';
+      contentHtml = 'Содержание этого закона пока недоступно в текстовом формате. Откройте оригинал на портале или запросите саммари: PDF-файл распознаётся с помощью ИИ.';
     }
 
     let linkHtml = '';
@@ -192,6 +222,111 @@ HTML_PAGE = r"""<!doctype html>
       digestListEl.innerHTML = '<div class="error">Не переданы документы дайджеста. URL: ' + escapeHtml(window.location.href) + '</div>';
       return;
     }
+    const origin = window.location.origin;
+
+    function fetchFullText(id) {
+      return fetch(origin + '/full_text?external_id=' + encodeURIComponent(id))
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        });
+    }
+    function sumHtml(summary, cls) {
+      return '<div class="sum ' + cls + '"><div class="sum-label">Саммари</div>' +
+        escapeHtml(summary).replace(/\n/g, '<br>') + '</div>';
+    }
+    // act: {message, button} — сообщение на месте кнопки «Сделать саммари» и нужна ли кнопка
+    function renderCard(details, data, id, act) {
+      act = act || {};
+      details._id = id;
+      details._data = data;
+      details._loaded = true;
+      const title = data.title || id;
+      const r = renderResult(data);
+      const head = details.querySelector('summary');
+      head.innerHTML = '<span class="doc-head-title">' + escapeHtml(title) + '</span>' +
+        (data.summary ? sumHtml(data.summary, 'sum-preview') : '');
+      // полный заголовок дублируется в теле секции — заголовок в <summary> обрезается эллипсисом
+      let html = '<div class="doc-title">' + escapeHtml(title) + '</div>';
+      if (r.dateText) html += '<div class="date">Дата подписания: ' + escapeHtml(r.dateText) + '</div>';
+      if (data.summary) {
+        html += sumHtml(data.summary, '');
+      } else {
+        html += '<div class="sum-action">' +
+          (act.button === false ? '' : '<button type="button" class="sum-btn">Сделать саммари</button>') +
+          '<div class="sum-status">' + escapeHtml(act.message || '') + '</div></div>';
+      }
+      html += r.isAvailable ? r.contentHtml : '<p class="error">' + escapeHtml(r.contentHtml) + '</p>';
+      if (r.linkHtml) html += '<div class="link">' + r.linkHtml + '</div>';
+      const body = details.querySelector('.doc-body');
+      body.innerHTML = html;
+      body.className = 'doc-body';
+      const btn = body.querySelector('.sum-btn');
+      if (btn) btn.addEventListener('click', function() { startSummarize(details); });
+    }
+    // непустые summary/text из ответа заменяют прежние при любом статусе
+    function mergeData(data, res) {
+      if (res.summary) data.summary = res.summary;
+      if (res.text) { data.text = res.text; data.is_text_available = true; }
+    }
+    // busy — кнопка показывает спиннер и «Саммари в процессе создания…»; message — текст под кнопкой
+    function setActionState(details, message, busy) {
+      const status = details.querySelector('.sum-status');
+      const btn = details.querySelector('.sum-btn');
+      if (status) status.textContent = message || '';
+      if (!btn) return;
+      btn.disabled = !!busy;
+      btn.classList.toggle('busy', !!busy);
+      btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+      if (busy) btn.innerHTML = '<span class="spin"></span>Саммари в процессе создания…';
+      else btn.textContent = 'Сделать саммари';
+    }
+
+    function startSummarize(details) {
+      const id = details._id;
+      const data = details._data;
+      if (!tg || !tg.initData) {
+        setActionState(details, 'Саммари можно сделать, открыв дайджест из Telegram.', false);
+        return;
+      }
+      details._busy = true;
+      setActionState(details, '', true);
+      fetch(origin + '/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ external_id: id, init_data: tg.initData })
+      })
+        .then(function(r) {
+          if (r.status === 401) return { stop: 'Сессия устарела — закройте и снова откройте дайджест.' };
+          if (r.status === 403) {
+            return r.json().then(
+              function(j) { return { stop: j.message || 'Нет доступа.' }; },
+              function() { return { stop: 'Нет доступа.' }; }
+            );
+          }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(res) {
+          details._busy = false;
+          if (res.stop) { setActionState(details, res.stop, false); return; }
+          mergeData(data, res);
+          const final = res.status === 'limit' || res.status === 'refused';
+          renderCard(details, data, id, res.status === 'ok' ? {} : { message: res.message, button: !final });
+        })
+        .catch(function() {
+          // запрос мог дойти до сервера, а ответ оборвал посредник — перепроверяем документ
+          const wait = 'Не удалось дождаться ответа — возможно, саммари ещё создаётся. Попробуйте через минуту.';
+          fetchFullText(id)
+            .then(function(fresh) {
+              details._busy = false;
+              if (fresh.summary) { mergeData(data, fresh); renderCard(details, data, id); }
+              else setActionState(details, wait, false);
+            })
+            .catch(function() { details._busy = false; setActionState(details, wait, false); });
+        });
+    }
+
     ids.forEach(function(rawId) {
       let id = rawId;
       try { id = decodeURIComponent(rawId); } catch (e) { /* оставляем как есть */ }
@@ -206,23 +341,20 @@ HTML_PAGE = r"""<!doctype html>
       details.appendChild(body);
       digestListEl.appendChild(details);
 
-      fetch(window.location.origin + '/full_text?external_id=' + encodeURIComponent(id))
-        .then(function(r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.json();
-        })
-        .then(function(data) {
-          const title = data.title || id;
-          summary.textContent = title;
-          const r = renderResult(data);
-          // полный заголовок дублируется в теле секции — <summary> обрезается CSS-эллипсисом
-          let html = '<div class="doc-title">' + escapeHtml(title) + '</div>';
-          if (r.dateText) html += '<div class="date">Дата подписания: ' + escapeHtml(r.dateText) + '</div>';
-          html += r.isAvailable ? r.contentHtml : '<p class="error">' + escapeHtml(r.contentHtml) + '</p>';
-          if (r.linkHtml) html += '<div class="link">' + r.linkHtml + '</div>';
-          body.innerHTML = html;
-          body.className = 'doc-body';
-        })
+      // при разворачивании карточки без саммари перепроверяем: его мог сделать другой пользователь
+      details.addEventListener('toggle', function() {
+        if (!details.open || !details._loaded || details._busy || details._data.summary) return;
+        fetchFullText(id)
+          .then(function(fresh) {
+            if (details._busy || !fresh.summary) return;
+            mergeData(details._data, fresh);
+            renderCard(details, details._data, id);
+          })
+          .catch(function() { /* перепроверка не критична */ });
+      });
+
+      fetchFullText(id)
+        .then(function(data) { renderCard(details, data, id); })
         .catch(function(err) {
           summary.textContent = id;
           body.textContent = 'Не удалось загрузить текст: ' + err.message;
@@ -333,6 +465,7 @@ async def handle_full_text(request: web.Request) -> web.Response:
                     "url": article.url,
                     "text": article.original_text if is_available else None,
                     "is_text_available": is_available,
+                    "summary": article.summary or None,
                 },
                 headers={"Access-Control-Allow-Origin": "*"},
             )
@@ -344,12 +477,98 @@ async def handle_full_text(request: web.Request) -> web.Response:
         )
 
 
-def create_app(session_maker) -> web.Application:
+def _verify_init_data(init_data: str, bot_token: str) -> int | None:
+    """Проверяет подпись Telegram WebApp initData и возвращает user.id (иначе None).
+
+    Схема Telegram: secret = HMAC_SHA256("WebAppData", bot_token); подписывается
+    отсортированный data_check_string из всех полей, кроме hash. Дополнительно
+    auth_date не должен быть старше INIT_DATA_MAX_AGE. initData не логируется.
+    """
+    try:
+        fields = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = fields.pop("hash", "")
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        expected = hmac.new(secret, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, received_hash):
+            return None
+        if time.time() - int(fields["auth_date"]) > INIT_DATA_MAX_AGE:
+            return None
+        return int(json.loads(fields["user"])["id"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+async def handle_summarize(request: web.Request) -> web.Response:
+    """Принудительная саммаризация документа из карточки дайджеста.
+
+    Доменные исходы (ok/limit/no_text/refused/error) — 200 со статусом и готовым
+    для карточки message; 400 — плохой запрос, 401 — нет/неверная initData,
+    403 — пользователь неизвестен или не подтвердил подписку, 500 — сбой сервера.
+    """
+    try:
+        payload = await request.json()
+        external_id = str(payload.get("external_id") or "").strip()
+        init_data = str(payload.get("init_data") or "")
+    except (ValueError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400, headers=CORS)
+    if not external_id:
+        return web.json_response({"error": "missing external_id"}, status=400, headers=CORS)
+
+    config = request.app["config"]
+    telegram_id = _verify_init_data(init_data, config.TELEGRAM_BOT_TOKEN)
+    if telegram_id is None:
+        return web.json_response({"error": "unauthorized"}, status=401, headers=CORS)
+
+    try:
+        session_maker = request.app["session_maker"]
+        async with session_maker() as session:
+            user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if user is None:
+            return web.json_response(
+                {"message": "Откройте бота и нажмите /start."}, status=403, headers=CORS
+            )
+        if config.REQUIRED_CHANNEL_ID and not user.channel_verified:
+            return web.json_response(
+                {"message": "Подтвердите подписку на канал в боте."}, status=403, headers=CORS
+            )
+
+        result = await force_summarize(config, session_maker, user, external_id)
+        messages = {
+            "limit": (
+                f"Месячный лимит саммаризаций ({config.FORCE_SUMMARIZE_MONTHLY_LIMIT}) "
+                "исчерпан. Попробуйте в следующем месяце."
+            ),
+            "no_text": "Не удалось получить текст закона. Попробуйте позже.",
+            "refused": "Языковая модель отказалась сформировать саммари для этого документа.",
+            "error": "Не удалось сделать саммари. Попробуйте позже.",
+        }
+        logger.info("handle_summarize: user=%s %s -> %s", telegram_id, external_id, result.status)
+        return web.json_response(
+            {
+                "status": result.status,
+                "summary": result.summary,
+                "text": result.text,
+                "is_text_available": bool(result.text and result.text.strip()),
+                "message": messages.get(result.status),
+            },
+            headers=CORS,
+        )
+    except Exception:
+        logger.exception("handle_summarize: error for %s", external_id)
+        return web.json_response({"error": "internal error"}, status=500, headers=CORS)
+
+
+def create_app(session_maker, config) -> web.Application:
     """Создаёт aiohttp Application с роутами WebApp."""
     app = web.Application()
     app["session_maker"] = session_maker
+    app["config"] = config
     app.router.add_get("/app", handle_app)
     app.router.add_get("/full_text", handle_full_text)
+    app.router.add_post("/summarize", handle_summarize)
     # health-check
     async def health(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -361,11 +580,11 @@ _runner: web.AppRunner | None = None
 _site: web.TCPSite | None = None
 
 
-async def start_webapp(host: str, port: int, session_maker) -> None:
+async def start_webapp(host: str, port: int, session_maker, config) -> None:
     """Запускает HTTP-сервер WebApp. При ошибке логирует и не роняет бота."""
     global _runner, _site
     try:
-        app = create_app(session_maker)
+        app = create_app(session_maker, config)
         _runner = web.AppRunner(app)
         await _runner.setup()
         _site = web.TCPSite(_runner, host, port)

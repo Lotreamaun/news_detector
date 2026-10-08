@@ -488,17 +488,17 @@ def _build_digest(
     дайджеста. Кнопка «Дайджест» открывает WebApp с документами группы в том же
     порядке, до ``DIGEST_ID_CAP`` штук (остаток доступен через /latest) — благодаря
     общей сортировке документы тизера всегда попадают и в список кнопки; без
-    ``webapp_url`` кнопка не добавляется, текст не меняется. Для документов из
-    тизера без саммари добавляется кнопка «Сделать саммари №N» — в отличие от
-    одиночного уведомления, её нажатие не правит это сообщение (иначе стёрлись
-    бы остальные пункты тизера), а присылает результат отдельным сообщением.
+    ``webapp_url`` нет ни кнопки, ни подсказки. Саммари недостающих документов
+    делается прямо в Mini-App, поэтому кнопок «Сделать саммари №N» тизер больше не
+    содержит (они остались только в ранее отправленных дайджестах, см.
+    ``force_summarize_digest``) — вместо них при заданном ``webapp_url`` в текст
+    добавляется подсказка про дайджест.
     """
     ordered = sorted(articles, key=_digest_sort_key)
     header_esc = escape_markdown(f"Приняли новые законы — {len(ordered)}", version=2)
     lines: list[str] = [f"*{header_esc}*"]
 
     sample = ordered[:3]
-    summary_buttons: list[list[InlineKeyboardButton]] = []
     for i, article in enumerate(sample, 1):
         title_clean = _normalize_text(article.title) or article.title
         title_esc = escape_markdown(f"{i}. {title_clean}", version=2)
@@ -509,22 +509,20 @@ def _build_digest(
             block = f"*{title_esc}*\n{summary_esc}\n[Читать на портале]({url_esc})"
         else:
             block = f"*{title_esc}*\n[Читать на портале]({url_esc})"
-            summary_buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"Сделать саммари №{i}",
-                        callback_data=f"{DIGEST_SUMMARIZE_PREFIX}{article.external_id}",
-                    )
-                ]
-            )
         lines.append(block)
 
-    if webapp_url and len(sample) < len(ordered):
-        lines.append(escape_markdown("Все документы — в полном списке по кнопке ниже", version=2))
+    if webapp_url:
+        lines.append(
+            escape_markdown(
+                "Саммари и полные тексты — в дайджесте по кнопке ниже. "
+                "Там же можно сделать саммари для любого закона",
+                version=2,
+            )
+        )
 
     text = "\n\n".join(lines)
 
-    buttons: list[list[InlineKeyboardButton]] = list(summary_buttons)
+    buttons: list[list[InlineKeyboardButton]] = []
     if webapp_url:
         capped = ordered[:DIGEST_ID_CAP]
         ids_param = ",".join(quote(a.external_id, safe="") for a in capped)
