@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,  # Функция для создания объекта движка
 )
 
-from app.models import Base, Article, User, UserFilter, WeeklyDigestRun  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
+from app.models import Base, Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
 
 _engine: Optional[AsyncEngine] = None  # приватная переменная для движка
 _async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None  # для сессий
@@ -110,6 +110,7 @@ async def init_db_schema() -> None:
         await _ensure_is_demo_column(connection)
         await _ensure_importance_column(connection)
         await _ensure_created_at_column(connection)
+        await _ensure_digest_override_column(connection)
 
 
 async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
@@ -185,4 +186,17 @@ async def _ensure_created_at_column(connection: AsyncConnection) -> None:
     if "created_at" not in columns:
         await connection.execute(
             text("ALTER TABLE articles ADD COLUMN created_at DATETIME")
+        )
+
+
+async def _ensure_digest_override_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``digest_override`` (решение администратора по недельной
+    подборке: 'include' / 'exclude', NULL = не трогал) в ``articles``.
+    """
+    result = await connection.execute(text("PRAGMA table_info(articles)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "digest_override" not in columns:
+        await connection.execute(
+            text("ALTER TABLE articles ADD COLUMN digest_override VARCHAR(16)")
         )

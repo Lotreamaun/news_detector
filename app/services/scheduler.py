@@ -31,7 +31,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
-from app.models import Article, User, UserFilter, WeeklyDigestRun
+from app.models import Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.importance import (
     CANDIDATE_LEVELS,
@@ -52,6 +52,20 @@ from app.services.rss_parser import (
     ocr_document_text,
 )
 from app.services.summarizer import Summarizer, SummarizerConfig
+from app.services.weekly_review import (
+    EXCLUDE,
+    INCLUDE,
+    ADMIN_LINK_CALLBACK,
+    WEEKLY_MIN_IMPORTANCE,
+    TargetPeriod,
+    final_selection,
+    format_time_left,
+    is_awaiting_rating,
+    moderation_unavailable_reason,
+    needs_summary_retry,
+    review_counts,
+    target_period,
+)
 from app.services.weekly_window import (
     DAY_END,
     SUNDAY_LAST_HOUR_START,
@@ -89,8 +103,8 @@ IMPORTANCE_BACKLOG_PUBLISHED_DAYS = 21
 # Нет текста дольше стольких часов после приёма — один OCR до оценки
 OCR_AFTER_HOURS = 24
 
-# Недельная подборка: в неё входят акты с оценкой не ниже этой
-WEEKLY_MIN_IMPORTANCE = 2
+# Недельная подборка: порог оценки (WEEKLY_MIN_IMPORTANCE) и правила решений
+# администратора живут в app/services/weekly_review.py
 # Время рассылки для предпросмотра, пока WEEKLY_DIGEST_TIME не задан
 WEEKLY_DEFAULT_TIME = time(18, 0)
 # Допуск по дате публикации относительно начала окна (акты, опубликованные накануне
@@ -140,6 +154,7 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _rate_backlog(context)
     except Exception:
         logger.exception("Ошибка добора неоценённых актов")
+    await _maybe_send_review_ping(context)
     await _maybe_send_weekly_digest(context)
 
 
@@ -505,28 +520,6 @@ async def _load_weekly_window(session_maker, start: datetime, end: datetime) -> 
         )
 
 
-def _select_weekly(window: list[Article]) -> list[Article]:
-    """Важные акты окна (оценка не ниже ``WEEKLY_MIN_IMPORTANCE``); сначала важнее, внутри уровня — свежее.
-
-    Наличие саммари здесь не проверяется: в подборку из них входят только акты с саммари
-    (``_split_by_summary``), остальным перед отправкой даётся попытка 2 саммаризации.
-    """
-    chosen = [a for a in window if a.importance is not None and a.importance >= WEEKLY_MIN_IMPORTANCE]
-    chosen.sort(key=lambda a: a.published_at or datetime.min, reverse=True)
-    chosen.sort(key=lambda a: a.importance, reverse=True)  # сортировка устойчива
-    return chosen
-
-
-def _split_by_summary(important: list[Article]) -> tuple[list[Article], list[Article]]:
-    """Делит важные акты на входящие в подборку (с саммари) и исключённые (без саммари), порядок сохраняется."""
-    return [a for a in important if a.summary], [a for a in important if not a.summary]
-
-
-def _select_unrated(window: list[Article]) -> list[Article]:
-    """Кандидаты окна без оценки."""
-    return [a for a in window if a.importance is None]
-
-
 def _build_weekly_message(articles: list[Article], webapp_url: str | None) -> tuple[str, InlineKeyboardMarkup]:
     """Недельное сообщение: тизер дайджеста с отдельным заголовком и порядком по важности."""
     order = {a.id: i for i, a in enumerate(articles)}
@@ -551,8 +544,11 @@ async def build_weekly_preview(session_maker, config) -> tuple[str | None, Inlin
     now = datetime.now(timezone.utc)
     start = last_digest_moment(now, config.WEEKLY_DIGEST_TIME or WEEKLY_DEFAULT_TIME, tz)
     window = await _load_weekly_window(session_maker, start, now)
-    included, without_summary = _split_by_summary(_select_weekly(window))
-    unrated = _select_unrated(window)
+    included = final_selection(window)
+    without_summary = [a for a in window if needs_summary_retry(a)]
+    unrated = [a for a in window if is_awaiting_rating(a)]
+    forced = [a for a in window if a.digest_override == INCLUDE]
+    dropped = [a for a in window if a.digest_override == EXCLUDE]
     zeros = [a for a in window if a.importance == 0]
     prefiltered = sum(1 for a in zeros if prefilter_zero(a.level, a.title))
     ones = sum(1 for a in window if a.importance == 1)
@@ -563,6 +559,10 @@ async def build_weekly_preview(session_maker, config) -> tuple[str | None, Inlin
         f"Включено в подборку: {len(included)}",
     ]
     lines += [f"  {a.external_id} — оценка {a.importance}" for a in included[:DIGEST_ID_CAP]]
+    lines.append(f"Включено администратором: {len(forced)}")
+    lines += [f"  {a.external_id} — оценка {a.importance}" for a in forced[:DIGEST_ID_CAP]]
+    lines.append(f"Исключено администратором: {len(dropped)}")
+    lines += [f"  {a.external_id} — оценка {a.importance}" for a in dropped[:DIGEST_ID_CAP]]
     lines.append(
         f"Без саммари (будут исключены, если саммари не появится до отправки): {len(without_summary)}"
     )
@@ -611,6 +611,121 @@ async def _weekly_run_finish(session_maker, period_end: datetime) -> None:
         await session.commit()
 
 
+async def load_review_target(
+    session_maker, config, now: datetime | None = None
+) -> tuple[TargetPeriod, list[Article]]:
+    """Целевой период панели модерации и его окно (design.md, п. 5); ничего не пишет в БД."""
+    now = now or datetime.now(timezone.utc)
+    tz = ZoneInfo(config.WEEKLY_DIGEST_TZ)
+    last = last_digest_moment(now, config.WEEKLY_DIGEST_TIME, tz)
+    async with session_maker() as session:
+        run = await session.scalar(
+            select(WeeklyDigestRun).where(WeeklyDigestRun.period_end == _as_utc(last))
+        )
+    target = target_period(
+        now,
+        config.WEEKLY_DIGEST_TIME,
+        tz,
+        run.started_at if run else None,
+        run.finished_at if run else None,
+    )
+    window = await _load_weekly_window(session_maker, target.window_start, target.window_end)
+    return target, window
+
+
+async def weekly_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue-колбэк пятничной задачи: напоминание администраторам (если ещё не отправлялось)."""
+    await _maybe_send_review_ping(context)
+
+
+async def _maybe_send_review_ping(context) -> None:
+    """Единая точка отправки напоминания администраторам; безопасна при любом числе вызовов.
+
+    Вызывается пятничной задачей, из ``_post_init`` и в конце каждого цикла проверки.
+    Условия: модерация доступна, напоминание включено, сейчас — пятница не раньше
+    ``WEEKLY_REVIEW_TIME`` и раньше запланированного момента, период не отправляется и
+    отметки в ``weekly_review_pings`` ещё нет. Сбой логируется и не пробрасывается.
+    """
+    config = context.bot_data["config"]
+    session_maker = context.bot_data["session_maker"]
+    if config.WEEKLY_REVIEW_TIME is None or moderation_unavailable_reason(config):
+        return
+    lock: asyncio.Lock = context.bot_data.setdefault("weekly_review_lock", asyncio.Lock())
+    async with lock:
+        try:
+            now = datetime.now(timezone.utc)
+            tz = ZoneInfo(config.WEEKLY_DIGEST_TZ)
+            target, window = await load_review_target(session_maker, config, now)
+            local = now.astimezone(tz)
+            if (
+                target.sending
+                or now >= target.period_end
+                or local.date() != target.period_end.date()
+                or local.time() < config.WEEKLY_REVIEW_TIME
+            ):
+                return
+            # отметка ставится ДО отправки: напоминание не должно прийти дважды ни при каких сбоях
+            async with session_maker() as session:
+                session.add(WeeklyReviewPing(period_end=_as_utc(target.period_end), pinged_at=now))
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    return
+            await _send_review_ping(context, config, review_counts(window), target.period_end - now, target.period_end)
+        except Exception:
+            logger.exception("Ошибка отправки напоминания администраторам")
+
+
+def build_review_ping(
+    config, counts, time_left: timedelta, period_end: datetime
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и кнопки служебного напоминания администратору (получателей не знает)."""
+    tz = ZoneInfo(config.WEEKLY_DIGEST_TZ)
+    when = period_end.astimezone(tz).strftime("%H:%M")
+    text = (
+        "🛠 Служебное сообщение для администратора\n\n"
+        f"Недельная подборка уйдёт сегодня в {when} (через {format_time_left(time_left)}).\n"
+        f"• В подборке: {counts.included}\n"
+        f"• Важных без саммари: {counts.no_summary}\n"
+        f"• Ещё не оценено: {counts.unrated}\n\n"
+        "Проверьте состав и саммари в панели — это пара минут. "
+        "Не успеете — подборка уйдёт автоматически."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Открыть панель", web_app=WebAppInfo(url=f"{config.WEBAPP_URL.rstrip('/')}/admin"))],
+            [InlineKeyboardButton("🔗 Ссылка для браузера", callback_data=ADMIN_LINK_CALLBACK)],
+        ]
+    )
+    return text, markup
+
+
+async def build_review_ping_now(session_maker, config) -> tuple[str, InlineKeyboardMarkup]:
+    """Напоминание с числами на момент вызова — для ``/test_digest review`` (ничего не пишет в БД)."""
+    now = datetime.now(timezone.utc)
+    target, window = await load_review_target(session_maker, config, now)
+    return build_review_ping(config, review_counts(window), target.period_end - now, target.period_end)
+
+
+async def _send_review_ping(context, config, counts, time_left: timedelta, period_end: datetime) -> None:
+    """Служебное напоминание: ТОЛЬКО администраторам (``ADMIN_CHAT_IDS``), напрямую через Bot API.
+
+    Намеренно не читает ``users`` и не использует ``_send_notification`` (тот деактивирует
+    пользователей по ``Forbidden``): получатели не принимаются извне, поэтому напоминание
+    не может попасть подписчикам. Ошибка у одного администратора не мешает остальным.
+    """
+    text, markup = build_review_ping(config, counts, time_left, period_end)
+    sent = 0
+    for chat_id in config.ADMIN_CHAT_IDS:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+            sent += 1
+        except Exception:
+            logger.warning("Напоминание администратору %s не отправлено", chat_id, exc_info=True)
+    logger.info("Напоминание о модерации подборки за %s: отправлено %d из %d администраторов",
+                period_end, sent, len(config.ADMIN_CHAT_IDS))
+
+
 async def _maybe_send_weekly_digest(context) -> None:
     """Единая точка отправки недельной подборки; безопасна при любом числе вызовов.
 
@@ -650,18 +765,17 @@ async def _send_weekly_digest(context) -> None:
         return
 
     window = await _load_weekly_window(session_maker, period_start, period_end)
-    if _select_unrated(window) or any(
-        a.importance is not None and a.importance >= WEEKLY_MIN_IMPORTANCE and not a.summary for a in window
-    ):
+    if any(is_awaiting_rating(a) or needs_summary_retry(a) for a in window):
         async with _llm_tools(config) as (summarizer, llm_client):
-            # финальный проход: оцениваем всех оставшихся, в т.ч. по названию
-            for article in _select_unrated(window):
+            # финальный проход: оцениваем всех оставшихся, в т.ч. по названию; документы
+            # с решением администратора не оцениваем (is_awaiting_rating их пропускает)
+            for article in [a for a in window if is_awaiting_rating(a)]:
                 try:
                     await _rate_article(context, session_maker, summarizer, llm_client, article, final=True)
                 except Exception:
                     logger.exception("Ошибка финальной оценки %s", article.external_id)
             window = await _load_weekly_window(session_maker, period_start, period_end)
-            unrated = _select_unrated(window)
+            unrated = [a for a in window if is_awaiting_rating(a)]
             if unrated:
                 if datetime.now(timezone.utc) < sunday_at(period_end, SUNDAY_LAST_HOUR_START):
                     logger.info("Недельная подборка отложена: неоценённых кандидатов %d", len(unrated))
@@ -669,16 +783,15 @@ async def _send_weekly_digest(context) -> None:
                 logger.warning(
                     "Недельная подборка уходит без неоценённых: %s", ", ".join(a.external_id for a in unrated)
                 )
-            # попытка 2 фоновой саммаризации для пунктов без саммари
-            for article in _select_weekly(window):
-                if article.summary:
-                    continue
+            # попытка 2 фоновой саммаризации — только для тех, кто реально пойдёт (не исключён)
+            for article in [a for a in window if needs_summary_retry(a)]:
                 try:
                     await _summarize_in_background(context, session_maker, summarizer, llm_client, article)
                 except Exception:
                     logger.exception("Ошибка финальной саммаризации %s", article.external_id)
 
-    included, without_summary = _split_by_summary(_select_weekly(window))
+    included = final_selection(window)
+    without_summary = [a for a in window if needs_summary_retry(a)]
     if without_summary:
         # в подборку идёт только то, что можно прочитать (design п. 9)
         logger.warning(

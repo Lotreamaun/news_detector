@@ -13,6 +13,8 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 from app.bot.handlers import (
+    admin_command,
+    admin_link_callback,
     check_subscription,
     force_summarize,
     force_summarize_digest,
@@ -43,7 +45,8 @@ from app.services.demo_article import (
     DEMO_ARTICLE_TITLE,
     DEMO_ARTICLE_URL,
 )
-from app.services.scheduler import check_legislation_updates, weekly_digest_job
+from app.services.scheduler import check_legislation_updates, weekly_digest_job, weekly_review_job
+from app.services.weekly_review import ADMIN_LINK_CALLBACK, moderation_unavailable_reason
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,10 @@ def _build_application(config: Config) -> Application:
         CallbackQueryHandler(require_channel_verified(force_summarize_digest), pattern=r"^force_sum:digest:")
     )
     application.add_handler(CommandHandler("test_digest", require_channel_verified(test_digest_command)))
+    application.add_handler(CommandHandler("admin", require_channel_verified(admin_command)))
+    application.add_handler(
+        CallbackQueryHandler(require_channel_verified(admin_link_callback), pattern=rf"^{ADMIN_LINK_CALLBACK}$")
+    )
 
     return application
 
@@ -198,6 +205,23 @@ def _schedule_jobs(application: Application, config: Config) -> None:
             )
     else:
         logger.info("Недельная подборка выключена (WEEKLY_DIGEST_TIME не задан)")
+
+    reason = moderation_unavailable_reason(config)
+    if reason:
+        logger.warning("Модерация недельной подборки недоступна (%s): подборка уходит автоматически", reason)
+    elif config.WEEKLY_REVIEW_TIME is not None:
+        job_queue.run_daily(
+            weekly_review_job,
+            time=config.WEEKLY_REVIEW_TIME.replace(tzinfo=ZoneInfo(config.WEEKLY_DIGEST_TZ)),
+            days=(5,),
+            name="weekly_review",
+        )
+        logger.info(
+            "Напоминание администраторам запланировано: пятница %s (%s)",
+            config.WEEKLY_REVIEW_TIME.strftime("%H:%M"), config.WEEKLY_DIGEST_TZ,
+        )
+    else:
+        logger.info("Напоминание администраторам выключено (WEEKLY_REVIEW_TIME пуст), панель доступна по /admin")
 
     if resolve_sqlite_path(config.DATABASE_URL) is None:
         logger.warning(
@@ -325,13 +349,18 @@ async def _run_initial_weekly_digest(application: Application) -> None:
     дневное окно и срок (воскресенье 22:00) проверяет сама ``_maybe_send_weekly_digest``.
     """
     job_queue = application.job_queue
-    jobs = job_queue.get_jobs_by_name("weekly_digest") if job_queue is not None else ()
-    if not jobs:
+    if job_queue is None:
         return
-    try:
-        await jobs[0].run(application)
-    except Exception:
-        logger.exception("Не удалось выполнить стартовую проверку недельной подборки")
+    # напоминание администраторам идёт первым: если бот был выключен в 12:00, оно придёт после
+    # старта (до момента отправки подборки, отметка в weekly_review_pings не даст дубля)
+    for name in ("weekly_review", "weekly_digest"):
+        jobs = job_queue.get_jobs_by_name(name)
+        if not jobs:
+            continue
+        try:
+            await jobs[0].run(application)
+        except Exception:
+            logger.exception("Не удалось выполнить стартовую проверку задачи %s", name)
 
 
 async def _ensure_demo_article(application: Application) -> None:

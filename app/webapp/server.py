@@ -22,6 +22,7 @@ import hmac
 import json
 import logging
 import time
+from pathlib import Path
 from urllib.parse import parse_qsl
 
 from aiohttp import web
@@ -32,6 +33,7 @@ from app.services.force_summary import force_summarize
 
 logger = logging.getLogger(__name__)
 
+STATIC_DIR = Path(__file__).parent / "static"  # общие стили и страница панели администратора
 CORS = {"Access-Control-Allow-Origin": "*"}
 INIT_DATA_MAX_AGE = 24 * 60 * 60  # страница дайджеста может долго висеть открытой
 # После временной неудачи саммари документа (нет текста, сбой GigaChat) повтор по нему
@@ -46,70 +48,7 @@ HTML_PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Полный текст закона</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-  * { box-sizing: border-box; }
-  :root { --sum-accent: var(--tg-theme-button-color, #2688d4); --sum-bg: rgba(38, 136, 212, 0.12); --sum-border: rgba(38, 136, 212, 0.45); }
-  @supports (color: color-mix(in srgb, red, blue)) { :root { --sum-bg: color-mix(in srgb, var(--sum-accent) 14%, transparent); --sum-border: color-mix(in srgb, var(--sum-accent) 45%, transparent); } }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #222); line-height: 1.6; }
-  .container { max-width: 800px; margin: 0 auto; padding: 16px; position: relative; }
-  .disclaimer { background: #fff3cd; color: #664d03; border: 1px solid #ffecb5; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 14px; }
-  .beta { position: absolute; top: 10px; right: 10px; background: #0d6efd; color: #fff; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 12px; letter-spacing: 0.5px; }
-  .title { font-size: 20px; font-weight: 700; margin: 0 0 4px 0; }
-  .date { font-size: 13px; color: var(--tg-theme-hint-color, #707579); margin: 0 0 16px 0; }
-  .text { word-break: break-word; font-size: 15px; line-height: 1.7; }
-  .text p { margin: 0 0 12px 0; }
-  .text p:last-child { margin-bottom: 0; }
-  .text table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; display: block; overflow-x: auto; }
-  .text th, .text td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
-  .text th { background: #f2f2f2; font-weight: 600; }
-  .link { margin-top: 16px; }
-  .link a { color: var(--tg-theme-link-color, #2688d4); text-decoration: none; word-break: break-all; }
-  /* плашки состояния и ошибки — одна геометрия (как у саммари), разный смысл цвета:
-     .unavailable — нормальное состояние «текста пока нет» (нейтральная, в цветах темы),
-     .error — что-то пошло не так (красная; ей же оформлен баннер-уведомление .toast) */
-  .error, .unavailable { border: 1px solid; border-radius: 8px; padding: 8px 10px; margin: 8px 0 12px 0; font-size: 14px; line-height: 1.5; }
-  .error { color: #842029; background: #f8d7da; border-color: #f5c2c7; }
-  .unavailable { color: var(--tg-theme-text-color, #222); background: var(--tg-theme-secondary-bg-color, #f1f1f4); border-color: rgba(112, 117, 121, 0.25); }
-  .loading { color: #555; }
-  .digest-hint { color: var(--tg-theme-hint-color, #707579); font-size: 13px; margin: 0 0 10px 0; }
-  .doc { border: 1px solid var(--tg-theme-hint-color, #ddd); border-radius: 8px; margin-bottom: 10px; }
-  .doc summary { cursor: pointer; padding: 12px; font-weight: 600; list-style: none; }
-  .doc summary::-webkit-details-marker { display: none; }
-  .doc-head-title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .doc-head-title::before { content: "▸ "; }
-  .doc[open] .doc-head-title::before { content: "▾ "; }
-  .sum { background: var(--sum-bg); border: 1px solid var(--sum-border); border-radius: 8px; padding: 8px 10px; margin: 8px 0 12px 0; font-size: 14px; font-weight: 400; line-height: 1.5; word-break: break-word; }
-  .sum-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--sum-accent); margin-bottom: 2px; }
-  .sum-preview { margin: 8px 0 0 0; }
-  .doc[open] .sum-preview { display: none; }
-  .sum-action { margin: 8px 0 12px 0; }
-  .sum-btn { display: inline-flex; align-items: center; gap: 8px; background: var(--tg-theme-button-color, #2688d4); color: var(--tg-theme-button-text-color, #fff); border: 0; border-radius: 8px; padding: 8px 14px; font-size: 14px; line-height: 20px; cursor: pointer; transition: background .15s, color .15s, box-shadow .15s, transform .12s; }
-  .sum-btn:active:not(:disabled) { transform: scale(.98); }
-  .sum-btn:disabled { cursor: default; }
-  /* нажатое состояние (loading): та же плашка, что и у готового саммари (.sum) — плашка «вырастает» из кнопки */
-  .sum-btn.busy { background: var(--sum-bg); color: var(--sum-accent); box-shadow: inset 0 0 0 1px var(--sum-border); }
-  /* чётный размер и целая высота строки — центр вращения попадает на целый пиксель, спиннер не «гуляет» */
-  .sum-btn .spin { width: 14px; height: 14px; flex: none; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; will-change: transform; animation: sum-spin .8s linear infinite; }
-  @keyframes sum-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .sum-btn .spin { animation: none; } }
-  .sum-status { font-size: 13px; color: var(--tg-theme-hint-color, #707579); margin-top: 6px; }
-  /* кулдаун после неудачи: кнопка видна, но приглушена; нажатие показывает баннер */
-  .sum-btn.cooling { opacity: .55; }
-  /* баннер о неудаче саммари (заметнее строки статуса под кнопкой): внешний вид — от .error,
-     здесь только положение, лёгкая тень (отделяет от контента под ним) и появление */
-  .toast { position: fixed; left: 16px; right: 16px; top: calc(16px + env(safe-area-inset-top, 0px)); max-width: 768px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0, 0, 0, .12); opacity: 0; transform: translateY(-20px); pointer-events: none; transition: opacity .2s, transform .2s; z-index: 10; }
-  .toast-count { font-variant-numeric: tabular-nums; }
-  .toast.show { opacity: 1; transform: none; pointer-events: auto; }
-  @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
-  /* тёмная тема Telegram (класс .dark ставит скрипт по tg.colorScheme): приглушённые варианты тех же
-     цветов — светлые плашки на тёмном фоне слепят, а серая сливается с фоном без заметной рамки */
-  .dark .disclaimer { color: #ffda6a; background: #332701; border-color: #997404; }
-  .dark .error { color: #ea868f; background: #2c0b0e; border-color: #842029; }
-  .dark .unavailable { border-color: rgba(112, 132, 153, 0.6); }
-  .dark .toast { box-shadow: 0 2px 12px rgba(0, 0, 0, .5); }
-  .doc-body { padding: 0 12px 12px 12px; }
-  .doc-title { font-weight: 700; margin: 0 0 8px 0; }
-</style>
+<link rel="stylesheet" href="/static/webapp.css">
 </head>
 <body>
 <div class="container">
@@ -688,6 +627,10 @@ def create_app(session_maker, config) -> web.Application:
     app.router.add_get("/app", handle_app)
     app.router.add_get("/full_text", handle_full_text)
     app.router.add_post("/summarize", handle_summarize)
+    app.router.add_static("/static", STATIC_DIR)
+    from app.webapp.admin import setup_admin  # здесь, а не наверху: admin импортирует этот модуль
+
+    setup_admin(app)  # панель модерации подборки; если модерация недоступна — роуты не добавляются
     # health-check
     async def health(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})

@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import desc, select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update, WebAppInfo
 from telegram.helpers import escape_markdown
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
@@ -14,11 +14,14 @@ from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
 from app.services.force_summary import force_summarize as run_force_summarize
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
+from app.services.weekly_review import moderation_unavailable_reason
+from app.webapp.admin import issue_login_token, login_url
 from app.services.scheduler import (
     DIGEST_SUMMARIZE_PREFIX,
     FORCE_SUMMARIZE_PREFIX,
     _build_digest,
     _build_notification,
+    build_review_ping_now,
     build_weekly_preview,
 )
 
@@ -922,10 +925,19 @@ async def test_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("[test_digest weekly] Подборка за текущее окно пуста.")
         await update.message.reply_text(report)
         return
+    if args and args[0] == "review":
+        reason = moderation_unavailable_reason(config)
+        if reason:
+            await update.message.reply_text(f"[test_digest review] Модерация недоступна: {reason}.")
+            return
+        text, reply_markup = await build_review_ping_now(_session_maker(context), config)
+        await update.message.reply_text(text, reply_markup=reply_markup)  # только вызвавшему
+        return
     if len(args) < 2 or args[0] != "real":
         await update.message.reply_text(
             "Использование: /test_digest real <N>\nНапример: /test_digest real 4\n"
-            "Или: /test_digest weekly — предпросмотр недельной подборки"
+            "Или: /test_digest weekly — предпросмотр недельной подборки\n"
+            "Или: /test_digest review — служебное напоминание с текущими числами (только вам)"
         )
         return
     try:
@@ -1050,3 +1062,50 @@ level_wizard_handler = ConversationHandler(
     name="level_wizard",
     persistent=False,
 )
+
+
+async def _send_admin_link(context: ContextTypes.DEFAULT_TYPE, chat_id: int, telegram_id: int) -> None:
+    """Присылает администратору свежую одноразовую ссылку входа в панель (для браузера).
+
+    Предпросмотр ссылки отключён: иначе Telegram сам откроет её и сожжёт одноразовый токен.
+    """
+    config = context.bot_data["config"]
+    reason = moderation_unavailable_reason(config)
+    if reason:
+        await context.bot.send_message(chat_id=chat_id, text=f"Панель модерации недоступна: {reason}.")
+        return
+    url = login_url(config.WEBAPP_URL, issue_login_token(telegram_id))
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🛠 Служебное сообщение для администратора\n\n"
+            "Ссылка для входа в панель модерации в браузере. "
+            "Одноразовая, действует 10 минут — не пересылайте её:\n\n"
+            f"{url}"
+        ),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /admin: администратору — ссылка на панель модерации подборки для браузера."""
+    if update.message is None or update.effective_user is None:
+        return
+    config = context.bot_data["config"]
+    if update.effective_user.id not in config.ADMIN_CHAT_IDS:
+        await update.message.reply_text("Команда доступна только администраторам.")
+        return
+    await _send_admin_link(context, update.message.chat_id, update.effective_user.id)
+
+
+async def admin_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🔗 Ссылка для браузера» в напоминании: то же, что /admin."""
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    config = context.bot_data["config"]
+    if query.from_user.id not in config.ADMIN_CHAT_IDS:
+        await query.answer("Доступно только администраторам.", show_alert=True)
+        return
+    await query.answer()
+    await _send_admin_link(context, query.message.chat_id, query.from_user.id)

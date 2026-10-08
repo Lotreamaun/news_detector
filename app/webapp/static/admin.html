@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Модерация подборки</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/static/webapp.css">
+<style>
+  :root { --bg: var(--tg-theme-bg-color, #fff); --muted: var(--tg-theme-hint-color, #707579); --line: rgba(112, 117, 121, 0.35); --accent: var(--tg-theme-button-color, #2688d4); --soft: var(--tg-theme-secondary-bg-color, #f1f1f4); }
+  html, body { min-height: 100%; }
+  body { display: flex; flex-direction: column; min-height: 100vh; background: var(--bg); }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* закреплённая шапка со сводкой */
+  .top { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); padding: 10px 16px 8px; padding-top: calc(10px + env(safe-area-inset-top, 0px)); }
+  .top-inner, .main-inner, .bar-inner { max-width: 800px; margin: 0 auto; }
+  .top-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .top h1 { font-size: 18px; margin: 0; line-height: 1.3; }
+  .saved { font-size: 13px; color: #198754; opacity: 0; transition: opacity .25s; }
+  .saved.show { opacity: 1; }
+  .dark .saved { color: #75b798; }
+  .stats { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+  .stat { font-size: 13px; background: var(--soft); border-radius: 12px; padding: 2px 10px; white-space: nowrap; }
+  .stat b { font-variant-numeric: tabular-nums; }
+  .when { font-size: 13px; color: var(--muted); }
+
+  main { flex: 1; padding: 12px 16px 16px; }
+  .banner { margin: 0 0 12px; }
+  .sec-title { font-size: 15px; font-weight: 700; margin: 18px 0 8px; display: flex; align-items: baseline; gap: 8px; }
+  .sec-title:first-child { margin-top: 4px; }
+  .sec-hint { font-size: 13px; color: var(--muted); margin: -4px 0 8px; }
+  .empty { color: var(--muted); font-size: 14px; border: 1px dashed var(--line); border-radius: 8px; padding: 14px 12px; }
+  details.rest > summary { font-size: 15px; font-weight: 700; cursor: pointer; padding: 12px 0; list-style: none; min-height: 44px; }
+  details.rest > summary::-webkit-details-marker { display: none; }
+  details.rest > summary::before { content: "▸ "; }
+  details.rest[open] > summary::before { content: "▾ "; }
+
+  /* карточка документа */
+  .card { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 10px; display: grid; grid-template-columns: 1fr auto; align-items: start; }
+  .card-head { background: none; border: 0; text-align: left; padding: 10px 4px 10px 12px; cursor: pointer; min-width: 0; border-radius: 8px; }
+  .card-title { display: block; font-weight: 600; font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+  .card:not(.open) .card-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .card-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .card-preview { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: 13px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+  .card.open .card-preview { display: none; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; border: 1px solid transparent; white-space: nowrap; }
+  .r3 { color: #842029; background: #f8d7da; border-color: #f5c2c7; }
+  .r2 { color: #664d03; background: #fff3cd; border-color: #ffecb5; }
+  .r1 { color: #0a3d62; background: #dbeafe; border-color: #bfdbfe; }
+  .r0 { color: #555; background: #eee; border-color: #ddd; }
+  .rn { color: var(--muted); border: 1px dashed var(--line); }
+  .dark .r3 { color: #ea868f; background: #2c0b0e; border-color: #842029; }
+  .dark .r2 { color: #ffda6a; background: #332701; border-color: #997404; }
+  .dark .r1 { color: #9ec5fe; background: #031633; border-color: #084298; }
+  .dark .r0 { color: #adb5bd; background: #2b2f32; border-color: #495057; }
+  .tag-new { color: #fff; background: #0d6efd; border-radius: 10px; padding: 1px 7px; font-weight: 700; font-size: 11px; }
+  .tag-off { color: #842029; }
+  .dark .tag-off { color: #ea868f; }
+
+  .switch-cell { display: flex; flex-direction: column; align-items: center; padding: 2px 6px 0 0; max-width: 84px; }
+  .switch { width: 56px; height: 48px; padding: 0; background: none; border: 0; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  .switch:disabled { cursor: default; opacity: .45; }
+  .track { width: 46px; height: 28px; border-radius: 14px; background: rgba(112, 117, 121, 0.45); position: relative; transition: background .15s; }
+  .knob { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .35); transition: transform .15s; }
+  .switch.on .track { background: var(--accent); }
+  .switch.on .knob { transform: translateX(18px); }
+  .switch-note { font-size: 11px; line-height: 1.2; color: var(--muted); text-align: center; margin: -4px 0 6px; }
+  @media (prefers-reduced-motion: reduce) { .track, .knob, .saved { transition: none; } }
+
+  .card-body { grid-column: 1 / -1; padding: 0 12px 12px; border-top: 1px solid var(--line); }
+  .card-body .sum { margin-top: 10px; }
+  .sum-text { white-space: pre-wrap; }
+  .meta-links { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; font-size: 14px; }
+  .meta-links a { color: var(--tg-theme-link-color, #2688d4); text-decoration: none; }
+  .link-btn { background: none; border: 0; padding: 6px 0 0; color: var(--tg-theme-link-color, #2688d4); font-size: 14px; cursor: pointer; min-height: 32px; }
+  .ghost-btn { background: transparent; color: var(--accent); border: 1px solid var(--sum-border); border-radius: 8px; padding: 8px 14px; font-size: 14px; line-height: 20px; cursor: pointer; }
+  .ghost-btn:disabled { opacity: .55; cursor: default; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .sum-edit { width: 100%; min-height: 120px; resize: vertical; border: 1px solid var(--sum-border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 14px; line-height: 1.5; background: var(--bg); color: inherit; margin-top: 4px; }
+  .edit-meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+  .counter.over { color: #dc3545; font-weight: 700; }
+  .dirty-mark { color: #b35c00; }
+  .dark .dirty-mark { color: #ffc107; }
+
+  /* закреплённая нижняя панель */
+  .bar { position: sticky; bottom: 0; z-index: 5; background: var(--bg); border-top: 1px solid var(--line); padding: 10px 16px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
+  .bar-inner { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .bar-line { font-size: 14px; font-weight: 600; }
+  .bar .sum-btn { min-height: 44px; }
+  .sum-btn:disabled { opacity: .55; }
+  .sum-btn.busy:disabled { opacity: 1; }
+
+  .sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 8; background: var(--bg); border-top: 1px solid var(--line); box-shadow: 0 -4px 16px rgba(0, 0, 0, .2); padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); }
+  .sheet[hidden] { display: none; }
+  .sheet textarea { width: 100%; height: 40vh; font: inherit; font-size: 13px; background: var(--bg); color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  .center-msg { text-align: center; padding: 40px 8px; }
+  .toast { z-index: 20; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-inner">
+    <div class="top-row">
+      <h1>Подборка недели</h1>
+      <span id="saved" class="saved" role="status" aria-live="polite"></span>
+    </div>
+    <div id="stats" class="stats"></div>
+    <div id="when" class="when"></div>
+  </div>
+</header>
+<main>
+  <div id="main" class="main-inner" aria-busy="true"><div class="center-msg loading">Загрузка…</div></div>
+</main>
+<footer class="bar">
+  <div class="bar-inner">
+    <div id="barline" class="bar-line">&nbsp;</div>
+    <button id="copy" type="button" class="sum-btn" disabled>Скопировать Markdown</button>
+  </div>
+</footer>
+<div id="sheet" class="sheet" hidden role="dialog" aria-label="Текст для ручного копирования">
+  <p class="sum-status" style="margin-top:0">Не удалось скопировать автоматически. Текст выделен — скопируйте его вручную.</p>
+  <textarea id="sheet-text" readonly></textarea>
+  <div class="btn-row" style="margin-top:8px"><button id="sheet-close" type="button" class="ghost-btn">Закрыть</button></div>
+</div>
+<div id="toast" class="error toast" role="alert" aria-live="assertive"></div>
+<script>
+(function() {
+  'use strict';
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  function applyColorScheme() {
+    document.documentElement.classList.toggle('dark', !!tg && tg.colorScheme === 'dark');
+  }
+  applyColorScheme();
+  if (tg && tg.onEvent) tg.onEvent('themeChanged', applyColorScheme);
+
+  const MAX_LEN = 600;
+  const COOLDOWN_MS = 60000;
+  const REFRESH_MS = 60000;
+  const RATING = { 3: ['3 · критично', 'r3'], 2: ['2 · важно', 'r2'], 1: ['1 · нейтрально', 'r1'], 0: ['0 · не важно', 'r0'] };
+
+  let state = null;          // последний ответ /admin/api/state
+  let view = 'loading';      // loading | ready | error | expired | forbidden
+  let errorMessage = '';
+  let deadline = 0;          // момент отправки по часам клиента
+  let restOpen = false;
+  let knownIds = null;
+  let wantFocus = null;      // элемент, на который вернуть фокус после действия пользователя
+  const open = new Set();        // раскрытые карточки
+  const drafts = new Map();      // external_id -> текст в редакторе саммари
+  const pending = new Map();     // external_id -> желаемое положение переключателя (идёт сохранение)
+  const busy = new Set();        // 'gen:<id>' | 'save:<id>'
+  const cooldown = new Map();    // external_id -> конец кулдауна «Сделать через GigaChat»
+  const newIds = new Set();      // документы, появившиеся после первой загрузки
+
+  const $ = function(id) { return document.getElementById(id); };
+  function h(tag, props) {
+    const el = document.createElement(tag);
+    for (const k in (props || {})) {
+      const v = props[k];
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k.indexOf('on') === 0) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? '' : v);
+    }
+    for (let i = 2; i < arguments.length; i++) {
+      [].concat(arguments[i]).forEach(function(kid) {
+        if (kid == null || kid === false) return;
+        el.append(kid.nodeType ? kid : document.createTextNode(kid));
+      });
+    }
+    return el;
+  }
+  function plural(n, a, b, c) {
+    const m = n % 100, d = n % 10;
+    return (m > 10 && m < 20) ? c : d === 1 ? a : (d >= 2 && d <= 4) ? b : c;
+  }
+  function timeLeft(ms) {
+    const m = Math.floor(ms / 60000);
+    if (m <= 0) return 'менее минуты';
+    const d = Math.floor(m / 1440), hh = Math.floor((m % 1440) / 60), mm = m % 60;
+    return [d && d + ' д', hh && hh + ' ч', (mm && !d) && mm + ' мин'].filter(Boolean).join(' ');
+  }
+
+  // ---- сеть ----
+  async function api(path, body) {
+    const headers = {};
+    if (tg && tg.initData) headers['X-Telegram-Init-Data'] = tg.initData;
+    const opts = { method: body ? 'POST' : 'GET', headers: headers };
+    if (body) {
+      headers['Content-Type'] = 'application/json';
+      headers['X-Admin-Panel'] = '1';
+      opts.body = JSON.stringify(body);
+    }
+    let r;
+    try { r = await fetch(path, opts); }
+    catch (e) { throw { kind: 'network', message: 'Нет связи с сервером. Проверьте интернет и повторите.' }; }
+    let data = null;
+    try { data = await r.json(); } catch (e) { /* тело не JSON */ }
+    if (!r.ok) {
+      const kind = r.status === 401 ? 'expired' : r.status === 403 ? 'forbidden' : r.status === 409 ? 'conflict' : 'http';
+      throw { kind: kind, status: r.status, message: (data && data.message) || ('Ошибка ' + r.status) };
+    }
+    return data;
+  }
+
+  // ---- уведомления ----
+  const toastEl = $('toast');
+  let toastTimer = null, toastTick = null;
+  function hideToast() { toastEl.classList.remove('show'); clearTimeout(toastTimer); clearInterval(toastTick); }
+  toastEl.addEventListener('click', hideToast);
+  function showToast(message, until) {
+    if (!message) return;
+    clearTimeout(toastTimer); clearInterval(toastTick);
+    toastEl.innerHTML = '<div class="toast-text"></div><div class="toast-count"></div>';
+    toastEl.querySelector('.toast-text').textContent = message;
+    const count = toastEl.querySelector('.toast-count');
+    function tick() {
+      const left = Math.ceil(((until || 0) - Date.now()) / 1000);
+      count.textContent = !until ? '' : left > 0 ? 'Повторить можно через ' + left + ' сек.' : 'Можно повторить.';
+      count.style.display = count.textContent ? '' : 'none';
+      if (left <= 0) clearInterval(toastTick);
+    }
+    tick();
+    if (until) toastTick = setInterval(tick, 1000);
+    toastEl.classList.add('show');
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('error');
+    toastTimer = setTimeout(hideToast, 6000);
+  }
+  let savedTimer = null;
+  function showSaved(text) {
+    const el = $('saved');
+    el.textContent = text || 'Сохранено ✓';
+    el.classList.add('show');
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(function() { el.classList.remove('show'); }, 2200);
+  }
+
+  // ---- состояние ----
+  function applyState(s) {
+    const ids = [].concat(s.sections.included, s.sections.unrated, s.sections.rest).map(function(c) { return c.external_id; });
+    if (knownIds) ids.forEach(function(id) { if (!knownIds.has(id)) newIds.add(id); });
+    knownIds = new Set(ids);
+    drafts.forEach(function(_, id) { if (!knownIds.has(id)) drafts.delete(id); });
+    state = s;
+    deadline = Date.now() + s.seconds_left * 1000;
+  }
+  function dirty() {
+    if (!state) return false;
+    const all = [].concat(state.sections.included, state.sections.unrated, state.sections.rest);
+    return all.some(function(c) { return drafts.has(c.external_id) && drafts.get(c.external_id) !== (c.summary || ''); });
+  }
+  function handleError(e) {
+    if (e.kind === 'expired') { view = 'expired'; render(); return; }
+    if (e.kind === 'forbidden') { view = 'forbidden'; render(); return; }
+    if (e.kind === 'conflict') { showToast(e.message); load(true); return; }
+    showToast(e.message);
+  }
+  async function load(silent) {
+    try {
+      applyState(await api('/admin/api/state'));
+      view = 'ready';
+    } catch (e) {
+      if (e.kind === 'expired' || e.kind === 'forbidden') { handleError(e); return; }
+      if (!state) { view = 'error'; errorMessage = e.message; }
+      else if (!silent) showToast(e.message);
+    }
+    render();
+  }
+
+  // ---- действия ----
+  async function setInclude(card, value) {
+    const id = card.external_id;
+    if (pending.has(id)) return;
+    pending.set(id, value);
+    render();
+    try {
+      const res = await api('/admin/api/toggle', { external_id: id, include: value });
+      applyState(res.state);
+      showSaved();
+    } catch (e) {
+      handleError(e);
+    }
+    pending.delete(id);
+    render();
+  }
+  async function saveSummary(card) {
+    const id = card.external_id;
+    busy.add('save:' + id);
+    render();
+    try {
+      const res = await api('/admin/api/summary', { external_id: id, action: 'save', text: drafts.get(id) });
+      applyState(res.state);
+      drafts.delete(id);
+      showSaved();
+    } catch (e) {
+      handleError(e);
+    }
+    busy.delete('save:' + id);
+    render();
+  }
+  async function generateSummary(card) {
+    const id = card.external_id;
+    const left = (cooldown.get(id) || 0) - Date.now();
+    if (left > 0) { showToast('Попробуйте позже.', cooldown.get(id)); return; }
+    busy.add('gen:' + id);
+    render();
+    try {
+      const res = await api('/admin/api/summary', { external_id: id, action: 'generate' });
+      applyState(res.state);
+      if (res.status === 'ok') showSaved('Саммари готово ✓');
+      else {
+        if (res.retry_after) cooldown.set(id, Date.now() + res.retry_after * 1000);
+        showToast(res.message || 'Не удалось сделать саммари.', cooldown.get(id));
+      }
+    } catch (e) {
+      if (e.kind === 'network') cooldown.set(id, Date.now() + COOLDOWN_MS);
+      handleError(e);
+    }
+    busy.delete('gen:' + id);
+    render();
+  }
+  function toggleOpen(card) {
+    const id = card.external_id;
+    if (open.has(id)) {
+      if (drafts.has(id) && drafts.get(id) !== (card.summary || '')) {
+        showToast('Есть несохранённый текст саммари — сохраните или отмените правку.');
+        return;
+      }
+      open.delete(id);
+      drafts.delete(id);
+    } else {
+      open.add(id);
+      newIds.delete(id);
+    }
+    render();
+  }
+
+  // ---- отрисовка ----
+  function chip(card) {
+    const r = RATING[card.importance];
+    return h('span', { class: 'chip ' + (r ? r[1] : 'rn'), text: r ? r[0] : 'не оценён' });
+  }
+  function summaryBlock(card) {
+    const id = card.external_id;
+    const readonly = state.sending;
+    if (drafts.has(id)) return editor(card);
+    if (card.summary) {
+      return h('div', { class: 'sum' },
+        h('div', { class: 'sum-label', text: 'Саммари' }),
+        h('div', { class: 'sum-text', text: card.summary }),
+        !readonly && h('button', { type: 'button', class: 'link-btn', 'data-key': 'edit:' + id, onclick: function() { drafts.set(id, card.summary); wantFocus = 'ta:' + id; render(); } }, 'Изменить'));
+    }
+    const generating = busy.has('gen:' + id);
+    const cooling = (cooldown.get(id) || 0) > Date.now();
+    return h('div', { class: 'sum-action' },
+      h('div', { class: 'btn-row' },
+        h('button', { type: 'button', class: 'sum-btn' + (generating ? ' busy' : '') + (cooling && !generating ? ' cooling' : ''), 'data-key': 'gen:' + id,
+          disabled: generating || readonly, 'aria-busy': generating ? 'true' : 'false', onclick: function() { generateSummary(card); } },
+          generating ? [h('span', { class: 'spin' }), 'Саммари в процессе создания…'] : 'Сделать через GigaChat'),
+        h('button', { type: 'button', class: 'ghost-btn', disabled: generating || readonly, 'data-key': 'manual:' + id, onclick: function() { drafts.set(id, ''); wantFocus = 'ta:' + id; render(); } }, 'Написать вручную')),
+      h('div', { class: 'sum-status', text: 'Без саммари закон нельзя включить в подборку.' }));
+  }
+  function editor(card) {
+    const id = card.external_id;
+    const original = card.summary || '';
+    const saving = busy.has('save:' + id);
+    const counter = h('span', { class: 'counter' });
+    const mark = h('span', { class: 'dirty-mark' });
+    const save = h('button', { type: 'button', class: 'sum-btn', 'data-key': 'save:' + id, onclick: function() { saveSummary(card); } }, saving ? [h('span', { class: 'spin' }), 'Сохраняю…'] : 'Сохранить');
+    const ta = h('textarea', { class: 'sum-edit', 'data-key': 'ta:' + id, 'aria-label': 'Саммари: ' + card.short_title, disabled: saving });
+    ta.value = drafts.get(id);
+    function refresh() {
+      const text = ta.value;
+      const len = text.trim().length;
+      counter.textContent = len + '/' + MAX_LEN;
+      counter.className = 'counter' + (len > MAX_LEN ? ' over' : '');
+      mark.textContent = original && text !== original ? 'изменено' : '';
+      save.disabled = saving || len === 0 || len > MAX_LEN || text === original;
+    }
+    ta.addEventListener('input', function() { drafts.set(id, ta.value); refresh(); });
+    refresh();
+    return h('div', { class: 'sum' },
+      h('div', { class: 'sum-label', text: 'Саммари — редактирование' }),
+      ta,
+      h('div', { class: 'edit-meta' }, mark, counter),
+      h('div', { class: 'btn-row' }, save,
+        h('button', { type: 'button', class: 'ghost-btn', disabled: saving, 'data-key': 'cancel:' + id, onclick: function() { drafts.delete(id); render(); } }, 'Отмена')));
+  }
+  function cardEl(card, section) {
+    const id = card.external_id;
+    const isOpen = open.has(id);
+    const on = pending.has(id) ? pending.get(id) : section === 'included';
+    const noSummary = !card.summary;
+    const switchBtn = h('button', {
+      type: 'button', role: 'switch', class: 'switch' + (on ? ' on' : ''), 'aria-checked': String(on),
+      'aria-label': 'В подборку: ' + card.short_title, 'data-key': 'sw:' + id,
+      disabled: noSummary || state.sending, 'aria-busy': pending.has(id) ? 'true' : null,
+      onclick: function() { setInclude(card, !on); }
+    }, h('span', { class: 'track' }, h('span', { class: 'knob' })));
+    const meta = h('div', { class: 'card-meta' },
+      chip(card),
+      newIds.has(id) && h('span', { class: 'tag-new', text: 'новое' }),
+      card.override === 'exclude' && h('span', { class: 'tag-off', text: 'исключён вами' }),
+      card.override === 'include' && section !== 'included' && h('span', { text: 'включён вами' }));
+    const head = h('button', { type: 'button', class: 'card-head', 'aria-expanded': String(isOpen), 'data-key': 'head:' + id, onclick: function() { toggleOpen(card); } },
+      h('span', { class: 'card-title', text: card.short_title }), meta,
+      !isOpen && card.summary && h('span', { class: 'card-preview', text: card.summary }));
+    const root = h('article', { class: 'card' + (isOpen ? ' open' : '') },
+      head,
+      h('div', { class: 'switch-cell' }, switchBtn, noSummary && h('div', { class: 'switch-note', text: 'нужно саммари' })));
+    if (isOpen) {
+      root.append(h('div', { class: 'card-body' },
+        h('div', { class: 'doc-title', text: card.title, style: 'margin-top:10px' }),
+        summaryBlock(card),
+        h('div', { class: 'meta-links' },
+          /^https?:\/\//.test(card.url) && h('a', { href: card.url, target: '_blank', rel: 'noopener', text: 'Читать на портале' }),
+          h('a', { href: '/app?external_id=' + encodeURIComponent(id), target: '_blank', rel: 'noopener', text: 'Полный текст' }))));
+    }
+    return root;
+  }
+  function section(key, title, cards, hint, emptyText) {
+    const titleId = 'sec-' + key;
+    return h('section', { 'aria-labelledby': titleId },
+      h('h2', { class: 'sec-title', id: titleId }, title, h('span', { class: 'sec-count', text: '· ' + cards.length })),
+      hint && h('p', { class: 'sec-hint', text: hint }),
+      cards.length ? cards.map(function(c) { return cardEl(c, key); }) : (emptyText ? h('div', { class: 'empty', text: emptyText }) : null));
+  }
+  function renderStats() {
+    const st = $('stats');
+    st.textContent = '';
+    if (!state) return;
+    const c = state.counts;
+    [['В подборке', c.included], ['Без саммари', c.no_summary], ['Не оценено', c.unrated]].forEach(function(p) {
+      st.append(h('span', { class: 'stat' }, p[0] + ' ', h('b', { text: p[1] })));
+    });
+  }
+  function updateClock() {
+    if (!state) return;
+    const left = deadline - Date.now();
+    let when;
+    if (state.sending) when = 'Идёт отправка подборки';
+    else if (left <= 0) when = 'Отправка задерживается — подборка уйдёт сама';
+    else when = 'Отправка ' + state.deadline_label + ' · через ' + timeLeft(left);
+    $('when').textContent = when;
+    const n = state.counts.included;
+    $('barline').textContent = state.sending ? 'Идёт отправка · ' + n + ' ' + plural(n, 'закон', 'закона', 'законов')
+      : 'Уйдёт ' + n + ' ' + plural(n, 'закон', 'закона', 'законов') + ' · ' + state.deadline_label + (left > 0 ? ' (через ' + timeLeft(left) + ')' : '');
+  }
+  function render() {
+    const main = $('main');
+    // фокус возвращаем только тому, кто им владел до перерисовки (или после явного действия): автообновление
+    // не должно «хватать» фокус и открывать клавиатуру
+    const active = document.activeElement;
+    const focusKey = (active && active.getAttribute && active.getAttribute('data-key')) || wantFocus;
+    wantFocus = null;
+    const selection = active && active.tagName === 'TEXTAREA' ? [active.selectionStart, active.selectionEnd] : null;
+    const scrollY = window.scrollY;
+    main.setAttribute('aria-busy', view === 'loading' ? 'true' : 'false');
+    main.textContent = '';
+    renderStats();
+    $('copy').disabled = !state || state.counts.included === 0;
+    if (view === 'loading') {
+      main.append(h('div', { class: 'center-msg loading', text: 'Загрузка…' }));
+    } else if (view === 'expired') {
+      main.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Сессия закончилась. Отправьте боту команду /admin и откройте новую ссылку (в Telegram — нажмите кнопку «Открыть панель» в напоминании).' })));
+    } else if (view === 'forbidden') {
+      main.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Доступ только для администраторов.' })));
+    } else if (view === 'error') {
+      main.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: errorMessage || 'Не удалось загрузить подборку.' }),
+        h('button', { type: 'button', class: 'sum-btn', onclick: function() { view = 'loading'; render(); load(); } }, 'Повторить')));
+    } else {
+      const s = state.sections;
+      if (state.sending) main.append(h('div', { class: 'unavailable banner', text: 'Идёт отправка подборки — правки закрыты. Когда она закончится, панель покажет следующую.' }));
+      const total = s.included.length + s.unrated.length + s.rest.length;
+      if (!total) {
+        main.append(h('div', { class: 'empty', text: 'В окне пока нет законов. Когда бот примет новые акты, они появятся здесь.' }));
+      } else {
+        main.append(section('included', 'В подборке', s.included, null, 'Пока ни один закон не попал в подборку. Включите нужные переключателем.'));
+        if (s.unrated.length) main.append(section('unrated', 'Ещё не оценены', s.unrated, 'Модель оценит их перед отправкой. Можно не ждать и решить самому: включить или исключить.'));
+        if (s.rest.length) {
+          const det = h('details', { class: 'rest' }, h('summary', {}, 'Не вошли ', h('span', { class: 'sec-count', text: '· ' + s.rest.length })),
+            s.rest.map(function(c) { return cardEl(c, 'rest'); }));
+          if (restOpen) det.setAttribute('open', '');
+          det.addEventListener('toggle', function() { restOpen = det.open; });
+          main.append(det);
+        }
+      }
+    }
+    updateClock();
+    window.scrollTo(0, scrollY);
+    if (focusKey && (!document.activeElement || document.activeElement === document.body)) {
+      const el = document.querySelector('[data-key="' + focusKey + '"]');
+      if (el && !el.disabled) {
+        el.focus({ preventScroll: true });
+        if (selection && el.tagName === 'TEXTAREA') el.setSelectionRange(selection[0], selection[1]);
+      }
+    }
+  }
+
+  // ---- экспорт ----
+  function copyViaTextarea(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+  async function copyMarkdown() {
+    const btn = $('copy');
+    btn.disabled = true;
+    try {
+      const res = await api('/admin/api/export');
+      let ok = false;
+      try { await navigator.clipboard.writeText(res.markdown); ok = true; } catch (e) { ok = copyViaTextarea(res.markdown); }
+      if (ok) {
+        showSaved('Скопировано: ' + res.count + ' ' + plural(res.count, 'закон', 'закона', 'законов') + ' ✓');
+      } else {
+        $('sheet-text').value = res.markdown;
+        $('sheet').hidden = false;
+        $('sheet-text').focus();
+        $('sheet-text').select();
+      }
+    } catch (e) {
+      handleError(e);
+    }
+    btn.disabled = !state || state.counts.included === 0;
+  }
+  $('copy').addEventListener('click', copyMarkdown);
+  $('sheet-close').addEventListener('click', function() { $('sheet').hidden = true; });
+
+  // ---- жизненный цикл ----
+  window.addEventListener('beforeunload', function(e) {
+    if (dirty()) { e.preventDefault(); e.returnValue = ''; }
+  });
+  document.addEventListener('visibilitychange', function() { if (!document.hidden) refreshIfIdle(); });
+  function refreshIfIdle() {
+    if (view === 'expired' || view === 'forbidden' || pending.size || busy.size) return;
+    load(true);
+  }
+  setInterval(function() { if (!document.hidden) refreshIfIdle(); }, REFRESH_MS);
+  setInterval(updateClock, 15000);
+  load();
+})();
+</script>
+</body>
+</html>
