@@ -79,6 +79,11 @@ LEVEL_MAP: dict[str, str] = {
 IMPORTANT_LEVELS: frozenset[str] = frozenset({"CONSTITUTION", "FKZ", "FZ"})
 
 
+# Начала заголовков федеральных указов и постановлений (в нижнем регистре)
+_DECREE_PREFIX = "указ президента российской федерации"
+_GOV_RESOLUTION_PREFIX = "постановление правительства российской федерации"
+
+
 def classify_level(document_type_id: str | None) -> str:
     """Определяет уровень силы по documentTypeId, fallback UNKNOWN."""
     if not document_type_id:
@@ -94,18 +99,20 @@ def classify_level_for_title(title: str | None, document_type_id: str | None = N
         return lvl
     if not title:
         return "UNKNOWN"
-    low = title.lower()
+    low = title.lower().strip()
+    # Указы и постановления определяются строго по началу заголовка: подстрока даёт
+    # ложные срабатывания («Указ Главы Республики … в Указ Президента Республики …»,
+    # федеральные постановления со словом «области» в названии).
+    if low.startswith(_DECREE_PREFIX):
+        return "DECREE"
+    if low.startswith(_GOV_RESOLUTION_PREFIX):
+        return "GOV_RESOLUTION"
+    if low.startswith(("указ ", "постановление правительства ")):
+        return "REGIONAL"  # указы и постановления не федеральных органов
     if "конституц" in low:
         return "CONSTITUTION"
-    if "федеральный закон" in low or low.strip().startswith("фз ") or " фз " in f" {low} ":
+    if "федеральный закон" in low or low.startswith("фз ") or " фз " in f" {low} ":
         return "FZ"
-    if "указ президента" in low:
-        return "DECREE"
-    if "постановление правительства" in low:
-        # региональное если есть маркер региона в заголовке
-        if any(x in low for x in ["республики", "края", "области", "луганск", "ингушет", "забайкал", "чуваш"]):
-            return "REGIONAL"
-        return "GOV_RESOLUTION"
     if "приказ" in low:
         if any(x in low for x in ["республики", "края", "области"]):
             return "REGIONAL"

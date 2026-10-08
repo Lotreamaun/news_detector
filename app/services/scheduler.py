@@ -19,8 +19,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta, timezone
+from typing import Callable
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -28,8 +31,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
-from app.models import Article, User, UserFilter
+from app.models import Article, User, UserFilter, WeeklyDigestRun
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
+from app.services.importance import (
+    CANDIDATE_LEVELS,
+    build_body,
+    prefilter_zero,
+    score_importance,
+)
 from app.services.rss_parser import (
     IMPORTANT_LEVELS,
     RssError,
@@ -43,6 +52,14 @@ from app.services.rss_parser import (
     ocr_document_text,
 )
 from app.services.summarizer import Summarizer, SummarizerConfig
+from app.services.weekly_window import (
+    DAY_END,
+    SUNDAY_LAST_HOUR_START,
+    in_daytime,
+    last_digest_moment,
+    previous_digest_moment,
+    sunday_at,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +77,26 @@ DIGEST_ID_CAP = 30
 # Порядок значимости уровней внутри дайджеста (не входящих в IMPORTANT_LEVELS),
 # от более значимого к менее — используется только для сортировки тизера/кнопки
 _REST_LEVEL_ORDER = ("DECREE", "GOV_RESOLUTION", "DEPARTMENTAL", "REGIONAL")
+
+# -- Оценка важности и недельная подборка -------------------------------------
+
+# Добор неоценённых кандидатов: не старше стольких дней с приёма и не более N за цикл
+IMPORTANCE_BACKLOG_DAYS = 14
+IMPORTANCE_BACKLOG_LIMIT = 20
+# Публикация старше стольких дней — явная история (бэкфилл), в добор не берём:
+# покрывает текущее окно подборки и предыдущее, если его отправка отложена
+IMPORTANCE_BACKLOG_PUBLISHED_DAYS = 21
+# Нет текста дольше стольких часов после приёма — один OCR до оценки
+OCR_AFTER_HOURS = 24
+
+# Недельная подборка: в неё входят акты с оценкой не ниже этой
+WEEKLY_MIN_IMPORTANCE = 2
+# Время рассылки для предпросмотра, пока WEEKLY_DIGEST_TIME не задан
+WEEKLY_DEFAULT_TIME = time(18, 0)
+# Допуск по дате публикации относительно начала окна (акты, опубликованные накануне
+# окна, но принятые ботом уже в нём — простой бота, задержка портала)
+WEEKLY_PUBLISHED_TOLERANCE_DAYS = 7
+WEEKLY_HEADER_TEMPLATE = "📌 Еженедельная подборка: главные законы — {count}"
 
 
 async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -85,26 +122,46 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("В API %d документов, из них новых: %d", len(entries), len(new_entries))
 
     if new_entries:
-        async with Summarizer(
-            SummarizerConfig(
-                auth_key=config.GIGACHAT_AUTH_KEY,
-                model=config.GIGACHAT_MODEL,
-                min_len=config.SUMMARY_MIN_LEN,
-                max_len=config.SUMMARY_MAX_LEN,
-                verify_ssl=config.GIGACHAT_VERIFY_SSL,
-            )
-        ) as summarizer:
+        async with _llm_tools(config) as (summarizer, llm_client):
             for entry in new_entries:
-                await _process_entry(context, session_maker, summarizer, entry)
+                await _process_entry(context, session_maker, summarizer, llm_client, entry)
 
     # Рассылаем ВСЕ ещё не разосланные статьи, а не только сохранённые в этом
     # цикле — так подхватываются и «зависшие» после падения процесса между
     # сохранением и рассылкой (см. Article.notified).
     pending = await _fetch_pending_articles(session_maker)
-    if not pending:
-        return
-    await _notify_users_batch(context, session_maker, pending)
-    await _mark_notified(session_maker, [a.id for a in pending])
+    if pending:
+        await _notify_users_batch(context, session_maker, pending)
+        await _mark_notified(session_maker, [a.id for a in pending])
+
+    # Сбой добора или недельной подборки не должен ломать основной цикл. Добор — после
+    # мгновенных уведомлений, чтобы оценка накопившихся актов не задерживала новые.
+    try:
+        await _rate_backlog(context)
+    except Exception:
+        logger.exception("Ошибка добора неоценённых актов")
+    await _maybe_send_weekly_digest(context)
+
+
+@asynccontextmanager
+async def _llm_tools(config):
+    """Открывает на время работы саммаризатор и клиент GigaChat (оценка, OCR); закрывает на выходе."""
+    async with Summarizer(
+        SummarizerConfig(
+            auth_key=config.GIGACHAT_AUTH_KEY,
+            model=config.GIGACHAT_MODEL,
+            min_len=config.SUMMARY_MIN_LEN,
+            max_len=config.SUMMARY_MAX_LEN,
+            verify_ssl=config.GIGACHAT_VERIFY_SSL,
+        )
+    ) as summarizer, GigaChatClient(
+        GigaChatConfig(
+            auth_key=config.GIGACHAT_AUTH_KEY,
+            model=config.GIGACHAT_MODEL,
+            verify_ssl=config.GIGACHAT_VERIFY_SSL,
+        )
+    ) as llm_client:
+        yield summarizer, llm_client
 
 
 async def _run_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,13 +238,17 @@ async def _mark_notified(session_maker, article_ids: list[int]) -> None:
         await session.commit()
 
 
-async def _process_entry(context, session_maker, summarizer: Summarizer, entry) -> Article | None:
-    """Обрабатывает один новый документ: текст -> саммари -> БД. Рассылка — отдельным проходом."""
+async def _process_entry(
+    context, session_maker, summarizer: Summarizer, llm_client: GigaChatClient, entry
+) -> Article | None:
+    """Обрабатывает один новый документ: текст -> саммари -> БД -> оценка важности.
+
+    Рассылка — отдельным проходом. Оценка важности (кандидатам) идёт после сохранения в
+    собственном ``try/except``: её сбой не мешает сохранению и рассылке.
+    """
     logger.info("Обработка нового документа %s: %s", entry.external_id, entry.title)
 
     try:
-        config = context.bot_data["config"]
-
         text = await get_legal_text(entry.external_id)
         if text:
             logger.info("Текст %s получен с actual.pravo.gov.ru", entry.external_id)
@@ -196,13 +257,7 @@ async def _process_entry(context, session_maker, summarizer: Summarizer, entry) 
                 "Текст %s не готов, документ «важный» — пробуем OCR через GigaChat",
                 entry.external_id,
             )
-            async with GigaChatClient(
-                GigaChatConfig(
-                    auth_key=config.GIGACHAT_AUTH_KEY,
-                    verify_ssl=config.GIGACHAT_VERIFY_SSL,
-                )
-            ) as ocr_client:
-                text = await ocr_document_text(entry.external_id, client=ocr_client)
+            text = await ocr_document_text(entry.external_id, client=llm_client)
             if text:
                 logger.info("OCR GigaChat вернул текст для %s", entry.external_id)
             else:
@@ -215,10 +270,21 @@ async def _process_entry(context, session_maker, summarizer: Summarizer, entry) 
             except GigaChatError as exc:
                 logger.warning("Не удалось сделать саммари для %s: %s", entry.external_id, exc)
 
-        return await _save_article(session_maker, entry, text, summary)
+        article = await _save_article(session_maker, entry, text, summary)
     except Exception:
         logger.exception("Ошибка обработки документа %s", entry.external_id)
         return None
+
+    if article is not None and article.level in CANDIDATE_LEVELS:
+        try:
+            # текст только что запрашивали; если он был, саммари уже пробовали сделать
+            await _rate_article(
+                context, session_maker, summarizer, llm_client, article,
+                retry_text=False, summary_tried=bool(text),
+            )
+        except Exception:
+            logger.exception("Ошибка оценки важности документа %s", entry.external_id)
+    return article
 
 
 async def _save_article(
@@ -255,6 +321,398 @@ async def _save_article(
         "с саммари" if summary else "без саммари",
     )
     return article
+
+
+# -- Оценка важности ----------------------------------------------------------
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite отдаёт даты без tzinfo (хранятся в UTC) — приводим к aware UTC."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+async def _update_article(session_maker, article_id: int, **values) -> None:
+    """Обновляет поля статьи по id."""
+    async with session_maker() as session:
+        await session.execute(update(Article).where(Article.id == article_id).values(**values))
+        await session.commit()
+
+
+async def _rate_article(
+    context,
+    session_maker,
+    summarizer: Summarizer,
+    llm_client: GigaChatClient,
+    article: Article,
+    *,
+    final: bool = False,
+    retry_text: bool = True,
+    summary_tried: bool = False,
+) -> int | None:
+    """Ставит акту-кандидату оценку важности (0–3) и сохраняет её; None — оценить не удалось.
+
+    Сначала предфильтр по заголовку (``0`` без LLM). Вход оценки — название + саммари,
+    иначе название + начало текста. Если текста нет, он запрашивается заново
+    (``retry_text``); без текста дольше ``OCR_AFTER_HOURS`` с приёма один раз пробуем OCR.
+    Оценка по одному названию допустима только на финальном проходе (``final``) или после
+    неудачного OCR; иначе оценка откладывается до добора.
+
+    После оценки ``>= 2`` акт без саммари саммаризуется в фоне (попытка 1), если это не
+    делали раньше (``summary_tried``).
+    """
+    if prefilter_zero(article.level, article.title):
+        await _update_article(session_maker, article.id, importance=0)
+        article.importance = 0
+        logger.info("Оценка %s: 0 (предфильтр по заголовку)", article.external_id)
+        return 0
+
+    text = article.original_text
+    title_only_ok = final
+    if not text and not article.summary and retry_text:
+        text = await get_legal_text(article.external_id)
+        if text:
+            await _update_article(session_maker, article.id, original_text=text)
+            article.original_text = text
+        else:
+            ocr_tried: set[str] = context.bot_data.setdefault("ocr_tried", set())
+            created_at = _as_utc(article.created_at) if article.created_at else datetime.now(timezone.utc)
+            if article.external_id in ocr_tried:
+                title_only_ok = True  # OCR уже пробовали в этом процессе и текста нет
+            elif datetime.now(timezone.utc) - created_at >= timedelta(hours=OCR_AFTER_HOURS):
+                ocr_tried.add(article.external_id)
+                logger.info("Текста %s нет больше %d ч — пробуем OCR до оценки", article.external_id, OCR_AFTER_HOURS)
+                text = await ocr_document_text(article.external_id, client=llm_client)
+                if text:
+                    await _update_article(session_maker, article.id, original_text=text)
+                    article.original_text = text
+                else:
+                    title_only_ok = True
+
+    body = build_body(article.summary, text)
+    if body is None and not title_only_ok:
+        logger.debug("Оценка %s отложена: нет ни саммари, ни текста", article.external_id)
+        return None
+
+    score = await score_importance(llm_client, article.title, body)
+    if score is None:
+        return None
+    await _update_article(session_maker, article.id, importance=score)
+    article.importance = score
+    logger.info(
+        "Оценка %s: %d (вход: %s)", article.external_id, score, "название + текст" if body else "название"
+    )
+
+    if score >= WEEKLY_MIN_IMPORTANCE and not article.summary and not summary_tried:
+        await _summarize_in_background(context, session_maker, summarizer, llm_client, article)
+    return score
+
+
+async def _summarize_in_background(
+    context, session_maker, summarizer: Summarizer, llm_client: GigaChatClient, article: Article
+) -> None:
+    """Фоновая саммаризация важного акта: текст (при отсутствии — OCR) -> саммари -> БД.
+
+    Отказ или сбой ничего не пишет в ``Article.summary``: заглушка подставляется только
+    при сборке недельного сообщения, иначе она стала бы «кэшированным саммари» для
+    /summary и кнопок. Расход лимитов пользователей не затрагивается.
+    """
+    text = article.original_text
+    if not text:
+        text = await get_legal_text(article.external_id)
+        if not text:
+            ocr_tried: set[str] = context.bot_data.setdefault("ocr_tried", set())
+            if article.external_id not in ocr_tried:
+                ocr_tried.add(article.external_id)
+                text = await ocr_document_text(article.external_id, client=llm_client)
+        if text:
+            await _update_article(session_maker, article.id, original_text=text)
+            article.original_text = text
+    if not text:
+        logger.info("Фоновое саммари %s: текста нет", article.external_id)
+        return
+    try:
+        summary = await summarizer.summarize(text)
+    except GigaChatError as exc:
+        logger.warning("Фоновое саммари %s не получено: %s", article.external_id, exc)
+        return
+    await _update_article(session_maker, article.id, summary=summary)
+    article.summary = summary
+    logger.info("Фоновое саммари %s сохранено", article.external_id)
+
+
+async def _rate_backlog(context) -> None:
+    """Добор: оценивает кандидатов без оценки, принятых не позже ``IMPORTANCE_BACKLOG_DAYS`` назад.
+
+    Не более ``IMPORTANCE_BACKLOG_LIMIT`` за цикл, старые раньше. Кандидаты без текста и
+    саммари до суток (и до OCR) пропускаются без вызова LLM — оценка дождётся текста.
+    """
+    config = context.bot_data["config"]
+    session_maker = context.bot_data["session_maker"]
+    now = datetime.now(timezone.utc)
+    async with session_maker() as session:
+        articles = list(
+            (
+                await session.scalars(
+                    select(Article)
+                    .where(
+                        Article.importance.is_(None),
+                        Article.level.in_(CANDIDATE_LEVELS),
+                        Article.is_demo.is_(False),
+                        Article.created_at >= now - timedelta(days=IMPORTANCE_BACKLOG_DAYS),
+                        Article.published_at >= now - timedelta(days=IMPORTANCE_BACKLOG_PUBLISHED_DAYS),
+                    )
+                    .order_by(Article.created_at)
+                    .limit(IMPORTANCE_BACKLOG_LIMIT)
+                )
+            ).all()
+        )
+    if not articles:
+        return
+    logger.info("Добор оценок: %d неоценённых кандидатов", len(articles))
+    async with _llm_tools(config) as (summarizer, llm_client):
+        for article in articles:
+            try:
+                await _rate_article(context, session_maker, summarizer, llm_client, article)
+            except Exception:
+                logger.exception("Ошибка добора оценки для %s", article.external_id)
+
+
+# -- Недельная подборка ------------------------------------------------------
+
+async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue-колбэк пятничной задачи: отправляет недельную подборку (если ещё не уходила)."""
+    await _maybe_send_weekly_digest(context)
+
+
+async def _load_weekly_window(session_maker, start: datetime, end: datetime) -> list[Article]:
+    """Кандидаты окна подборки: приняты в ``(start, end]``, не демо, опубликованы не раньше
+    ``start`` минус допуск (отсекает явную историю, например бэкфилл)."""
+    published_from = datetime.combine(
+        start.date() - timedelta(days=WEEKLY_PUBLISHED_TOLERANCE_DAYS), time.min, tzinfo=timezone.utc
+    )
+    async with session_maker() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(Article).where(
+                        Article.level.in_(CANDIDATE_LEVELS),
+                        Article.is_demo.is_(False),
+                        Article.created_at > _as_utc(start),
+                        Article.created_at <= _as_utc(end),
+                        Article.published_at >= published_from,
+                    )
+                )
+            ).all()
+        )
+
+
+def _select_weekly(window: list[Article]) -> list[Article]:
+    """Важные акты окна (оценка не ниже ``WEEKLY_MIN_IMPORTANCE``); сначала важнее, внутри уровня — свежее.
+
+    Наличие саммари здесь не проверяется: в подборку из них входят только акты с саммари
+    (``_split_by_summary``), остальным перед отправкой даётся попытка 2 саммаризации.
+    """
+    chosen = [a for a in window if a.importance is not None and a.importance >= WEEKLY_MIN_IMPORTANCE]
+    chosen.sort(key=lambda a: a.published_at or datetime.min, reverse=True)
+    chosen.sort(key=lambda a: a.importance, reverse=True)  # сортировка устойчива
+    return chosen
+
+
+def _split_by_summary(important: list[Article]) -> tuple[list[Article], list[Article]]:
+    """Делит важные акты на входящие в подборку (с саммари) и исключённые (без саммари), порядок сохраняется."""
+    return [a for a in important if a.summary], [a for a in important if not a.summary]
+
+
+def _select_unrated(window: list[Article]) -> list[Article]:
+    """Кандидаты окна без оценки."""
+    return [a for a in window if a.importance is None]
+
+
+def _build_weekly_message(articles: list[Article], webapp_url: str | None) -> tuple[str, InlineKeyboardMarkup]:
+    """Недельное сообщение: тизер дайджеста с отдельным заголовком и порядком по важности."""
+    order = {a.id: i for i, a in enumerate(articles)}
+    return _build_digest(
+        articles,
+        webapp_url,
+        header=WEEKLY_HEADER_TEMPLATE.format(count=len(articles)),
+        sort_key=lambda a: order[a.id],
+    )
+
+
+async def build_weekly_preview(session_maker, config) -> tuple[str | None, InlineKeyboardMarkup | None, str]:
+    """Предпросмотр для /test_digest weekly: подборка за текущее окно + сводка для администратора.
+
+    Окно — от последнего запланированного момента до «сейчас» (то, что накапливается к
+    следующей рассылке). Ничего не пишет в БД и не запускает оценку/саммаризацию.
+
+    Returns:
+        ``(текст MarkdownV2, клавиатура, сводка)``; текст и клавиатура ``None``, если подборка пуста.
+    """
+    tz = ZoneInfo(config.WEEKLY_DIGEST_TZ)
+    now = datetime.now(timezone.utc)
+    start = last_digest_moment(now, config.WEEKLY_DIGEST_TIME or WEEKLY_DEFAULT_TIME, tz)
+    window = await _load_weekly_window(session_maker, start, now)
+    included, without_summary = _split_by_summary(_select_weekly(window))
+    unrated = _select_unrated(window)
+    zeros = [a for a in window if a.importance == 0]
+    prefiltered = sum(1 for a in zeros if prefilter_zero(a.level, a.title))
+    ones = sum(1 for a in window if a.importance == 1)
+
+    lines = [
+        f"[test_digest weekly] Окно: {start.strftime('%d.%m %H:%M')} — "
+        f"{now.astimezone(tz).strftime('%d.%m %H:%M')} ({config.WEEKLY_DIGEST_TZ})",
+        f"Включено в подборку: {len(included)}",
+    ]
+    lines += [f"  {a.external_id} — оценка {a.importance}" for a in included[:DIGEST_ID_CAP]]
+    lines.append(
+        f"Без саммари (будут исключены, если саммари не появится до отправки): {len(without_summary)}"
+    )
+    lines += [f"  {a.external_id} — оценка {a.importance}" for a in without_summary[:DIGEST_ID_CAP]]
+    lines.append(f"Неоценённые кандидаты: {len(unrated)}")
+    lines += [f"  {a.external_id}" for a in unrated[:DIGEST_ID_CAP]]
+    lines.append(
+        f"Отсеяно предфильтром: {prefiltered}; оценено 0: {len(zeros) - prefiltered}; оценено 1: {ones}"
+    )
+    if not included:
+        return None, None, "\n".join(lines)
+    text, markup = _build_weekly_message(included, config.WEBAPP_URL)
+    return text, markup, "\n".join(lines)
+
+
+async def _weekly_run_finished(session_maker, period_end: datetime) -> bool:
+    """True, если рассылка за период уже завершена."""
+    async with session_maker() as session:
+        finished = await session.scalar(
+            select(WeeklyDigestRun.finished_at).where(WeeklyDigestRun.period_end == _as_utc(period_end))
+        )
+    return finished is not None
+
+
+async def _weekly_run_start(session_maker, period_end: datetime) -> None:
+    """Фиксирует начало рассылки периода (повторный старт после сбоя обновляет ``started_at``)."""
+    async with session_maker() as session:
+        run = await session.scalar(
+            select(WeeklyDigestRun).where(WeeklyDigestRun.period_end == _as_utc(period_end))
+        )
+        if run is None:
+            session.add(WeeklyDigestRun(period_end=_as_utc(period_end), started_at=datetime.now(timezone.utc)))
+        else:
+            run.started_at = datetime.now(timezone.utc)
+        await session.commit()
+
+
+async def _weekly_run_finish(session_maker, period_end: datetime) -> None:
+    """Фиксирует завершение рассылки периода."""
+    async with session_maker() as session:
+        await session.execute(
+            update(WeeklyDigestRun)
+            .where(WeeklyDigestRun.period_end == _as_utc(period_end))
+            .values(finished_at=datetime.now(timezone.utc))
+        )
+        await session.commit()
+
+
+async def _maybe_send_weekly_digest(context) -> None:
+    """Единая точка отправки недельной подборки; безопасна при любом числе вызовов.
+
+    Вызывается из пятничной задачи, из ``_post_init`` (догон после простоя) и в конце
+    каждого цикла проверки (повтор отложенной отправки). Под ``asyncio.Lock``, чтобы
+    задача и цикл не отправили одновременно; сбой логируется и не пробрасывается.
+    """
+    if context.bot_data["config"].WEEKLY_DIGEST_TIME is None:
+        return
+    lock: asyncio.Lock = context.bot_data.setdefault("weekly_digest_lock", asyncio.Lock())
+    async with lock:
+        try:
+            await _send_weekly_digest(context)
+        except Exception:
+            logger.exception("Ошибка отправки недельной подборки")
+
+
+async def _send_weekly_digest(context) -> None:
+    """Проверки и отправка недельной подборки (порядок — design.md, п. 11); вызывать под локом."""
+    config = context.bot_data["config"]
+    session_maker = context.bot_data["session_maker"]
+    tz = ZoneInfo(config.WEEKLY_DIGEST_TZ)
+
+    now = datetime.now(timezone.utc)
+    period_end = last_digest_moment(now, config.WEEKLY_DIGEST_TIME, tz)
+    period_start = previous_digest_moment(period_end)
+
+    if await _weekly_run_finished(session_maker, period_end):
+        return
+    if now > sunday_at(period_end, DAY_END):
+        skipped: set[datetime] = context.bot_data.setdefault("weekly_skipped", set())
+        if period_end not in skipped:
+            skipped.add(period_end)
+            logger.warning("Недельная подборка за %s пропущена: срок (воскресенье %s) прошёл", period_end, DAY_END)
+        return
+    if not in_daytime(now, tz):
+        return
+
+    window = await _load_weekly_window(session_maker, period_start, period_end)
+    if _select_unrated(window) or any(
+        a.importance is not None and a.importance >= WEEKLY_MIN_IMPORTANCE and not a.summary for a in window
+    ):
+        async with _llm_tools(config) as (summarizer, llm_client):
+            # финальный проход: оцениваем всех оставшихся, в т.ч. по названию
+            for article in _select_unrated(window):
+                try:
+                    await _rate_article(context, session_maker, summarizer, llm_client, article, final=True)
+                except Exception:
+                    logger.exception("Ошибка финальной оценки %s", article.external_id)
+            window = await _load_weekly_window(session_maker, period_start, period_end)
+            unrated = _select_unrated(window)
+            if unrated:
+                if datetime.now(timezone.utc) < sunday_at(period_end, SUNDAY_LAST_HOUR_START):
+                    logger.info("Недельная подборка отложена: неоценённых кандидатов %d", len(unrated))
+                    return
+                logger.warning(
+                    "Недельная подборка уходит без неоценённых: %s", ", ".join(a.external_id for a in unrated)
+                )
+            # попытка 2 фоновой саммаризации для пунктов без саммари
+            for article in _select_weekly(window):
+                if article.summary:
+                    continue
+                try:
+                    await _summarize_in_background(context, session_maker, summarizer, llm_client, article)
+                except Exception:
+                    logger.exception("Ошибка финальной саммаризации %s", article.external_id)
+
+    included, without_summary = _split_by_summary(_select_weekly(window))
+    if without_summary:
+        # в подборку идёт только то, что можно прочитать (design п. 9)
+        logger.warning(
+            "Недельная подборка за %s: исключены без саммари: %s",
+            period_end, ", ".join(a.external_id for a in without_summary),
+        )
+    if not included:
+        await _weekly_run_start(session_maker, period_end)
+        await _weekly_run_finish(session_maker, period_end)
+        logger.info("Недельная подборка за %s пуста — ничего не отправляем", period_end)
+        return
+
+    text, markup = _build_weekly_message(included, config.WEBAPP_URL)
+    await _weekly_run_start(session_maker, period_end)
+    async with session_maker() as session:
+        users = list(
+            (
+                await session.scalars(
+                    select(User).where(User.is_active.is_(True), User.channel_verified.is_(True))
+                )
+            ).all()
+        )
+    sent = 0
+    for user in users:
+        # фильтры пользователя не применяются: подборка одинакова для всех
+        try:
+            if await _send_notification(context, session_maker, user, text, markup):
+                sent += 1
+        except Exception:
+            logger.exception("Ошибка отправки подборки пользователю %s — пропуск", user.telegram_id)
+        await asyncio.sleep(0.05)
+    await _weekly_run_finish(session_maker, period_end)
+    logger.info("Недельная подборка за %s: %d законов, отправлена %d из %d пользователей",
+                period_end, len(included), sent, len(users))
 
 
 async def _notify_users_batch(context, session_maker, articles: list[Article]) -> None:
@@ -477,7 +935,11 @@ def _digest_sort_key(article: Article) -> tuple[int, str]:
 
 
 def _build_digest(
-    articles: list[Article], webapp_url: str | None = None
+    articles: list[Article],
+    webapp_url: str | None = None,
+    *,
+    header: str | None = None,
+    sort_key: Callable[[Article], object] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Формирует MarkdownV2-тизер дайджеста: до 3 самых значимых документов + кнопка «Дайджест».
 
@@ -493,9 +955,12 @@ def _build_digest(
     содержит (они остались только в ранее отправленных дайджестах, см.
     ``force_summarize_digest``) — вместо них при заданном ``webapp_url`` в текст
     добавляется подсказка про дайджест.
+
+    Необязательные параметры для недельной подборки (по умолчанию — поведение дневного
+    дайджеста): ``header`` — свой заголовок, ``sort_key`` — свой порядок.
     """
-    ordered = sorted(articles, key=_digest_sort_key)
-    header_esc = escape_markdown(f"Приняли новые законы — {len(ordered)}", version=2)
+    ordered = sorted(articles, key=sort_key or _digest_sort_key)
+    header_esc = escape_markdown(header or f"Приняли новые законы — {len(ordered)}", version=2)
     lines: list[str] = [f"*{header_esc}*"]
 
     sample = ordered[:3]

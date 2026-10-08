@@ -51,3 +51,5 @@ logs/
 
 # macOS
 .DS_Store
+# Кэш саммари для scripts/calibrate_importance.py
+scripts/.calibration_cache.json
