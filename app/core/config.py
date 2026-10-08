@@ -123,14 +123,17 @@ def _get_int_list_env(name: str) -> tuple[int, ...]:
             raise ConfigError(f"Invalid integer in {name}: {part!r}") from e
     return tuple(ids)
 
-def _get_time_env(name: str) -> time | None:
+def _get_time_env(name: str, default: str = "") -> time | None:
     """
     Читает время ``HH:MM`` из переменной окружения; пусто = None.
+
+    ``default`` подставляется, только если переменная не задана вовсе
+    (явно заданная пустая строка по-прежнему означает None).
 
     Raises:
         ConfigError: если значение не в формате ``HH:MM``
     """
-    raw = os.getenv(name, "").strip()
+    raw = os.getenv(name, default).strip()
     if not raw:
         return None
     try:
@@ -198,6 +201,10 @@ class Config:
     # и часовой пояс, в котором оно задано
     WEEKLY_DIGEST_TIME: time | None
     WEEKLY_DIGEST_TZ: str
+
+    # Пятничное напоминание администраторам о модерации подборки (None = выключено);
+    # тот же часовой пояс, что и у WEEKLY_DIGEST_TZ
+    WEEKLY_REVIEW_TIME: time | None
 
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
@@ -267,6 +274,15 @@ class Config:
             ZoneInfo(weekly_digest_tz)
         except (ZoneInfoNotFoundError, ValueError) as e:
             raise ConfigError(f"Invalid timezone for WEEKLY_DIGEST_TZ: {weekly_digest_tz!r}") from e
+        weekly_review_time = _get_time_env("WEEKLY_REVIEW_TIME", "12:00")
+        if (
+            weekly_review_time is not None
+            and weekly_digest_time is not None
+            and weekly_review_time >= weekly_digest_time
+        ):
+            raise ConfigError(
+                "WEEKLY_REVIEW_TIME must be earlier than WEEKLY_DIGEST_TIME"
+            )
         if required_channel_id is None:
             logging.getLogger(__name__).warning(
                 "REQUIRED_CHANNEL_ID не задан, гейт подписки на канал отключён"
@@ -320,4 +336,5 @@ class Config:
             DB_BACKUP_RETENTION_COUNT=db_backup_retention_count,
             WEEKLY_DIGEST_TIME=weekly_digest_time,
             WEEKLY_DIGEST_TZ=weekly_digest_tz,
+            WEEKLY_REVIEW_TIME=weekly_review_time,
         )

@@ -6,9 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 News Detector / LegalBot — a Telegram bot that monitors `pravo.gov.ru` for newly
 published Russian legal acts, summarizes them via the GigaChat API, and pushes
-notifications to subscribed users. Also serves a small Telegram Mini-App (WebApp)
-for reading the full text of a law. Personal/pet project, Russian-language
-codebase and commit history.
+notifications to subscribed users, plus a weekly "most important laws" digest.
+Also serves a small Telegram Mini-App (WebApp) for reading the full text and
+summaries of laws. Personal/pet project, Russian-language codebase and commit
+history. Deployed as a Docker container on Dockhost (see "Deployment").
 
 ## Commands
 
@@ -25,8 +26,12 @@ python -c "from app.core.config import Config; print(Config.load())"
 # run
 python -m app.main
 
-# logs
-tail -f app.log
+# logs (LOG_FILE, default logs/app.log)
+tail -f logs/app.log
+
+# one-off tools (spend GigaChat quota, need a filled .env)
+python -m scripts.calibrate_importance          # importance rubric vs golden labels
+python -m scripts.seed_weekly_window --dry-run  # load the current digest window into the DB
 ```
 
 There is no test suite, linter, or formatter configured in this repo
@@ -70,13 +75,17 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
    does **not** fire immediately (a known APScheduler/PTB gotcha), the first
    check is manually triggered from `post_init` via `_run_initial_check`,
    which also decides `is_first_run` (suppress notification spam on an empty
-   DB) and `needs_backfill` (see below).
+   DB) and `needs_backfill` (see below). `post_init` then also starts the
+   WebApp server, runs the weekly-digest catch-up (`_run_initial_weekly_digest`),
+   inserts the onboarding demo article and makes the first DB backup.
+   `_schedule_jobs()` additionally registers `weekly_digest_job` (only if
+   `WEEKLY_DIGEST_TIME` is set) and the DB backup job.
 
 ### Processing one document (`app/services/scheduler.py`, `rss_parser.py`)
 
 1. `fetch_documents()` pulls the day's document list from pravo.gov.ru's JSON
-   API into `FeedEntry` objects (`external_id` = `eoNumber`, the site's
-   publication number).
+   API (all pages: `pageSize=200`, at most 20 pages) into `FeedEntry` objects
+   (`external_id` = `eoNumber`, the site's publication number).
 2. New entries are filtered against `articles.external_id` already in the DB
    — this is the idempotency guarantee: one document is processed exactly once.
 3. For each new entry, `_process_entry()` resolves text and level:
@@ -89,8 +98,9 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      `GOV_RESOLUTION` are strictly by title prefix ("Указ Президента Российской
      Федерации…" / "Постановление Правительства Российской Федерации…"); other
      decrees/resolutions (regional) are `REGIONAL`. Old rows are not reclassified.
-   - If no text is ready and the act `is_important()` (currently: ФКЗ), OCR
-     is attempted via GigaChat on the source PDF (`ocr_document_text`).
+   - If no text is ready and the act `is_important()` (`IMPORTANT_LEVELS`:
+     Конституция/ФКЗ/ФЗ), OCR is attempted via GigaChat on the source PDF
+     (`ocr_document_text`).
    - If text was obtained (directly or via OCR), `summarizer.summarize()`
      calls GigaChat for a 140–280 char summary (`SUMMARY_MIN_LEN`/`MAX_LEN`).
      GigaChat refusals are detected (`classify_reply` in `gigachat.py`) and
@@ -113,7 +123,10 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      `created_at`, ≤20 per cycle); no text for >24h → one OCR before scoring.
 4. Notifications respect each user's `UserFilter` rows (chosen legal-force
    levels in `user_filters`; no rows = no filter, receive everything) and
-   skip users who blocked the bot (`Forbidden`).
+   skip users who blocked the bot (`Forbidden`). Only active users who passed
+   the channel gate (`channel_verified`) are notified. `IMPORTANT_LEVELS` acts
+   go out one message each; the rest: 1 act = one message, 2+ = one digest
+   teaser (`_build_digest`: up to 3 acts + a "Дайджест" Mini-App button).
 5. `needs_backfill` (set in `_run_initial_check`) drives a one-time 30-day
    backfill of FKZ/FZ acts on first run if the DB has none in that window —
    idempotent, only evaluated at startup.
@@ -132,7 +145,32 @@ leftovers, by title if needed); hard deadline Sunday 22:00 (in the last hour
 unscored ones are dropped; later the period is skipped). Acts with no summary
 after two background attempts are excluded (ids logged) — no placeholder text.
 Empty digest (including after that exclusion) = nothing sent. Admin preview:
-`/test_digest weekly` (no DB writes, no scoring).
+`/test_digest weekly` (no DB writes, no scoring). Specs: `law-importance-scoring`,
+`weekly-important-digest`.
+
+**Moderation (`weekly_review.py`, `webapp/admin.py`, `webapp/static/admin.html`).** The
+admin decision lives in `Article.digest_override` (`'include'` / `'exclude'` / NULL) and is
+final: `final_selection(window)` (window docs with a summary that are `include`, or NULL with
+importance ≥ 2; order = rating, unrated last, then newer first) feeds the send, the panel, the
+Markdown export and `/test_digest weekly`. The final pass rates/waits only for unrated docs
+with no decision, and the "attempt 2" summary runs only for docs that will actually go (not
+`exclude`). On Friday at `WEEKLY_REVIEW_TIME` (default 12:00; empty = off) `_maybe_send_review_ping`
+sends a service message **only to `ADMIN_CHAT_IDS`** straight via `bot.send_message` (never
+through `users`/`_send_notification`), once per period (`weekly_review_pings`), with a Mini-App
+button to `/admin` and a "🔗 Ссылка для браузера" callback. The panel shows the nearest unsent
+digest (`target_period`); edits after `weekly_digest_runs.started_at` get 409. Auth: Telegram
+`initData` (header `X-Telegram-Init-Data`) or a session cookie from the one-time link of `/admin`
+(10 min token, 12 h session, both in process memory); POSTs need `X-Admin-Panel: 1` + JSON; no
+CORS. Moderation is available only with `WEEKLY_DIGEST_TIME`, `WEBAPP_URL` and `ADMIN_CHAT_IDS`
+(otherwise the digest goes automatically; reason is logged at start). Shared Mini-App styles
+live in `app/webapp/static/webapp.css`. Spec: `weekly-digest-moderation`.
+
+Known quirks (not bugs of this feature): a double GigaChat refusal while scoring
+gives importance `2` (sensitive topics must not drop out), but if the summary
+also fails the act is then excluded from the digest; `classify_level_for_title`
+still tags any title containing "конституц" (e.g. a Constitutional Court ruling)
+as `CONSTITUTION`; `Summarizer` cuts an over-long summary at `SUMMARY_MAX_LEN`
+and appends "…", which can end mid-sentence.
 
 ### Bot commands / handlers (`app/bot/handlers.py`, registered in `app/main.py`)
 
@@ -145,8 +183,37 @@ Empty digest (including after that exclusion) = nothing sent. Admin preview:
   choosing legal-force filter levels, backed by `user_filters`.
 - `/help` — command reference.
 - `/test_digest real <N>` / `/test_digest weekly` — admin-only debug previews.
+- `/admin` (and the reminder's "Ссылка для браузера" button) — admin-only; sends a one-time
+  login link to the moderation panel (link preview disabled so Telegram does not burn the token).
+- Onboarding: `/start` registers the user and, if `REQUIRED_CHANNEL_ID` is set,
+  asks to subscribe to the channel (`check_subscription` callback); a "show
+  example" button sends the demo article (`app/services/demo_article.py`,
+  `is_demo`, hidden from `/latest` and digests). Other commands/callbacks are
+  wrapped in `require_channel_verified` (default-deny, no admin bypass).
 - Full-text button opens the Mini-App (`app/webapp/server.py`), which only
   appears when `WEBAPP_URL` is set (Telegram requires HTTPS for WebApps).
+
+### Mini-App (`app/webapp/server.py`)
+
+aiohttp server started from `post_init` on `WEBAPP_HOST:WEBAPP_PORT`. Routes:
+`GET /app?external_id=` (one law) and `GET /app?ids=a,b,…` (digest accordion,
+capped by `DIGEST_ID_CAP`), `GET /full_text` (JSON with title, url, text,
+`is_text_available`, `summary`), `POST /summarize` (force-summarize a digest
+card; the user is identified by Telegram `initData` signature) and `GET /health`.
+After a temporary summarize failure for a document there is a 60 s cooldown
+(`SUMMARIZE_COOLDOWN_SECONDS`, in-memory `app["summarize_failed_at"]`) answered
+without calling GigaChat, for any user; the page shows a toast banner and a
+muted button with a countdown. Failures and cooldown do not consume the user's
+monthly limit. The force-summarize core is `app/services/force_summary.py`,
+shared with the bot (`/summary`, "Сделать саммари" buttons).
+
+### Deployment
+
+`Dockerfile` (`python:3.14-slim`, `python -m app.main`) + `docker-compose.yml`
+(`.env`, volumes `./data` and `./logs`) — runs on Dockhost; see spec `deployment`.
+`openspec/`, `docs/`, `.env`, `data/`, `logs/` are excluded from the image.
+SQLite lives in `data/`; `app/services/backup.py` makes periodic consistent
+copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 
 ### Key modules
 
@@ -164,15 +231,23 @@ Empty digest (including after that exclusion) = nothing sent. Admin preview:
 | `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
 | `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |
 | `app/models/weekly_digest_run.py` | `WeeklyDigestRun` — one row per sent weekly period (idempotency) |
-| `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → notify |
+| `app/services/weekly_review.py` | Moderation rules without HTTP/DB: `final_selection`, `target_period`, short title, Markdown export |
+| `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
+| `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
+| `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
+| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling) |
+| `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
+| `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |
+| `app/services/demo_article.py` | Constants of the onboarding demo article |
 | `app/bot/handlers.py` | All Telegram command/callback/conversation handlers |
-| `app/webapp/server.py` | aiohttp Mini-App server for full law text |
+| `app/webapp/server.py` | aiohttp Mini-App server: full text, digest cards with summaries, force-summarize |
 
 For a much more detailed, code-line-referenced walkthrough of the same flow
 (written for a junior dev), see `docs/FLOW.md`. `docs/vision.md` has the
 original architectural rationale/principles. Both may lag newer features
-(e.g. `docs/FLOW.md` predates the WebApp, filters, and backfill) — trust the
-code over the docs when they disagree.
+(e.g. `docs/FLOW.md` predates the WebApp, filters, backfill, importance scoring
+and the weekly digest; `docs/PLAN.md` and `docs/idea.md` are historical) — trust
+the code and `openspec/specs/` over the docs when they disagree.
 
 ## Project conventions (from `.cursor/rules/`)
 
@@ -199,11 +274,14 @@ alike (all mirrors of the same OpenSpec rules); the canonical copy is
 
 This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
-`llm-refusal-handling`, `content-viewing`); `openspec/changes/` holds
-in-progress or archived change proposals (`proposal.md`, `design.md`,
-`tasks.md` per change), archived ones moved under `openspec/changes/archive/`.
-When making a nontrivial feature change, check whether a relevant spec/change
-already exists there before starting.
+`legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
+`digest-notifications`, `force-summarization`, `law-importance-scoring`,
+`weekly-important-digest`, `deployment`); `openspec/changes/` holds
+in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
+change), finished ones moved under `openspec/changes/archive/` (dated). There
+are currently no active changes; `law-sphere-filter` and `law-region-filter`
+live as GitHub issues #7 and #8. When making a nontrivial feature change, check
+whether a relevant spec/change already exists there before starting.
 
 `.claude/commands/opsx/*` (`propose`, `explore`, `apply`, `update`, `archive`,
 `sync`) and the matching `.claude/skills/openspec-*` are the tooling for
@@ -221,11 +299,17 @@ Notable variables beyond the obvious (see `.env.example` for the full list):
 (comma-separated, unlimited force-summarize), `TELEGRAM_PROXY_URL` (needed
 from RU, `api.telegram.org` is blocked there), `WEBAPP_HOST`/`WEBAPP_PORT`/
 `WEBAPP_URL` (WebApp button hidden if `WEBAPP_URL` is empty), `LOG_FILE`/
-`LOG_RETENTION_DAYS`, `GIGACHAT_AUTH_KEY`/`GIGACHAT_SCOPE`/`GIGACHAT_MODEL`/
+`LOG_RETENTION_DAYS`, `BACKFILL_ENABLED` (false skips the 30-day startup
+backfill), `REQUIRED_CHANNEL_ID` (empty = channel gate off),
+`DB_BACKUP_DIR`/`DB_BACKUP_INTERVAL_HOURS`/`DB_BACKUP_RETENTION_COUNT`, `GIGACHAT_AUTH_KEY`/`GIGACHAT_SCOPE`/`GIGACHAT_MODEL`/
 `GIGACHAT_VERIFY_SSL`, `WEEKLY_DIGEST_TIME` (`HH:MM`, empty = weekly digest
-off) / `WEEKLY_DIGEST_TZ` (default `Europe/Moscow`; needs `tzdata` on slim images).
+off) / `WEEKLY_DIGEST_TZ` (default `Europe/Moscow`; needs `tzdata` on slim images),
+`WEEKLY_REVIEW_TIME` (`HH:MM`, default `12:00`, empty = no admin reminder; must be earlier than
+`WEEKLY_DIGEST_TIME`).
 
-Importance calibration is a one-off tool, not a test suite:
-`python -m scripts.calibrate_importance` (golden labels in
-`scripts/importance_golden.csv`, title sample for the prefilter in
-`scripts/importance_titles_sample.json`).
+Importance scripts are one-off tools, not a test suite: `scripts/calibrate_importance.py`
+(golden labels in `scripts/importance_golden.csv`, `--fill` adds url/summary columns;
+few-shot examples in `importance.py` are excluded from its metrics),
+`scripts/seed_weekly_window.py` (loads the current digest window into the DB with
+`notified=True`, so nobody is notified) and the title sample for the prefilter in
+`scripts/importance_titles_sample.json`.

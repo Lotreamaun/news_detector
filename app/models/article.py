@@ -59,6 +59,10 @@ class Article(Base):
     # NULL = не оценён. Внутренняя, пользователю не показывается
     # (см. app/services/importance.py).
     importance: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Решение администратора по недельной подборке: 'include' / 'exclude';
+    # NULL = администратор документ не трогал (решает оценка). Окончательное для
+    # финального прохода (см. app/services/weekly_review.py).
+    digest_override: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Время приёма системой (published_at — только дата без времени). Значение по умолчанию
     # на уровне модели покрывает и _save_article, и строки из /summary. У старых строк NULL.
     created_at: Mapped[datetime | None] = mapped_column(

@@ -36,6 +36,11 @@ def previous_digest_moment(moment: datetime) -> datetime:
     return moment - _PERIOD
 
 
+def next_digest_moment(moment: datetime) -> datetime:
+    """Следующий запланированный момент (конец окна, которое накапливается после ``moment``)."""
+    return moment + _PERIOD
+
+
 def sunday_at(moment: datetime, at: time) -> datetime:
     """Воскресенье той же недели, что и пятничный ``moment``, в время ``at``."""
     return datetime.combine(moment.date() + timedelta(days=2), at, tzinfo=moment.tzinfo)
