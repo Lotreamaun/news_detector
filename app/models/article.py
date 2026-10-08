@@ -1,8 +1,8 @@
 """Модель закона/документа с портала (идемпотентность по external_id)."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, String, Text, text  # в string фиксированная длина, в text - произвольная
+from sqlalchemy import Boolean, DateTime, SmallInteger, String, Text, text  # в string фиксированная длина, в text - произвольная
 from sqlalchemy.orm import (
     Mapped, # обертка для типов
     mapped_column # настраивает колонку
@@ -54,4 +54,15 @@ class Article(Base):
         nullable=False,
         default=False,
         server_default=text("0"),
+    )
+    # Оценка важности 0–3 (0 — не важно, 1 — нейтрально, 2 — важно, 3 — критически важно);
+    # NULL = не оценён. Внутренняя, пользователю не показывается
+    # (см. app/services/importance.py).
+    importance: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Время приёма системой (published_at — только дата без времени). Значение по умолчанию
+    # на уровне модели покрывает и _save_article, и строки из /summary. У старых строк NULL.
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
     )

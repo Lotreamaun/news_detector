@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from logging.handlers import TimedRotatingFileHandler
 
 from telegram import BotCommand, Update
@@ -42,7 +43,7 @@ from app.services.demo_article import (
     DEMO_ARTICLE_TITLE,
     DEMO_ARTICLE_URL,
 )
-from app.services.scheduler import check_legislation_updates
+from app.services.scheduler import check_legislation_updates, weekly_digest_job
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,26 @@ def _schedule_jobs(application: Application, config: Config) -> None:
     )
     logger.info("Проверка RSS запланирована: каждые %d минут", config.CHECK_INTERVAL_MINUTES)
 
+    if config.WEEKLY_DIGEST_TIME is not None:
+        # В PTB 22.6 days у run_daily нумеруются 0–6 как воскресенье–суббота: пятница = 5
+        job_queue.run_daily(
+            weekly_digest_job,
+            time=config.WEEKLY_DIGEST_TIME.replace(tzinfo=ZoneInfo(config.WEEKLY_DIGEST_TZ)),
+            days=(5,),
+            name="weekly_digest",
+        )
+        logger.info(
+            "Недельная подборка запланирована: пятница %s (%s)",
+            config.WEEKLY_DIGEST_TIME.strftime("%H:%M"), config.WEEKLY_DIGEST_TZ,
+        )
+        if not config.WEBAPP_URL:
+            logger.warning(
+                "WEEKLY_DIGEST_TIME задан, а WEBAPP_URL пуст: в подборке не будет кнопки «Дайджест», "
+                "пользователи увидят только 3 закона"
+            )
+    else:
+        logger.info("Недельная подборка выключена (WEEKLY_DIGEST_TIME не задан)")
+
     if resolve_sqlite_path(config.DATABASE_URL) is None:
         logger.warning(
             "DATABASE_URL не указывает на SQLite — автоматический файловый бэкап БД "
@@ -200,6 +221,7 @@ async def _post_init(application: Application) -> None:
     await _register_commands(application)
     await _start_webapp(application)
     await _run_initial_check(application)
+    await _run_initial_weekly_digest(application)
     await _ensure_demo_article(application)
     await _run_initial_backup(application)
 
@@ -294,6 +316,22 @@ async def _run_initial_check(application: Application) -> None:
         # бэкфилл идемпотентны и выполняются только при старте
         application.bot_data["is_first_run"] = False
         application.bot_data["needs_backfill"] = False
+
+
+async def _run_initial_weekly_digest(application: Application) -> None:
+    """Догон после простоя: проверяет недельную подборку сразу после старта.
+
+    Повторный вызов безопасен: период фиксируется в ``weekly_digest_runs``, а
+    дневное окно и срок (воскресенье 22:00) проверяет сама ``_maybe_send_weekly_digest``.
+    """
+    job_queue = application.job_queue
+    jobs = job_queue.get_jobs_by_name("weekly_digest") if job_queue is not None else ()
+    if not jobs:
+        return
+    try:
+        await jobs[0].run(application)
+    except Exception:
+        logger.exception("Не удалось выполнить стартовую проверку недельной подборки")
 
 
 async def _ensure_demo_article(application: Application) -> None:

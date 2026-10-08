@@ -21,3 +21,6 @@ socksio==1.0.0
 
 # Саммаризация
 sumy==0.11.0
+
+# База часовых поясов для zoneinfo (python:3.14-slim её не содержит), см. WEEKLY_DIGEST_TZ
+tzdata==2025.2
