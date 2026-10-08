@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 CORS = {"Access-Control-Allow-Origin": "*"}
 INIT_DATA_MAX_AGE = 24 * 60 * 60  # страница дайджеста может долго висеть открытой
+# После временной неудачи саммари документа (нет текста, сбой GigaChat) повтор по нему
+# разрешён только через столько секунд — защита GigaChat от 429 при повторных нажатиях,
+# перезагрузке страницы и запросах других пользователей к тому же документу
+SUMMARIZE_COOLDOWN_SECONDS = 60
 
 HTML_PAGE = r"""<!doctype html>
 <html lang="ru">
@@ -60,7 +64,12 @@ HTML_PAGE = r"""<!doctype html>
   .text th { background: #f2f2f2; font-weight: 600; }
   .link { margin-top: 16px; }
   .link a { color: var(--tg-theme-link-color, #2688d4); text-decoration: none; word-break: break-all; }
-  .error { color: #842029; background: #f8d7da; border: 1px solid #f5c2c7; border-radius: 8px; padding: 12px; }
+  /* плашки состояния и ошибки — одна геометрия (как у саммари), разный смысл цвета:
+     .unavailable — нормальное состояние «текста пока нет» (нейтральная, в цветах темы),
+     .error — что-то пошло не так (красная; ей же оформлен баннер-уведомление .toast) */
+  .error, .unavailable { border: 1px solid; border-radius: 8px; padding: 8px 10px; margin: 8px 0 12px 0; font-size: 14px; line-height: 1.5; }
+  .error { color: #842029; background: #f8d7da; border-color: #f5c2c7; }
+  .unavailable { color: var(--tg-theme-text-color, #222); background: var(--tg-theme-secondary-bg-color, #f1f1f4); border-color: rgba(112, 117, 121, 0.25); }
   .loading { color: #555; }
   .digest-hint { color: var(--tg-theme-hint-color, #707579); font-size: 13px; margin: 0 0 10px 0; }
   .doc { border: 1px solid var(--tg-theme-hint-color, #ddd); border-radius: 8px; margin-bottom: 10px; }
@@ -84,6 +93,20 @@ HTML_PAGE = r"""<!doctype html>
   @keyframes sum-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .sum-btn .spin { animation: none; } }
   .sum-status { font-size: 13px; color: var(--tg-theme-hint-color, #707579); margin-top: 6px; }
+  /* кулдаун после неудачи: кнопка видна, но приглушена; нажатие показывает баннер */
+  .sum-btn.cooling { opacity: .55; }
+  /* баннер о неудаче саммари (заметнее строки статуса под кнопкой): внешний вид — от .error,
+     здесь только положение, лёгкая тень (отделяет от контента под ним) и появление */
+  .toast { position: fixed; left: 16px; right: 16px; top: calc(16px + env(safe-area-inset-top, 0px)); max-width: 768px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0, 0, 0, .12); opacity: 0; transform: translateY(-20px); pointer-events: none; transition: opacity .2s, transform .2s; z-index: 10; }
+  .toast-count { font-variant-numeric: tabular-nums; }
+  .toast.show { opacity: 1; transform: none; pointer-events: auto; }
+  @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+  /* тёмная тема Telegram (класс .dark ставит скрипт по tg.colorScheme): приглушённые варианты тех же
+     цветов — светлые плашки на тёмном фоне слепят, а серая сливается с фоном без заметной рамки */
+  .dark .disclaimer { color: #ffda6a; background: #332701; border-color: #997404; }
+  .dark .error { color: #ea868f; background: #2c0b0e; border-color: #842029; }
+  .dark .unavailable { border-color: rgba(112, 132, 153, 0.6); }
+  .dark .toast { box-shadow: 0 2px 12px rgba(0, 0, 0, .5); }
   .doc-body { padding: 0 12px 12px 12px; }
   .doc-title { font-weight: 700; margin: 0 0 8px 0; }
 </style>
@@ -103,10 +126,17 @@ HTML_PAGE = r"""<!doctype html>
     <div id="digest-list"></div>
   </div>
 </div>
+<div id="toast" class="error toast" role="alert" aria-live="assertive"></div>
 <script>
 (function() {
   const tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
+  // тёмные варианты плашек — по схеме Telegram (не по настройке ОС: вне Telegram фон всегда светлый)
+  function applyColorScheme() {
+    document.documentElement.classList.toggle('dark', !!tg && tg.colorScheme === 'dark');
+  }
+  applyColorScheme();
+  if (tg && tg.onEvent) tg.onEvent('themeChanged', applyColorScheme);
 
   function escapeHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -224,6 +254,53 @@ HTML_PAGE = r"""<!doctype html>
     }
     const origin = window.location.origin;
 
+    // после временной неудачи (нет текста, сбой GigaChat) кнопку можно нажать снова только через минуту
+    const COOLDOWN_MS = 60000;
+    const toastEl = document.getElementById('toast');
+    let toastTimer = null;
+    let toastTick = null;
+    function hideToast() {
+      toastEl.classList.remove('show');
+      clearTimeout(toastTimer);
+      clearInterval(toastTick);
+    }
+    toastEl.addEventListener('click', hideToast);
+    // until — конец кулдауна: тогда под сообщением идёт живой обратный отсчёт
+    function showToast(message, until) {
+      if (!message) return;
+      clearTimeout(toastTimer);
+      clearInterval(toastTick);
+      toastEl.innerHTML = '<div class="toast-text"></div><div class="toast-count"></div>';
+      toastEl.querySelector('.toast-text').textContent = message;
+      const count = toastEl.querySelector('.toast-count');
+      function tick() {
+        const left = Math.ceil(((until || 0) - Date.now()) / 1000);
+        count.textContent = !until ? '' : left > 0 ? 'Повторить можно через ' + left + ' сек.' : 'Можно повторить.';
+        count.style.display = count.textContent ? '' : 'none';
+        if (left <= 0) clearInterval(toastTick);
+      }
+      tick();
+      if (until) toastTick = setInterval(tick, 1000);
+      toastEl.classList.add('show');
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('error');
+      toastTimer = setTimeout(hideToast, 6000);
+    }
+    function startCooldown(details, ms) {
+      details._cooldownUntil = Date.now() + ms;
+      applyCooldown(details);
+    }
+    // приглушает кнопку до конца кулдауна (после перерисовки карточки — тоже)
+    function applyCooldown(details) {
+      const btn = details.querySelector('.sum-btn');
+      const left = (details._cooldownUntil || 0) - Date.now();
+      if (!btn || left <= 0) return;
+      btn.classList.add('cooling');
+      setTimeout(function() {
+        const current = details.querySelector('.sum-btn');
+        if (current) current.classList.remove('cooling');
+      }, left);
+    }
+
     function fetchFullText(id) {
       return fetch(origin + '/full_text?external_id=' + encodeURIComponent(id))
         .then(function(r) {
@@ -256,13 +333,14 @@ HTML_PAGE = r"""<!doctype html>
           (act.button === false ? '' : '<button type="button" class="sum-btn">Сделать саммари</button>') +
           '<div class="sum-status">' + escapeHtml(act.message || '') + '</div></div>';
       }
-      html += r.isAvailable ? r.contentHtml : '<p class="error">' + escapeHtml(r.contentHtml) + '</p>';
+      html += r.isAvailable ? r.contentHtml : '<p class="unavailable">' + escapeHtml(r.contentHtml) + '</p>';
       if (r.linkHtml) html += '<div class="link">' + r.linkHtml + '</div>';
       const body = details.querySelector('.doc-body');
       body.innerHTML = html;
       body.className = 'doc-body';
       const btn = body.querySelector('.sum-btn');
       if (btn) btn.addEventListener('click', function() { startSummarize(details); });
+      applyCooldown(details);
     }
     // непустые summary/text из ответа заменяют прежние при любом статусе
     function mergeData(data, res) {
@@ -285,8 +363,15 @@ HTML_PAGE = r"""<!doctype html>
     function startSummarize(details) {
       const id = details._id;
       const data = details._data;
+      const left = (details._cooldownUntil || 0) - Date.now();
+      if (left > 0) {
+        showToast('Попробуйте позже.', details._cooldownUntil);
+        return;
+      }
       if (!tg || !tg.initData) {
-        setActionState(details, 'Саммари можно сделать, открыв дайджест из Telegram.', false);
+        const msg = 'Саммари можно сделать, открыв дайджест из Telegram.';
+        setActionState(details, msg, false);
+        showToast(msg);
         return;
       }
       details._busy = true;
@@ -309,21 +394,35 @@ HTML_PAGE = r"""<!doctype html>
         })
         .then(function(res) {
           details._busy = false;
-          if (res.stop) { setActionState(details, res.stop, false); return; }
+          if (res.stop) { setActionState(details, res.stop, false); showToast(res.stop); return; }
           mergeData(data, res);
           const final = res.status === 'limit' || res.status === 'refused';
-          renderCard(details, data, id, res.status === 'ok' ? {} : { message: res.message, button: !final });
+          if (res.status === 'no_text' || res.status === 'error' || res.status === 'cooldown') {
+            details._cooldownUntil = Date.now() + (res.retry_after ? res.retry_after * 1000 : COOLDOWN_MS);
+          }
+          // строка под кнопкой — только для окончательных исходов (кнопки больше нет, причина должна остаться);
+          // разовые неудачи сообщает баннер, кнопка остаётся для повтора после кулдауна
+          renderCard(details, data, id, res.status === 'ok' ? {} : { message: final ? res.message : '', button: !final });
+          if (res.status === 'cooldown') showToast('Саммари сейчас не получить.', details._cooldownUntil);
+          else if (res.status !== 'ok') showToast(res.message, final ? null : details._cooldownUntil);
         })
         .catch(function() {
           // запрос мог дойти до сервера, а ответ оборвал посредник — перепроверяем документ
-          const wait = 'Не удалось дождаться ответа — возможно, саммари ещё создаётся. Попробуйте через минуту.';
+          const wait = 'Не удалось дождаться ответа — возможно, саммари ещё создаётся.';
           fetchFullText(id)
             .then(function(fresh) {
               details._busy = false;
-              if (fresh.summary) { mergeData(data, fresh); renderCard(details, data, id); }
-              else setActionState(details, wait, false);
+              if (fresh.summary) { mergeData(data, fresh); renderCard(details, data, id); return; }
+              setActionState(details, '', false);
+              startCooldown(details, COOLDOWN_MS);
+              showToast(wait, details._cooldownUntil);
             })
-            .catch(function() { details._busy = false; setActionState(details, wait, false); });
+            .catch(function() {
+              details._busy = false;
+              setActionState(details, '', false);
+              startCooldown(details, COOLDOWN_MS);
+              showToast(wait, details._cooldownUntil);
+            });
         });
     }
 
@@ -405,7 +504,7 @@ HTML_PAGE = r"""<!doctype html>
         contentEl.className = 'text';
       } else {
         contentEl.textContent = r.contentHtml;
-        contentEl.className = 'error';
+        contentEl.className = 'unavailable';
       }
       if (r.linkHtml) {
         linkEl.innerHTML = r.linkHtml;
@@ -504,7 +603,8 @@ def _verify_init_data(init_data: str, bot_token: str) -> int | None:
 async def handle_summarize(request: web.Request) -> web.Response:
     """Принудительная саммаризация документа из карточки дайджеста.
 
-    Доменные исходы (ok/limit/no_text/refused/error) — 200 со статусом и готовым
+    Доменные исходы (ok/limit/no_text/refused/error, а также cooldown — повтор по
+    документу после временной неудачи раньше ``SUMMARIZE_COOLDOWN_SECONDS``) — 200 со статусом и готовым
     для карточки message; 400 — плохой запрос, 401 — нет/неверная initData,
     403 — пользователь неизвестен или не подтвердил подписку, 500 — сбой сервера.
     """
@@ -535,7 +635,25 @@ async def handle_summarize(request: web.Request) -> web.Response:
                 {"message": "Подтвердите подписку на канал в боте."}, status=403, headers=CORS
             )
 
+        failed_at: dict[str, float] = request.app["summarize_failed_at"]
+        left = SUMMARIZE_COOLDOWN_SECONDS - (time.monotonic() - failed_at.get(external_id, float("-inf")))
+        if left > 0:
+            retry_after = int(left) + 1
+            logger.info("handle_summarize: user=%s %s -> cooldown %ss", telegram_id, external_id, retry_after)
+            return web.json_response(
+                {
+                    "status": "cooldown",
+                    "retry_after": retry_after,
+                    "message": f"Саммари сейчас не получить. Попробуйте через {retry_after} сек.",
+                },
+                headers=CORS,
+            )
+
         result = await force_summarize(config, session_maker, user, external_id)
+        if result.status in ("no_text", "error"):
+            failed_at[external_id] = time.monotonic()
+        else:
+            failed_at.pop(external_id, None)
         messages = {
             "limit": (
                 f"Месячный лимит саммаризаций ({config.FORCE_SUMMARIZE_MONTHLY_LIMIT}) "
@@ -566,6 +684,7 @@ def create_app(session_maker, config) -> web.Application:
     app = web.Application()
     app["session_maker"] = session_maker
     app["config"] = config
+    app["summarize_failed_at"] = {}  # external_id -> time.monotonic() последней временной неудачи
     app.router.add_get("/app", handle_app)
     app.router.add_get("/full_text", handle_full_text)
     app.router.add_post("/summarize", handle_summarize)
