@@ -85,7 +85,10 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      after retries, placeholder text) returns `None`, never raises.
    - `classify_level_for_title()` / `classify_level()` tag the act's legal
      force (`FKZ`, `FZ`, `UNKNOWN`, ...) from `document_type_id`/title —
-     stored on `Article.level` and used for per-user filtering.
+     stored on `Article.level` and used for per-user filtering. `DECREE` /
+     `GOV_RESOLUTION` are strictly by title prefix ("Указ Президента Российской
+     Федерации…" / "Постановление Правительства Российской Федерации…"); other
+     decrees/resolutions (regional) are `REGIONAL`. Old rows are not reclassified.
    - If no text is ready and the act `is_important()` (currently: ФКЗ), OCR
      is attempted via GigaChat on the source PDF (`ocr_document_text`).
    - If text was obtained (directly or via OCR), `summarizer.summarize()`
@@ -97,12 +100,39 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      notified: summary + link if available, otherwise a fallback message
      with just the link. **The bot must never go silent** — this fallback
      principle is load-bearing, see `docs/vision.md`.
+   - After saving, candidates (`CONSTITUTION`/`FKZ`/`FZ`/`DECREE`/`GOV_RESOLUTION`)
+     get an internal importance score 0–3 (`Article.importance`, NULL = not
+     scored, never shown to users) in a separate `try/except` so a scoring
+     failure never blocks saving/notifying: `prefilter_zero()` (title patterns
+     for routine decrees → `0` without LLM), else GigaChat by a rubric
+     (`app/services/importance.py`; input = summary, else start of text; no
+     text yet → scoring deferred). Score `≥ 2` triggers a background summary
+     (text, or OCR if absent) if there is none.
+   - Unscored candidates are retried ("backlog") at the end of every
+     `check_legislation_updates` cycle (`_rate_backlog`, ≤14 days since
+     `created_at`, ≤20 per cycle); no text for >24h → one OCR before scoring.
 4. Notifications respect each user's `UserFilter` rows (chosen legal-force
    levels in `user_filters`; no rows = no filter, receive everything) and
    skip users who blocked the bot (`Forbidden`).
 5. `needs_backfill` (set in `_run_initial_check`) drives a one-time 30-day
    backfill of FKZ/FZ acts on first run if the DB has none in that window —
    idempotent, only evaluated at startup.
+
+### Weekly important digest (`app/services/scheduler.py`, `weekly_window.py`)
+
+Every Friday at `WEEKLY_DIGEST_TIME` (`WEEKLY_DIGEST_TZ`; empty time = feature
+off, scoring still runs) all acts with importance `≥ 2` accepted in the window
+(previous Friday → this Friday, by `Article.created_at`) go to every active,
+channel-verified user in one teaser (`_build_digest` with its own header),
+ignoring `UserFilter`. `_maybe_send_weekly_digest` is the single entry point
+(Friday job, `_post_init` catch-up, end of each check cycle), under an
+`asyncio.Lock`; idempotent per period via `weekly_digest_runs`. Sends only
+09:00–22:00 local; waits while window candidates are unscored (final pass scores
+leftovers, by title if needed); hard deadline Sunday 22:00 (in the last hour
+unscored ones are dropped; later the period is skipped). Acts with no summary
+after two background attempts are excluded (ids logged) — no placeholder text.
+Empty digest (including after that exclusion) = nothing sent. Admin preview:
+`/test_digest weekly` (no DB writes, no scoring).
 
 ### Bot commands / handlers (`app/bot/handlers.py`, registered in `app/main.py`)
 
@@ -114,6 +144,7 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
 - `/settings` — a `ConversationHandler` wizard (`level_wizard_handler`) for
   choosing legal-force filter levels, backed by `user_filters`.
 - `/help` — command reference.
+- `/test_digest real <N>` / `/test_digest weekly` — admin-only debug previews.
 - Full-text button opens the Mini-App (`app/webapp/server.py`), which only
   appears when `WEBAPP_URL` is set (Telegram requires HTTPS for WebApps).
 
@@ -130,6 +161,9 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
 | `app/services/rss_parser.py` | pravo.gov.ru list/text/OCR + level classification |
 | `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection) |
 | `app/services/summarizer.py` | Prompt + summarization logic |
+| `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
+| `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |
+| `app/models/weekly_digest_run.py` | `WeeklyDigestRun` — one row per sent weekly period (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → notify |
 | `app/bot/handlers.py` | All Telegram command/callback/conversation handlers |
 | `app/webapp/server.py` | aiohttp Mini-App server for full law text |
@@ -188,4 +222,10 @@ Notable variables beyond the obvious (see `.env.example` for the full list):
 from RU, `api.telegram.org` is blocked there), `WEBAPP_HOST`/`WEBAPP_PORT`/
 `WEBAPP_URL` (WebApp button hidden if `WEBAPP_URL` is empty), `LOG_FILE`/
 `LOG_RETENTION_DAYS`, `GIGACHAT_AUTH_KEY`/`GIGACHAT_SCOPE`/`GIGACHAT_MODEL`/
-`GIGACHAT_VERIFY_SSL`.
+`GIGACHAT_VERIFY_SSL`, `WEEKLY_DIGEST_TIME` (`HH:MM`, empty = weekly digest
+off) / `WEEKLY_DIGEST_TZ` (default `Europe/Moscow`; needs `tzdata` on slim images).
+
+Importance calibration is a one-off tool, not a test suite:
+`python -m scripts.calibrate_importance` (golden labels in
+`scripts/importance_golden.csv`, title sample for the prefilter in
+`scripts/importance_titles_sample.json`).

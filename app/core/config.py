@@ -5,6 +5,8 @@
 import logging
 import os  # Импорт стандартного модуля os. Дает доступ к переменным окружения через os.getenv
 from dataclasses import dataclass
+from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     # Декоратор @dataclass генерирует шаблонный код в классе, 
     # который предназначен преимущественно для хранения данных
 
@@ -121,6 +123,23 @@ def _get_int_list_env(name: str) -> tuple[int, ...]:
             raise ConfigError(f"Invalid integer in {name}: {part!r}") from e
     return tuple(ids)
 
+def _get_time_env(name: str) -> time | None:
+    """
+    Читает время ``HH:MM`` из переменной окружения; пусто = None.
+
+    Raises:
+        ConfigError: если значение не в формате ``HH:MM``
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        hours, minutes = raw.split(":")
+        return time(int(hours), int(minutes))
+    except ValueError as e:
+        raise ConfigError(f"Invalid time for {name}: {raw!r} (expected HH:MM)") from e
+
+
 @dataclass(frozen=True, slots=True)  # Генерирует шаблонный код для класса Config
 class Config:
     """
@@ -174,6 +193,11 @@ class Config:
     DB_BACKUP_DIR: str
     DB_BACKUP_INTERVAL_HOURS: int
     DB_BACKUP_RETENTION_COUNT: int
+
+    # Еженедельная подборка важных законов (по пятницам): время отправки (None = выключена)
+    # и часовой пояс, в котором оно задано
+    WEEKLY_DIGEST_TIME: time | None
+    WEEKLY_DIGEST_TZ: str
 
     @classmethod  # Декоратор делает эту функцию методом класса — ее можно вызвать без создания экземпляра
     def load(cls) -> "Config":
@@ -235,6 +259,14 @@ class Config:
         db_backup_dir = os.getenv("DB_BACKUP_DIR", "./data/backups").strip() or "./data/backups"
         db_backup_interval_hours = _get_int_env("DB_BACKUP_INTERVAL_HOURS", 24)
         db_backup_retention_count = _get_int_env("DB_BACKUP_RETENTION_COUNT", 7)
+        weekly_digest_time = _get_time_env("WEEKLY_DIGEST_TIME")
+        weekly_digest_tz = (
+            os.getenv("WEEKLY_DIGEST_TZ", "Europe/Moscow").strip() or "Europe/Moscow"
+        )
+        try:
+            ZoneInfo(weekly_digest_tz)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ConfigError(f"Invalid timezone for WEEKLY_DIGEST_TZ: {weekly_digest_tz!r}") from e
         if required_channel_id is None:
             logging.getLogger(__name__).warning(
                 "REQUIRED_CHANNEL_ID не задан, гейт подписки на канал отключён"
@@ -286,4 +318,6 @@ class Config:
             DB_BACKUP_DIR=db_backup_dir,
             DB_BACKUP_INTERVAL_HOURS=db_backup_interval_hours,
             DB_BACKUP_RETENTION_COUNT=db_backup_retention_count,
+            WEEKLY_DIGEST_TIME=weekly_digest_time,
+            WEEKLY_DIGEST_TZ=weekly_digest_tz,
         )

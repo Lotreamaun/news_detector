@@ -19,6 +19,7 @@ from app.services.scheduler import (
     FORCE_SUMMARIZE_PREFIX,
     _build_digest,
     _build_notification,
+    build_weekly_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -899,6 +900,10 @@ async def test_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     статей БД (`_build_digest`, тот же код, что и в проде) и присылает его только
     вызвавшему администратору — НЕ запускает `_notify_users_batch` и не рассылает
     остальным подписчикам.
+
+    ``/test_digest weekly`` — предпросмотр недельной подборки за текущее окно
+    (``build_weekly_preview``): только вызвавшему администратору, ничего не пишет в
+    ``weekly_digest_runs`` и не запускает оценку/саммаризацию.
     """
     if update.message is None or update.effective_user is None:
         return
@@ -909,9 +914,18 @@ async def test_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     args = context.args or []
+    if args and args[0] == "weekly":
+        text, reply_markup, report = await build_weekly_preview(_session_maker(context), config)
+        if text:
+            await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        else:
+            await update.message.reply_text("[test_digest weekly] Подборка за текущее окно пуста.")
+        await update.message.reply_text(report)
+        return
     if len(args) < 2 or args[0] != "real":
         await update.message.reply_text(
-            "Использование: /test_digest real <N>\nНапример: /test_digest real 4"
+            "Использование: /test_digest real <N>\nНапример: /test_digest real 4\n"
+            "Или: /test_digest weekly — предпросмотр недельной подборки"
         )
         return
     try:

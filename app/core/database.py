@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,  # Функция для создания объекта движка
 )
 
-from app.models import Base, Article, User, UserFilter  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
+from app.models import Base, Article, User, UserFilter, WeeklyDigestRun  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
 
 _engine: Optional[AsyncEngine] = None  # приватная переменная для движка
 _async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None  # для сессий
@@ -108,6 +108,8 @@ async def init_db_schema() -> None:
         await _ensure_channel_verified_column(connection)
         await _ensure_article_notified_column(connection)
         await _ensure_is_demo_column(connection)
+        await _ensure_importance_column(connection)
+        await _ensure_created_at_column(connection)
 
 
 async def _ensure_channel_verified_column(connection: AsyncConnection) -> None:
@@ -155,4 +157,32 @@ async def _ensure_is_demo_column(connection: AsyncConnection) -> None:
     if "is_demo" not in columns:
         await connection.execute(
             text("ALTER TABLE articles ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
+        )
+
+
+async def _ensure_importance_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``importance`` (оценка важности 0–3, NULL = не оценён)
+    в уже существующую таблицу ``articles``.
+    """
+    result = await connection.execute(text("PRAGMA table_info(articles)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "importance" not in columns:
+        await connection.execute(
+            text("ALTER TABLE articles ADD COLUMN importance SMALLINT")
+        )
+
+
+async def _ensure_created_at_column(connection: AsyncConnection) -> None:
+    """
+    Добавляет колонку ``created_at`` (время приёма документа) в ``articles``.
+
+    У старых строк остаётся NULL: в окна еженедельной подборки они не попадают
+    (прошлое не рассылаем).
+    """
+    result = await connection.execute(text("PRAGMA table_info(articles)"))
+    columns = {row[1] for row in result.fetchall()}
+    if "created_at" not in columns:
+        await connection.execute(
+            text("ALTER TABLE articles ADD COLUMN created_at DATETIME")
         )
