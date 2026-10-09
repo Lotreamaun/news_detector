@@ -5,6 +5,10 @@
   GET /app?external_id=<id>            — HTML-страница фронтенда, один документ
   GET /app?ids=<id1>,<id2>,...         — та же страница, аккордеон из нескольких
                                           документов (кнопка «Полные тексты» дайджеста)
+  GET /app?view=today                  — та же страница, все акты, опубликованные сегодня
+                                          (группы, поиск по заголовку, тексты — по раскрытию)
+  GET /today_list                      — JSON {date, total, groups: [{key, title, items}]}
+                                          без текстов; дата — всегда сегодня по Москве
   GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available, summary}
   POST /summarize                      — принудительная саммаризация из карточки дайджеста
                                           (JSON {external_id, init_data}); пользователь
@@ -12,7 +16,9 @@
 
 Режим ``ids`` переиспользует существующий ``/full_text`` (по одному запросу на
 документ), а не отдельный batch-эндпоинт — проще и достаточно для размеров
-дайджеста, ограниченных ``DIGEST_ID_CAP`` в scheduler.py.
+дайджеста, ограниченных ``DIGEST_ID_CAP`` в scheduler.py. Режим ``today`` не
+ограничен: список приходит одним лёгким запросом ``/today_list``, а текст
+документа запрашивается через ``/full_text`` только при раскрытии карточки.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ from sqlalchemy import select
 
 from app.models import Article, User
 from app.services.force_summary import force_summarize
+from app.services.rss_parser import _normalize_text
+from app.services.today import day_bounds, group_for_page, portal_today
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +69,9 @@ HTML_PAGE = r"""<!doctype html>
     <div id="link" class="link"></div>
   </div>
   <div id="digest" style="display:none">
-    <div class="digest-hint">👇 Нажмите на закон, чтобы посмотреть текст</div>
+    <div id="digest-hint" class="digest-hint">👇 Нажмите на закон, чтобы посмотреть текст</div>
+    <input type="search" id="search" class="search" placeholder="Поиск по заголовку" autocomplete="off" style="display:none">
+    <div id="nothing" class="digest-hint" style="display:none">Ничего не найдено</div>
     <div id="digest-list"></div>
   </div>
 </div>
@@ -181,16 +191,12 @@ HTML_PAGE = r"""<!doctype html>
 
   const params = new URLSearchParams(window.location.search);
   const idsParam = params.get('ids');
-  if (idsParam) {
+  const viewToday = params.get('view') === 'today';
+  if (idsParam || viewToday) {
     document.getElementById('single').style.display = 'none';
     const digestEl = document.getElementById('digest');
     const digestListEl = document.getElementById('digest-list');
     digestEl.style.display = 'block';
-    const ids = idsParam.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-    if (!ids.length) {
-      digestListEl.innerHTML = '<div class="error">Не переданы документы дайджеста. URL: ' + escapeHtml(window.location.href) + '</div>';
-      return;
-    }
     const origin = window.location.origin;
 
     // после временной неудачи (нет текста, сбой GigaChat) кнопку можно нажать снова только через минуту
@@ -365,6 +371,122 @@ HTML_PAGE = r"""<!doctype html>
         });
     }
 
+    // при разворачивании карточки без саммари перепроверяем: его мог сделать другой пользователь
+    function recheckSummary(details) {
+      if (!details.open || !details._loaded || details._busy || details._data.summary) return;
+      fetchFullText(details._id)
+        .then(function(fresh) {
+          if (details._busy || !fresh.summary) return;
+          mergeData(details._data, fresh);
+          renderCard(details, details._data, details._id);
+        })
+        .catch(function() { /* перепроверка не критична */ });
+    }
+
+    // ---- режим «сегодня»: список из /today_list, тексты — по первому раскрытию карточки ----
+    const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+    function ruDate(iso) {
+      const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      return m ? parseInt(m[3], 10) + ' ' + MONTHS[parseInt(m[2], 10) - 1] : String(iso);
+    }
+    function normSearch(s) { return String(s).toLowerCase().replace(/ё/g, 'е'); }
+
+    function buildTodayCard(item) {
+      const details = document.createElement('details');
+      details.className = 'doc';
+      const summary = document.createElement('summary');
+      summary.innerHTML = '<span class="doc-head-title">' + escapeHtml(item.title || item.external_id) + '</span>' +
+        (item.summary ? sumHtml(item.summary, 'sum-preview') : '');
+      const body = document.createElement('div');
+      body.className = 'doc-body loading';
+      body.textContent = 'Загрузка текста закона…';
+      details.appendChild(summary);
+      details.appendChild(body);
+      details.addEventListener('toggle', function() {
+        if (!details.open || details._busy) return;
+        if (details._loaded) { recheckSummary(details); return; }
+        if (details._loading) return;
+        details._loading = true;
+        fetchFullText(item.external_id)
+          .then(function(data) { renderCard(details, data, item.external_id); })
+          .catch(function(err) {
+            body.textContent = 'Не удалось загрузить текст: ' + err.message;
+            body.className = 'doc-body error';
+          })
+          .then(function() { details._loading = false; });
+      });
+      return details;
+    }
+
+    function loadToday() {
+      const hintEl = document.getElementById('digest-hint');
+      const searchEl = document.getElementById('search');
+      const nothingEl = document.getElementById('nothing');
+      hintEl.textContent = 'Загрузка…';
+      fetch(origin + '/today_list')
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(res) {
+          hintEl.textContent = 'Законы, опубликованные на портале сегодня, ' + ruDate(res.date) +
+            '. Список пополняется в течение дня.' + (res.total ? ' Всего: ' + res.total + '.' : '');
+          if (!res.total) {
+            digestListEl.innerHTML = '<div class="unavailable">Сегодня пока ничего не опубликовано</div>';
+            return;
+          }
+          const groups = res.groups.map(function(g) {
+            const el = document.createElement('details');
+            el.className = 'group';
+            el.open = g.key === 'federal';
+            const head = document.createElement('summary');
+            head.className = 'group-head';
+            const count = document.createElement('span');
+            count.className = 'group-count';
+            head.appendChild(document.createTextNode(g.title + ' '));
+            head.appendChild(count);
+            el.appendChild(head);
+            const cards = g.items.map(function(item) {
+              const card = buildTodayCard(item);
+              el.appendChild(card);
+              return { el: card, norm: normSearch(item.title || '') };
+            });
+            digestListEl.appendChild(el);
+            return { key: g.key, el: el, count: count, cards: cards };
+          });
+          function applySearch() {
+            const q = normSearch(searchEl.value.trim());
+            let found = 0;
+            groups.forEach(function(g) {
+              let shown = 0;
+              g.cards.forEach(function(c) {
+                const match = !q || c.norm.includes(q);
+                c.el.hidden = !match;
+                if (match) shown++;
+              });
+              g.el.hidden = !!q && shown === 0;
+              g.el.open = q ? shown > 0 : g.key === 'federal';
+              g.count.textContent = q ? shown + ' из ' + g.cards.length : String(g.cards.length);
+              found += shown;
+            });
+            nothingEl.style.display = q && !found ? '' : 'none';
+          }
+          groups.forEach(function(g) { g.count.textContent = String(g.cards.length); });
+          searchEl.style.display = '';
+          searchEl.addEventListener('input', applySearch);
+        })
+        .catch(function(err) {
+          hintEl.textContent = '';
+          digestListEl.innerHTML = '<div class="error">Не удалось загрузить список: ' + escapeHtml(err.message) + '</div>';
+        });
+    }
+    if (viewToday) { loadToday(); return; }
+
+    const ids = idsParam.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    if (!ids.length) {
+      digestListEl.innerHTML = '<div class="error">Не переданы документы дайджеста. URL: ' + escapeHtml(window.location.href) + '</div>';
+      return;
+    }
     ids.forEach(function(rawId) {
       let id = rawId;
       try { id = decodeURIComponent(rawId); } catch (e) { /* оставляем как есть */ }
@@ -379,17 +501,7 @@ HTML_PAGE = r"""<!doctype html>
       details.appendChild(body);
       digestListEl.appendChild(details);
 
-      // при разворачивании карточки без саммари перепроверяем: его мог сделать другой пользователь
-      details.addEventListener('toggle', function() {
-        if (!details.open || !details._loaded || details._busy || details._data.summary) return;
-        fetchFullText(id)
-          .then(function(fresh) {
-            if (details._busy || !fresh.summary) return;
-            mergeData(details._data, fresh);
-            renderCard(details, details._data, id);
-          })
-          .catch(function() { /* перепроверка не критична */ });
-      });
+      details.addEventListener('toggle', function() { recheckSummary(details); });
 
       fetchFullText(id)
         .then(function(data) { renderCard(details, data, id); })
@@ -515,6 +627,53 @@ async def handle_full_text(request: web.Request) -> web.Response:
         )
 
 
+async def handle_today_list(request: web.Request) -> web.Response:
+    """Отдаёт JSON со списком актов за сегодня (по Москве), без текстов.
+
+    Параметров не принимает (лишние игнорируются): дату определяет сервер, поэтому
+    акты других дней через страницу недоступны. Ответ:
+    ``{date, total, groups: [{key, title, items: [{external_id, title, summary}]}]}``.
+    """
+    start, end = day_bounds(today := portal_today())
+    stmt = (
+        select(
+            Article.external_id,
+            Article.title,
+            Article.summary,
+            Article.level,
+            Article.importance,
+        )
+        .where(Article.published_at >= start, Article.published_at < end)
+        .where(Article.is_demo.is_(False))
+    )
+    try:
+        async with request.app["session_maker"]() as session:
+            articles = (await session.execute(stmt)).all()
+    except Exception:
+        logger.exception("handle_today_list: error")
+        return web.json_response({"error": "internal error"}, status=500, headers=CORS)
+
+    groups = [
+        {
+            "key": key,
+            "title": title,
+            "items": [
+                {
+                    "external_id": a.external_id,
+                    "title": _normalize_text(a.title) or a.title,
+                    "summary": a.summary or None,
+                }
+                for a in items
+            ],
+        }
+        for key, title, items in group_for_page(articles)
+    ]
+    logger.info("handle_today_list: %s -> %d актов", today.isoformat(), len(articles))
+    return web.json_response(
+        {"date": today.isoformat(), "total": len(articles), "groups": groups}, headers=CORS
+    )
+
+
 def _verify_init_data(init_data: str, bot_token: str) -> int | None:
     """Проверяет подпись Telegram WebApp initData и возвращает user.id (иначе None).
 
@@ -626,6 +785,7 @@ def create_app(session_maker, config) -> web.Application:
     app["summarize_failed_at"] = {}  # external_id -> time.monotonic() последней временной неудачи
     app.router.add_get("/app", handle_app)
     app.router.add_get("/full_text", handle_full_text)
+    app.router.add_get("/today_list", handle_today_list)
     app.router.add_post("/summarize", handle_summarize)
     app.router.add_static("/static", STATIC_DIR)
     from app.webapp.admin import setup_admin  # здесь, а не наверху: admin импортирует этот модуль

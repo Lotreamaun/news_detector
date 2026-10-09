@@ -48,7 +48,7 @@ class Article(Base):
         server_default=text("0"),
     )
     # Заранее подготовленная статья-пример для онбординга (см. app/services/demo_article.py),
-    # не результат парсинга ленты — исключается из /latest.
+    # не результат парсинга ленты — исключается из /today и дайджестов.
     is_demo: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
