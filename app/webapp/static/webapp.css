@@ -60,9 +60,9 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .dark .toast { box-shadow: 0 2px 12px rgba(0, 0, 0, .5); }
 .doc-body { padding: 0 12px 12px 12px; }
 .doc-title { font-weight: 700; margin: 0 0 8px 0; }
-/* страница «сегодня»: поиск и группы (федеральные / региональные / прочие) со счётчиком */
+/* страница «сегодня»: поиск (16px — иначе iOS приближает страницу при фокусе) и группы (федеральные / региональные / прочие) со счётчиком */
 [hidden] { display: none !important; }
-.search { width: 100%; margin: 0 0 12px 0; padding: 9px 12px; font: inherit; font-size: 15px; color: var(--tg-theme-text-color, #222); background: var(--tg-theme-secondary-bg-color, #f1f1f4); border: 1px solid rgba(112, 117, 121, 0.25); border-radius: 8px; }
+.search { width: 100%; margin: 0 0 12px 0; padding: 9px 12px; font: inherit; font-size: 16px; color: var(--tg-theme-text-color, #222); background: var(--tg-theme-secondary-bg-color, #f1f1f4); border: 1px solid rgba(112, 117, 121, 0.25); border-radius: 8px; }
 .group { margin-bottom: 14px; }
 .group-head { cursor: pointer; font-size: 17px; font-weight: 700; padding: 6px 0 10px 0; }
 .group-count { font-weight: 400; font-size: 14px; color: var(--tg-theme-hint-color, #707579); }
