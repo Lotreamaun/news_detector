@@ -129,7 +129,7 @@ async def handle_login(request: web.Request) -> web.Response:
     if entry is None or entry[1] <= time.monotonic() or entry[0] not in config.ADMIN_CHAT_IDS:
         page = (
             '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">'
             '<title>Вход в панель</title><link rel="stylesheet" href="/static/webapp.css"></head>'
             '<body><div class="container"><h1 class="title">Ссылка недействительна</h1>'
             '<p class="error">Ссылка уже использована или истекла. Отправьте боту команду '
