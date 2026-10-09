@@ -175,7 +175,11 @@ and appends "…", which can end mid-sentence.
 ### Bot commands / handlers (`app/bot/handlers.py`, registered in `app/main.py`)
 
 - `/start` — registers the user (`users.telegram_id`, unique).
-- `/latest` — last 30 days of ФКЗ/ФЗ.
+- `/today` — all acts published today (`published_at` = today in Moscow, see
+  `app/services/today.py`), ignoring `UserFilter`: one teaser with group counters
+  (Федеральные / Региональные / Прочие, group by `external_id` prefix `00`), top‑3 by
+  importance and a "Все за сегодня" Mini-App button. Empty day → "Сегодня пока ничего
+  не опубликовано".
 - `/summary` — force-summarize a law by id/link; rate-limited per user per
   month via `SummarizationUsage` (`FORCE_SUMMARIZE_MONTHLY_LIMIT`); chat IDs
   in `ADMIN_CHAT_IDS` are exempt from the limit.
@@ -188,7 +192,7 @@ and appends "…", which can end mid-sentence.
 - Onboarding: `/start` registers the user and, if `REQUIRED_CHANNEL_ID` is set,
   asks to subscribe to the channel (`check_subscription` callback); a "show
   example" button sends the demo article (`app/services/demo_article.py`,
-  `is_demo`, hidden from `/latest` and digests). Other commands/callbacks are
+  `is_demo`, hidden from `/today` and digests). Other commands/callbacks are
   wrapped in `require_channel_verified` (default-deny, no admin bypass).
 - Full-text button opens the Mini-App (`app/webapp/server.py`), which only
   appears when `WEBAPP_URL` is set (Telegram requires HTTPS for WebApps).
@@ -197,7 +201,10 @@ and appends "…", which can end mid-sentence.
 
 aiohttp server started from `post_init` on `WEBAPP_HOST:WEBAPP_PORT`. Routes:
 `GET /app?external_id=` (one law) and `GET /app?ids=a,b,…` (digest accordion,
-capped by `DIGEST_ID_CAP`), `GET /full_text` (JSON with title, url, text,
+capped by `DIGEST_ID_CAP`), `GET /app?view=today` (all acts published today: groups,
+title search, full text loaded lazily on first expand) with its light JSON
+`GET /today_list` (no params — the date is always today in Moscow, server-side),
+`GET /full_text` (JSON with title, url, text,
 `is_text_available`, `summary`), `POST /summarize` (force-summarize a digest
 card; the user is identified by Telegram `initData` signature) and `GET /health`.
 After a temporary summarize failure for a document there is a 60 s cooldown
@@ -231,6 +238,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
 | `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |
 | `app/models/weekly_digest_run.py` | `WeeklyDigestRun` — one row per sent weekly period (idempotency) |
+| `app/services/today.py` | Pure rules for `/today`: Moscow "today" and day bounds, `scope_of` (group by `external_id`), importance order, `pick_top`, `group_for_page` |
 | `app/services/weekly_review.py` | Moderation rules without HTTP/DB: `final_selection`, `target_period`, short title, Markdown export |
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |

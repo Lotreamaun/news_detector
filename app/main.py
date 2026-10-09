@@ -19,7 +19,6 @@ from app.bot.handlers import (
     force_summarize,
     force_summarize_digest,
     help_command,
-    latest,
     level_wizard_handler,
     onboarding_show_example,
     require_channel_verified,
@@ -27,6 +26,7 @@ from app.bot.handlers import (
     start,
     summary_command,
     test_digest_command,
+    today,
 )
 from app.core.config import Config
 from app.core.database import (
@@ -132,7 +132,7 @@ def _build_application(config: Config) -> Application:
     )
     application.add_handler(CallbackQueryHandler(check_subscription, pattern=r"^check_subscription$"))
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("latest", require_channel_verified(latest)))
+    application.add_handler(CommandHandler("today", require_channel_verified(today)))
     application.add_handler(CommandHandler("help", require_channel_verified(help_command)))
     application.add_handler(CommandHandler("summary", require_channel_verified(summary_command)))
     application.add_handler(
@@ -266,7 +266,7 @@ async def _register_commands(application: Application) -> None:
     """Регистрирует список команд бота (видно при наборе '/' в чате)."""
     commands = [
         BotCommand("start", "Регистрация пользователя"),
-        BotCommand("latest", "Последние ФКЗ/ФЗ за 30 дней"),
+        BotCommand("today", "Законы, опубликованные сегодня"),
         BotCommand("summary", "Принудительно сделать саммари закона"),
         BotCommand("settings", "Настройка фильтров"),
         BotCommand("help", "Справка по командам"),

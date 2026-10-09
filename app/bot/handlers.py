@@ -14,6 +14,7 @@ from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
 from app.services.force_summary import force_summarize as run_force_summarize
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
+from app.services.today import FEDERAL, OTHER, REGIONAL, day_bounds, pick_top, portal_today, scope_of
 from app.services.weekly_review import moderation_unavailable_reason
 from app.webapp.admin import issue_login_token, login_url
 from app.services.scheduler import (
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = (
     "Доступные команды:\n"
     "/start — регистрация и настройка фильтров\n"
-    "/latest — последние федеральные законы (ФКЗ/ФЗ) за 30 дней\n"
+    "/today — законы, опубликованные сегодня\n"
     "/settings — настройка фильтров\n"
     "/summary <id или ссылка> — принудительно сделать саммари\n"
     "/help — эта справка"
@@ -449,7 +450,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Привет! Присылаю саммари новых законов по твоим фильтрам.\n"
             "Команды:\n"
-            "/latest — последние ФКЗ/ФЗ за 30 дней\n"
+            "/today — законы, опубликованные сегодня\n"
             "/settings — настройка фильтров\n"
             "/summary <id> — принудительно саммари\n"
             "/help — справка",
@@ -519,7 +520,7 @@ async def _send_example_notification(query, context: ContextTypes.DEFAULT_TYPE) 
                 select(Article).where(Article.is_demo == True).limit(1)  # noqa: E712
             )
     if article is None:
-        await query.message.reply_text("Пока нет законов для примера. Попробуйте позже: /latest")
+        await query.message.reply_text("Пока нет законов для примера. Попробуйте позже")
         return
     text, reply_markup = _build_notification(article, context.bot_data["config"].WEBAPP_URL)
     # шлём как тестовое уведомление в тот же чат
@@ -532,7 +533,7 @@ async def _send_example_notification(query, context: ContextTypes.DEFAULT_TYPE) 
         )
     except Exception:
         logger.exception("Не удалось отправить пример уведомления")
-        await query.message.reply_text("Не удалось показать пример. Попробуйте /latest")
+        await query.message.reply_text("Не удалось показать пример. Попробуйте позже")
 
 
 async def show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -656,43 +657,81 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_TEXT)
 
 
-async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /latest: последние ФКЗ/ФЗ за 30 дней (без учёта фильтров юзера)."""
+def _build_today_message(
+    articles: list, webapp_url: str | None = None
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """MarkdownV2-тизер ``/today``: число актов дня, счётчики групп, до 3 самых важных и кнопка Mini-App.
+
+    ``articles`` — все акты дня (нужны для счётчиков); показываются первые три по
+    порядку важности (``pick_top``). Блок акта оформлен как в ``_build_digest``. Кнопка
+    «Все за сегодня» открывает страницу дня без даты: её определяет сервер. Без
+    ``webapp_url`` нет ни кнопки, ни подсказки.
+    """
+    counts = {FEDERAL: 0, REGIONAL: 0, OTHER: 0}
+    for article in articles:
+        counts[scope_of(article.external_id)] += 1
+    stats = f"Федеральные — {counts[FEDERAL]} · Региональные — {counts[REGIONAL]}"
+    if counts[OTHER]:
+        stats += f" · Прочие — {counts[OTHER]}"
+
+    lines: list[str] = [
+        f"*{escape_markdown(f'Опубликовано сегодня — {len(articles)}', version=2)}*",
+        escape_markdown(stats, version=2),
+    ]
+    for i, article in enumerate(pick_top(articles), 1):
+        title_clean = _normalize_text(article.title) or article.title
+        title_esc = escape_markdown(f"{i}. {title_clean}", version=2)
+        url_esc = escape_markdown(article.url, version=2)
+        if article.summary:
+            summary_clean = _normalize_text(article.summary) or article.summary
+            summary_esc = escape_markdown(summary_clean, version=2)
+            lines.append(f"*{title_esc}*\n{summary_esc}\n[Читать на портале]({url_esc})")
+        else:
+            lines.append(f"*{title_esc}*\n[Читать на портале]({url_esc})")
+
+    markup = None
+    if webapp_url:
+        lines.append(escape_markdown("Все акты дня и поиск по заголовку — по кнопке ниже", version=2))
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📖 Все за сегодня",
+                        web_app=WebAppInfo(url=f"{webapp_url.rstrip('/')}/app?view=today"),
+                    )
+                ]
+            ]
+        )
+    return "\n\n".join(lines), markup
+
+
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /today: все акты, опубликованные сегодня (по Москве), без учёта фильтров юзера."""
     if update.message is None:
         return
 
-    session_maker = _session_maker(context)
-
-    since = _window_start(days=30)
+    start, end = day_bounds(portal_today())
     stmt = (
-        select(Article)
-        .where(Article.published_at >= since)
-        .where(Article.level.in_(["FKZ", "FZ"]))
+        select(
+            Article.external_id,
+            Article.title,
+            Article.summary,
+            Article.url,
+            Article.level,
+            Article.importance,
+        )
+        .where(Article.published_at >= start, Article.published_at < end)
         .where(Article.is_demo.is_(False))
-        .order_by(Article.published_at.desc())
-        .limit(10)
     )
-
-    async with session_maker() as session:
-        articles = (await session.scalars(stmt)).all()
+    async with _session_maker(context)() as session:
+        articles = (await session.execute(stmt)).all()
 
     if not articles:
-        await update.message.reply_text("Пока нет федеральных законов за последние 30 дней")
+        await update.message.reply_text("Сегодня пока ничего не опубликовано")
         return
 
-    header_title = escape_markdown("Федеральные законы за последние 30 дней", version=2)
-    lines: list[str] = [f"*{header_title}*"]
-    for i, article in enumerate(articles, 1):
-        header = _format_summary(
-            (article.summary or "")[:200],
-            f"{i}. {article.title}",
-        )
-        block = f"{header}\n\n{_full_text_block(article.url)}"
-        lines.append(block)
-
-    await update.message.reply_text(
-        "\n\n".join(lines), parse_mode="MarkdownV2"
-    )
+    text, markup = _build_today_message(articles, context.bot_data["config"].WEBAPP_URL)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="MarkdownV2")
 
 
 async def _get_or_create_user(
