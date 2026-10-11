@@ -288,7 +288,7 @@ This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
 `legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
 `digest-notifications`, `force-summarization`, `law-importance-scoring`,
-`weekly-important-digest`, `deployment`); `openspec/changes/` holds
+`weekly-important-digest`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
 in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
 change), finished ones moved under `openspec/changes/archive/` (dated). There
 are currently no active changes; `law-sphere-filter` and `law-region-filter`
