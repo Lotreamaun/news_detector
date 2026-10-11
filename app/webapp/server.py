@@ -12,7 +12,10 @@
   GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available, summary}
   POST /summarize                      — принудительная саммаризация из карточки дайджеста
                                           (JSON {external_id, init_data}); пользователь
-                                          определяется по подписанному Telegram initData
+                                          определяется по подписанному Telegram initData;
+                                          в ответе — актуальный счётчик попыток ``usage``
+  POST /usage                          — счётчик попыток саммари пользователя
+                                          (JSON {init_data} -> {used, limit, unlimited, resets_on})
 
 Режим ``ids`` переиспользует существующий ``/full_text`` (по одному запросу на
 документ), а не отдельный batch-эндпоинт — проще и достаточно для размеров
@@ -37,6 +40,7 @@ from sqlalchemy import select
 from app.models import Article, User
 from app.services.force_summary import force_summarize
 from app.services.rss_parser import _normalize_text
+from app.services.summary_usage import NO_SPEND_NOTE, SummaryUsage, get_summary_usage, limit_message
 from app.services.today import day_bounds, group_for_page, portal_today
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,10 @@ HTML_PAGE = r"""<!doctype html>
 <body>
 <div class="container">
   <div class="beta">Beta</div>
+  <div id="usage" class="usage" hidden>
+    <button type="button" id="usage-chip" class="usage-chip" aria-expanded="false" aria-controls="usage-tip"></button>
+    <div id="usage-tip" class="usage-tip unavailable" role="status" hidden></div>
+  </div>
   <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки.</div>
   <div id="single">
     <h1 id="title" class="title loading">Загрузка…</h1>
@@ -204,6 +212,62 @@ HTML_PAGE = r"""<!doctype html>
     const toastEl = document.getElementById('toast');
     let toastTimer = null;
     let toastTick = null;
+    // ---- счётчик попыток саммари: чип сверху страницы + плашка-пояснение по нажатию ----
+    const USAGE_TIP_MS = 8000;
+    const usageEl = document.getElementById('usage');
+    const usageChipEl = document.getElementById('usage-chip');
+    const usageTipEl = document.getElementById('usage-tip');
+    let usage = null;
+    let usageTipTimer = null;
+    function hideUsageTip() {
+      clearTimeout(usageTipTimer);
+      usageTipEl.hidden = true;
+      usageChipEl.setAttribute('aria-expanded', 'false');
+    }
+    function usageTipText(u) {
+      if (u.unlimited) return 'Для вас ограничений на саммари нет.';
+      const when = ruDate(u.resets_on);
+      if (u.used >= u.limit) {
+        return 'Все попытки саммари на этот месяц использованы (' + u.used + '/' + u.limit + '). Новые появятся ' + when +
+          '. Без попыток доступны готовые саммари, а также ФЗ, ФКЗ и Конституция.';
+      }
+      return 'Использовано ' + u.used + ' из ' + u.limit + ' попыток саммари в этом месяце. Попытка тратится на создание нового саммари. ' +
+        'Готовые саммари, ФЗ, ФКЗ, Конституция и неудачные попытки её не тратят. Обновится ' + when + '.';
+    }
+    function renderUsage() {
+      if (!usage) { usageEl.hidden = true; return; }
+      usageEl.hidden = false;
+      usageChipEl.textContent = 'Саммари ' + (usage.unlimited ? '∞' : usage.used + '/' + usage.limit);
+      usageChipEl.classList.toggle('out', !usage.unlimited && usage.used >= usage.limit);
+      usageTipEl.textContent = usageTipText(usage);
+    }
+    function setUsage(u) {
+      if (!u || typeof u.used !== 'number') return;
+      usage = u;
+      renderUsage();
+    }
+    function loadUsage() {
+      if (!tg || !tg.initData) return;
+      fetch(origin + '/usage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ init_data: tg.initData })
+      })
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(setUsage)
+        .catch(function() { /* без счётчика страница работает как раньше */ });
+    }
+    usageChipEl.addEventListener('click', function() {
+      if (!usageTipEl.hidden) { hideUsageTip(); return; }
+      usageTipEl.hidden = false;
+      usageChipEl.setAttribute('aria-expanded', 'true');
+      clearTimeout(usageTipTimer);
+      usageTipTimer = setTimeout(hideUsageTip, USAGE_TIP_MS);
+    });
+    document.addEventListener('click', function(e) {
+      if (!usageEl.contains(e.target)) hideUsageTip();
+    });
+
     function hideToast() {
       toastEl.classList.remove('show');
       clearTimeout(toastTimer);
@@ -213,6 +277,7 @@ HTML_PAGE = r"""<!doctype html>
     // until — конец кулдауна: тогда под сообщением идёт живой обратный отсчёт
     function showToast(message, until) {
       if (!message) return;
+      hideUsageTip();
       clearTimeout(toastTimer);
       clearInterval(toastTick);
       toastEl.innerHTML = '<div class="toast-text"></div><div class="toast-count"></div>';
@@ -340,6 +405,7 @@ HTML_PAGE = r"""<!doctype html>
         .then(function(res) {
           details._busy = false;
           if (res.stop) { setActionState(details, res.stop, false); showToast(res.stop); return; }
+          setUsage(res.usage);
           mergeData(data, res);
           const final = res.status === 'limit' || res.status === 'refused';
           if (res.status === 'no_text' || res.status === 'error' || res.status === 'cooldown') {
@@ -480,6 +546,7 @@ HTML_PAGE = r"""<!doctype html>
           digestListEl.innerHTML = '<div class="error">Не удалось загрузить список: ' + escapeHtml(err.message) + '</div>';
         });
     }
+    loadUsage();
     if (viewToday) { loadToday(); return; }
 
     const ids = idsParam.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
@@ -698,6 +765,65 @@ def _verify_init_data(init_data: str, bot_token: str) -> int | None:
         return None
 
 
+async def _auth_user(request: web.Request, init_data: str) -> User | web.Response:
+    """Проверяет initData, находит пользователя и гейт канала.
+
+    Возвращает ``User`` либо готовый ответ-отказ (401 — подпись, 403 — неизвестный
+    пользователь или нет подписки на канал). Общая часть ``/summarize`` и ``/usage``.
+    """
+    config = request.app["config"]
+    telegram_id = _verify_init_data(init_data, config.TELEGRAM_BOT_TOKEN)
+    if telegram_id is None:
+        return web.json_response({"error": "unauthorized"}, status=401, headers=CORS)
+    async with request.app["session_maker"]() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+    if user is None:
+        return web.json_response(
+            {"message": "Откройте бота и нажмите /start."}, status=403, headers=CORS
+        )
+    if config.REQUIRED_CHANNEL_ID and not user.channel_verified:
+        return web.json_response(
+            {"message": "Подтвердите подписку на канал в боте."}, status=403, headers=CORS
+        )
+    return user
+
+
+def _usage_json(usage: SummaryUsage) -> dict:
+    """Счётчик попыток в формате ответов Mini-App."""
+    return {
+        "used": usage.used,
+        "limit": usage.limit,
+        "unlimited": usage.unlimited,
+        "resets_on": usage.resets_on.isoformat(),
+    }
+
+
+def _with_note(message: str, usage: SummaryUsage) -> str:
+    """Дописывает «Попытка не потрачена.» к сообщению о неудаче, если пользователь ограничен лимитом."""
+    return message if usage.unlimited else f"{message} {NO_SPEND_NOTE}"
+
+
+async def handle_usage(request: web.Request) -> web.Response:
+    """Счётчик попыток саммари пользователя (JSON {init_data}); без обращения к модели.
+
+    Ошибки — как у ``/summarize``: 400 плохой запрос, 401 подпись, 403 нет доступа, 500 сбой.
+    """
+    try:
+        payload = await request.json()
+        init_data = str(payload.get("init_data") or "")
+    except (ValueError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400, headers=CORS)
+    try:
+        user = await _auth_user(request, init_data)
+        if isinstance(user, web.Response):
+            return user
+        usage = await get_summary_usage(request.app["config"], request.app["session_maker"], user)
+        return web.json_response(_usage_json(usage), headers=CORS)
+    except Exception:
+        logger.exception("handle_usage: error")
+        return web.json_response({"error": "internal error"}, status=500, headers=CORS)
+
+
 async def handle_summarize(request: web.Request) -> web.Response:
     """Принудительная саммаризация документа из карточки дайджеста.
 
@@ -716,33 +842,26 @@ async def handle_summarize(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing external_id"}, status=400, headers=CORS)
 
     config = request.app["config"]
-    telegram_id = _verify_init_data(init_data, config.TELEGRAM_BOT_TOKEN)
-    if telegram_id is None:
-        return web.json_response({"error": "unauthorized"}, status=401, headers=CORS)
-
     try:
         session_maker = request.app["session_maker"]
-        async with session_maker() as session:
-            user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
-        if user is None:
-            return web.json_response(
-                {"message": "Откройте бота и нажмите /start."}, status=403, headers=CORS
-            )
-        if config.REQUIRED_CHANNEL_ID and not user.channel_verified:
-            return web.json_response(
-                {"message": "Подтвердите подписку на канал в боте."}, status=403, headers=CORS
-            )
+        user = await _auth_user(request, init_data)
+        if isinstance(user, web.Response):
+            return user
 
         failed_at: dict[str, float] = request.app["summarize_failed_at"]
         left = SUMMARIZE_COOLDOWN_SECONDS - (time.monotonic() - failed_at.get(external_id, float("-inf")))
         if left > 0:
             retry_after = int(left) + 1
-            logger.info("handle_summarize: user=%s %s -> cooldown %ss", telegram_id, external_id, retry_after)
+            logger.info("handle_summarize: user=%s %s -> cooldown %ss", user.telegram_id, external_id, retry_after)
+            usage = await get_summary_usage(config, session_maker, user)
             return web.json_response(
                 {
                     "status": "cooldown",
                     "retry_after": retry_after,
-                    "message": f"Саммари сейчас не получить. Попробуйте через {retry_after} сек.",
+                    "message": _with_note(
+                        f"Саммари сейчас не получить. Попробуйте через {retry_after} сек.", usage
+                    ),
+                    "usage": _usage_json(usage),
                 },
                 headers=CORS,
             )
@@ -752,16 +871,16 @@ async def handle_summarize(request: web.Request) -> web.Response:
             failed_at[external_id] = time.monotonic()
         else:
             failed_at.pop(external_id, None)
+        usage = await get_summary_usage(config, session_maker, user)
         messages = {
-            "limit": (
-                f"Месячный лимит саммаризаций ({config.FORCE_SUMMARIZE_MONTHLY_LIMIT}) "
-                "исчерпан. Попробуйте в следующем месяце."
+            "limit": limit_message(usage),
+            "no_text": _with_note("Не удалось получить текст закона. Попробуйте позже.", usage),
+            "refused": _with_note(
+                "Языковая модель отказалась сформировать саммари для этого документа.", usage
             ),
-            "no_text": "Не удалось получить текст закона. Попробуйте позже.",
-            "refused": "Языковая модель отказалась сформировать саммари для этого документа.",
-            "error": "Не удалось сделать саммари. Попробуйте позже.",
+            "error": _with_note("Не удалось сделать саммари. Попробуйте позже.", usage),
         }
-        logger.info("handle_summarize: user=%s %s -> %s", telegram_id, external_id, result.status)
+        logger.info("handle_summarize: user=%s %s -> %s", user.telegram_id, external_id, result.status)
         return web.json_response(
             {
                 "status": result.status,
@@ -769,6 +888,7 @@ async def handle_summarize(request: web.Request) -> web.Response:
                 "text": result.text,
                 "is_text_available": bool(result.text and result.text.strip()),
                 "message": messages.get(result.status),
+                "usage": _usage_json(usage),
             },
             headers=CORS,
         )
@@ -787,6 +907,7 @@ def create_app(session_maker, config) -> web.Application:
     app.router.add_get("/full_text", handle_full_text)
     app.router.add_get("/today_list", handle_today_list)
     app.router.add_post("/summarize", handle_summarize)
+    app.router.add_post("/usage", handle_usage)
     app.router.add_static("/static", STATIC_DIR)
     from app.webapp.admin import setup_admin  # здесь, а не наверху: admin импортирует этот модуль
 
