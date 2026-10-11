@@ -32,6 +32,7 @@ from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
 from app.models import Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing
+from app.services.force_summary import inflight_task
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.importance import (
     CANDIDATE_LEVELS,
@@ -429,7 +430,41 @@ async def _summarize_in_background(
     Отказ или сбой ничего не пишет в ``Article.summary``: заглушка подставляется только
     при сборке недельного сообщения, иначе она стала бы «кэшированным саммари» для
     /summary и кнопок. Расход лимитов пользователей не затрагивается.
+
+    Уступает пользовательской саммаризации: сначала перечитывает саммари из БД (есть —
+    модель не вызывается), затем, если по документу идёт принудительная саммаризация,
+    дожидается её итога вместо своей работы.
     """
+    async with session_maker() as session:
+        saved = await session.scalar(select(Article.summary).where(Article.id == article.id))
+    if saved:
+        article.summary = saved
+        logger.info("Фоновое саммари %s: уже в БД — пропускаем", article.external_id)
+        return
+
+    task = inflight_task(article.external_id)
+    if task is not None:
+        logger.info(
+            "Фоновое саммари %s: ждём пользовательскую саммаризацию", article.external_id
+        )
+        result = await asyncio.shield(task)
+        if result.status == "ok" and result.summary:
+            await _update_article(session_maker, article.id, summary=result.summary)
+            article.summary = result.summary
+            if result.text and not article.original_text:
+                await _update_article(session_maker, article.id, original_text=result.text)
+                article.original_text = result.text
+            logger.info(
+                "Фоновое саммари %s: взято из пользовательской саммаризации", article.external_id
+            )
+        else:
+            logger.info(
+                "Фоновое саммари %s: пользовательская саммаризация не удалась (%s)",
+                article.external_id,
+                result.status,
+            )
+        return
+
     text = article.original_text
     if not text:
         text = await get_legal_text(article.external_id)

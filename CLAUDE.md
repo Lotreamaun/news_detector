@@ -117,7 +117,8 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      for routine decrees → `0` without LLM), else GigaChat by a rubric
      (`app/services/importance.py`; input = summary, else start of text; no
      text yet → scoring deferred). Score `≥ 2` triggers a background summary
-     (text, or OCR if absent) if there is none.
+     (text, or OCR if absent) if there is none; it yields to force-summarize: re-reads the
+     summary from the DB and waits for a running user task (`inflight_task`) instead of its own call.
    - Unscored candidates are retried ("backlog") at the end of every
      `check_legislation_updates` cycle (`_rate_backlog`, ≤14 days since
      `created_at`, ≤20 per cycle); no text for >24h → one OCR before scoring.
@@ -212,7 +213,10 @@ After a temporary summarize failure for a document there is a 60 s cooldown
 without calling GigaChat, for any user; the page shows a toast banner and a
 muted button with a countdown. Failures and cooldown do not consume the user's
 monthly limit. The force-summarize core is `app/services/force_summary.py`,
-shared with the bot (`/summary`, "Сделать саммари" buttons).
+shared with the bot (`/summary`, "Сделать саммари" buttons). At most one summarization runs per
+`external_id`: a repeated request (any entry point, any user) joins the running task and
+receives its result without a model call or spending the user's limit; only the initiator is
+charged, on success (`ForceSummaryResult.from_cache` = taken from the DB, never charged).
 
 ### Deployment
 
@@ -243,7 +247,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
-| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling) |
+| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`) |
 | `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
 | `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |
 | `app/services/demo_article.py` | Constants of the onboarding demo article |
