@@ -65,11 +65,11 @@ HTML_PAGE = r"""<!doctype html>
 <body>
 <div class="container">
   <div class="beta">Beta</div>
+  <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки.</div>
   <div id="usage" class="usage" hidden>
     <button type="button" id="usage-chip" class="usage-chip" aria-expanded="false" aria-controls="usage-tip"></button>
     <div id="usage-tip" class="usage-tip unavailable" role="status" hidden></div>
   </div>
-  <div class="disclaimer">⚠️ Текст распознан с помощью ИИ, возможны ошибки.</div>
   <div id="single">
     <h1 id="title" class="title loading">Загрузка…</h1>
     <div id="date" class="date"></div>
