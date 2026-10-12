@@ -14,6 +14,7 @@ from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
 from app.services.force_summary import force_summarize as run_force_summarize
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
+from app.services.summary_usage import format_reset_date, get_summary_usage, limit_message
 from app.services.today import FEDERAL, OTHER, REGIONAL, day_bounds, pick_top, portal_today, scope_of
 from app.services.weekly_review import moderation_unavailable_reason
 from app.webapp.admin import issue_login_token, login_url
@@ -134,6 +135,26 @@ async def _show_level_step(update: Update, context: ContextTypes.DEFAULT_TYPE, u
     return LEVEL_STATE
 
 
+async def _usage_line(context: ContextTypes.DEFAULT_TYPE, user: User) -> str | None:
+    """Строка со счётчиком попыток саммари для /settings; при сбое чтения — None."""
+    try:
+        usage = await get_summary_usage(
+            context.bot_data["config"], _session_maker(context), user
+        )
+    except Exception:
+        logger.exception("Не удалось получить счётчик саммари для /settings")
+        return None
+    when = format_reset_date(usage.resets_on)
+    if usage.unlimited:
+        return "Саммари по запросу: без ограничений."
+    if usage.used >= usage.limit:
+        return (
+            f"Саммари по запросу: {usage.used}/{usage.limit} — попытки закончились. "
+            f"Новые появятся {when}."
+        )
+    return f"Саммари по запросу: {usage.used}/{usage.limit} в этом месяце. Обновится {when}."
+
+
 async def level_wizard_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point для /start (новый) и /settings — показывает приветствие визарда."""
     if update.effective_user is None:
@@ -148,6 +169,9 @@ async def level_wizard_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Настроим подписку (30 сек):\n"
         "Выберите по силе — какие законы получать."
     )
+    usage_line = await _usage_line(context, user)
+    if usage_line:
+        text += f"\n\n{usage_line}"
     markup = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Настроить", callback_data="wizard:setup")],
@@ -823,11 +847,8 @@ async def _summarize_and_reply(
             reply_markup=reply_markup,
         )
     elif result.status == "limit":
-        limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
-        fallback = (
-            f"Месячный лимит принудительных саммаризаций ({limit}) исчерпан. "
-            "Попробуйте в следующем месяце."
-        )
+        usage = await get_summary_usage(config, _session_maker(context), user)
+        fallback = limit_message(usage)
         await _deliver_summary_failure(
             context, user, message, status_message,
             config, result.title_known, result.title, result.url, external_id, fallback,

@@ -207,7 +207,10 @@ title search, full text loaded lazily on first expand) with its light JSON
 `GET /today_list` (no params — the date is always today in Moscow, server-side),
 `GET /full_text` (JSON with title, url, text,
 `is_text_available`, `summary`), `POST /summarize` (force-summarize a digest
-card; the user is identified by Telegram `initData` signature) and `GET /health`.
+card; the user is identified by Telegram `initData` signature; every domain
+outcome carries a fresh `usage`), `POST /usage` (`{init_data}` → `{used, limit,
+unlimited, resets_on}`; counter chip on digest/today pages, same auth as
+`/summarize` via `_auth_user`) and `GET /health`.
 After a temporary summarize failure for a document there is a 60 s cooldown
 (`SUMMARIZE_COOLDOWN_SECONDS`, in-memory `app["summarize_failed_at"]`) answered
 without calling GigaChat, for any user; the page shows a toast banner and a
@@ -247,6 +250,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
+| `app/services/summary_usage.py` | Read-only summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
 | `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`; its GigaChat clients use `priority="user"`) |
 | `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
 | `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |
@@ -288,7 +292,7 @@ This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
 `legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
 `digest-notifications`, `force-summarization`, `law-importance-scoring`,
-`weekly-important-digest`, `deployment`); `openspec/changes/` holds
+`weekly-important-digest`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
 in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
 change), finished ones moved under `openspec/changes/archive/` (dated). There
 are currently no active changes; `law-sphere-filter` and `law-region-filter`

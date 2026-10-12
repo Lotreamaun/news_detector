@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Literal
 
 from sqlalchemy import select
@@ -28,6 +27,7 @@ from app.services.rss_parser import (
     ocr_document_text,
 )
 from app.services.summarizer import Summarizer, SummarizerConfig
+from app.services.summary_usage import current_month
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ async def force_summarize(
         return await asyncio.shield(task)
 
     is_admin = user.telegram_id in getattr(config, "ADMIN_CHAT_IDS", ())
-    month = datetime.now().strftime("%Y-%m")
+    month = current_month()
     limit = config.FORCE_SUMMARIZE_MONTHLY_LIMIT
 
     # title/url берём из сохранённой записи — они нужны во всех исходах ниже
