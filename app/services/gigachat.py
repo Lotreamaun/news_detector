@@ -19,6 +19,9 @@ import re
 import ssl
 import time
 import uuid
+from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -32,6 +35,77 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 60
 # Ретраится только: сетевые ошибки, таймауты, 429, 5xx.
 # Остальные HTTP-ошибки (400, 401, 403 и т.д.) падают сразу.
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# -- Очередь запросов на процесс -----------------------------------------------
+# У ключа GigaChat один поток, а клиентов в процессе много (планировщик,
+# force-summarize, OCR), поэтому очередь модульная, а не на экземпляр клиента.
+# Все запросы к API идут по одному; пользовательские — вперёд фоновых,
+# внутри приоритета — FIFO. Выполняющийся запрос не прерывается.
+
+Priority = Literal["user", "background"]
+
+_stream_busy = False
+_waiting: dict[Priority, deque[asyncio.Future[None]]] = {
+    "user": deque(),
+    "background": deque(),
+}
+
+
+def _release() -> None:
+    """Передаёт поток первому неотменённому ожидающему (user, затем background)."""
+    global _stream_busy
+    for priority in ("user", "background"):
+        queue = _waiting[priority]
+        while queue:
+            fut = queue.popleft()
+            if not fut.done():
+                fut.set_result(None)  # поток передан «из рук в руки», флаг остаётся
+                return
+    _stream_busy = False
+
+
+def calls_ahead_of_user() -> int:
+    """Сколько вызовов API окажется впереди нового пользовательского запроса.
+
+    ``1`` при занятом потоке плюс число неотменённых ожидающих пользовательских.
+    Только чтение.
+    """
+    waiting_users = sum(1 for fut in _waiting["user"] if not fut.done())
+    return (1 if _stream_busy else 0) + waiting_users
+
+
+@asynccontextmanager
+async def _stream_slot(priority: Priority) -> AsyncIterator[None]:
+    """Занимает единственный поток к API; выход из блока освобождает его."""
+    global _stream_busy
+    if not _stream_busy and not any(_waiting.values()):
+        _stream_busy = True
+    else:
+        ahead = calls_ahead_of_user() if priority == "user" else (
+            (1 if _stream_busy else 0) + sum(len(q) for q in _waiting.values())
+        )
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        _waiting[priority].append(fut)
+        started = time.monotonic()
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                _release()  # поток уже передан нам, но задачу отменили
+            else:
+                try:
+                    _waiting[priority].remove(fut)
+                except ValueError:
+                    pass
+            raise
+        logger.info(
+            "GigaChat: %s-запрос ждал очереди %.1f с (впереди было %d)",
+            priority, time.monotonic() - started, ahead,
+        )
+    try:
+        yield
+    finally:
+        _release()
 
 
 class GigaChatError(RuntimeError):
@@ -77,6 +151,10 @@ class GigaChatConfig:
         timeout: таймаут HTTP-запроса в секундах.
         max_retries: сколько раз повторить временную ошибку.
         verify_ssl: проверять ли TLS-сертификат.
+        priority: приоритет в общей очереди запросов процесса: ``"user"`` —
+            запрос живого пользователя (идёт вперёд фоновых), ``"background"`` —
+            работа планировщика и скрипты. По умолчанию фон: забытое поле не даёт
+            запросу обойти очередь.
     """
 
     auth_key: str
@@ -87,11 +165,15 @@ class GigaChatConfig:
     timeout: float = 60.0
     max_retries: int = 3
     verify_ssl: bool = False
+    priority: Priority = "background"
 
 
 class GigaChatClient:
     """
     Клиент к GigaChat: кэширует токен, делает запросы с ретраями.
+
+    Все запросы к API процесса (со всех клиентов) идут по одному,
+    пользовательские вперёд фоновых; OAuth-запрос токена вне очереди.
 
     Поддерживает ``async with GigaChatClient(config) as client:`` для
     автоматического управления сессией aiohttp.
@@ -167,8 +249,6 @@ class GigaChatClient:
             GigaChatAuthError: не задан ключ или не удалось получить токен.
             GigaChatAPIError: ошибка API или пустой ответ.
         """
-        token = await self.get_access_token()
-
         payload: dict[str, Any] = {
             "model": model or self._config.model,
             "messages": messages,
@@ -183,13 +263,12 @@ class GigaChatClient:
                 last["attachments"] = list(attachments)
                 payload["messages"] = [*messages[:-1], last]
 
-        data = await self._request_json(
+        data = await self._api_request(
             "POST",
             f"{self._config.api_base_url}/chat/completions",
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
             },
             json=payload,
         )
@@ -219,19 +298,14 @@ class GigaChatClient:
         Returns:
             Идентификатор загруженного файла.
         """
-        token = await self.get_access_token()
-
         form = aiohttp.FormData()
         form.add_field("purpose", purpose)
         form.add_field("file", data, filename=filename, content_type=mime)
 
-        body = await self._request_json(
+        body = await self._api_request(
             "POST",
             f"{self._config.api_base_url}/files",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
             data=form,
         )
         file_id = body.get("id")
@@ -251,28 +325,20 @@ class GigaChatClient:
             GigaChatAuthError: не задан ключ или не удалось получить токен.
             GigaChatAPIError: ошибка API.
         """
-        token = await self.get_access_token()
-        await self._request_json(
+        await self._api_request(
             "POST",
             f"{self._config.api_base_url}/files/{file_id}/delete",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
             expect_json=False,
         )
         logger.info("Файл %s удалён из хранилища GigaChat", file_id)
 
     async def get_models(self) -> list[str]:
         """Возвращает список доступных моделей (для отладки и TODO-проверок)."""
-        token = await self.get_access_token()
-        data = await self._request_json(
+        data = await self._api_request(
             "GET",
             f"{self._config.api_base_url}/models",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
         )
         return [item.get("id", "") for item in data.get("data", [])]
 
@@ -343,6 +409,32 @@ class GigaChatClient:
 
         logger.info("Получен новый access-токен GigaChat (срок до %.0f)", self._token_expires_at)
         return str(token)
+
+    async def _api_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        data: Any | None = None,
+        json: Any | None = None,
+        expect_json: bool = True,
+    ) -> dict[str, Any]:
+        """Запрос к API в общей очереди процесса (ретраи — внутри слота).
+
+        Токен берётся уже внутри слота: ожидание очереди может занять минуты,
+        и заранее полученный токен успел бы протухнуть.
+        """
+        async with _stream_slot(self._config.priority):
+            token = await self.get_access_token()
+            return await self._request_json(
+                method,
+                url,
+                headers={**headers, "Authorization": f"Bearer {token}"},
+                data=data,
+                json=json,
+                expect_json=expect_json,
+            )
 
     async def _request_json(
         self,

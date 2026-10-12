@@ -237,7 +237,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/models/user_filter.py` | `UserFilter` — per-user legal-force filter rows |
 | `app/models/usage.py` | `SummarizationUsage` — monthly force-summarize counter |
 | `app/services/rss_parser.py` | pravo.gov.ru list/text/OCR + level classification |
-| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection) |
+| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection); one process-wide request queue: one API call at a time, `priority="user"` calls go ahead of `"background"` (default), `calls_ahead_of_user()` |
 | `app/services/summarizer.py` | Prompt + summarization logic |
 | `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
 | `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |
@@ -247,7 +247,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
-| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`) |
+| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`; its GigaChat clients use `priority="user"`) |
 | `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
 | `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |
 | `app/services/demo_article.py` | Constants of the onboarding demo article |

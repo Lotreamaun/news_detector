@@ -263,6 +263,7 @@ async def _summarize_document(
                 GigaChatConfig(
                     auth_key=config.GIGACHAT_AUTH_KEY,
                     verify_ssl=config.GIGACHAT_VERIFY_SSL,
+                    priority="user",
                 )
             ) as ocr_client:
                 text = await ocr_document_text(external_id, client=ocr_client)
@@ -290,6 +291,7 @@ async def _summarize_document(
                 min_len=config.SUMMARY_MIN_LEN,
                 max_len=config.SUMMARY_MAX_LEN,
                 verify_ssl=config.GIGACHAT_VERIFY_SSL,
+                priority="user",
             )
         ) as summarizer:
             summary = await summarizer.summarize(text)
