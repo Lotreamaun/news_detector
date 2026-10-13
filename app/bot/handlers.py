@@ -1169,3 +1169,5 @@ async def admin_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await query.answer()
     await _send_admin_link(context, query.message.chat_id, query.from_user.id)
+        # повторный /settings при незавершённом диалоге открывает визард заново, а не молчит
+        CommandHandler("settings", require_channel_verified(level_wizard_entry)),
