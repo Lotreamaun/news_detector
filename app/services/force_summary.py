@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -27,12 +28,15 @@ from app.services.rss_parser import (
     ocr_document_text,
 )
 from app.services.summarizer import Summarizer, SummarizerConfig
-from app.services.summary_usage import current_month
+from app.services.summary_usage import current_month, release, reserve, reserved
 
 logger = logging.getLogger(__name__)
 
 # уровни, для которых месячный лимит принудительной саммаризации не действует
 AUTO_LEVELS: frozenset[str] = IMPORTANT_LEVELS
+
+# Режим работы над документом: "text" — текст получен с портала, "ocr" — нужно распознавание
+ModeCallback = Callable[[Literal["text", "ocr"]], None]
 
 
 @dataclass(frozen=True)
@@ -103,17 +107,37 @@ def _on_task_done(external_id: str, task: asyncio.Task[ForceSummaryResult]) -> N
         )
 
 
+def _notify_mode(on_mode: ModeCallback | None, mode: Literal["text", "ocr"]) -> None:
+    """Сообщает инициатору режим работы; сбой колбэка только пишется в лог."""
+    if on_mode is None:
+        return
+    try:
+        on_mode(mode)
+    except Exception:
+        logger.exception("Колбэк режима саммаризации (%s) завершился исключением", mode)
+
+
 async def force_summarize(
-    config, session_maker, user: User, external_id: str
+    config,
+    session_maker,
+    user: User,
+    external_id: str,
+    on_mode: ModeCallback | None = None,
 ) -> ForceSummaryResult:
     """Выполняет принудительную саммаризацию закона и возвращает результат без доставки.
 
     Порядок: присоединение к выполняющейся саммаризации документа (без лимита и списания) →
     лечение псевдозаголовка → готовое саммари из БД (без LLM и без лимита) →
-    месячный лимит (обходят админы и ``AUTO_LEVELS``) → общая задача по документу
-    (``_summarize_document``: текст / OCR → саммари → сохранение) → +1 к счётчику инициатору.
+    месячный лимит с учётом попыток «в работе» (обходят админы и ``AUTO_LEVELS``) → резерв
+    попытки → общая задача по документу (``_summarize_document``: текст / OCR → саммари →
+    сохранение) → +1 к счётчику инициатору → снятие резерва. Платный инициатор держит резерв,
+    пока ждёт задачу: один пользователь не запустит больше саммаризаций, чем у него попыток.
     По документу выполняется не более одной задачи. Сбои модели и непредвиденные ошибки
     возвращаются статусами ``refused`` / ``error``.
+
+    on_mode — необязательный синхронный колбэк: вызывается только у инициатора, как только
+    известен режим (``"text"`` / ``"ocr"``); при присоединении, выдаче из кэша и отказе по
+    лимиту не вызывается. Не должен блокироваться (без ``await``), его исключения логируются.
     """
     task = _inflight.get(external_id)
     if task is not None:
@@ -169,28 +193,40 @@ async def force_summarize(
     auto_bypass = cached is not None and cached.level in AUTO_LEVELS
     charge = not is_admin and not auto_bypass
 
+    # внутри сессии только читаем счётчик: выход из неё — await, сравнивать надо после него
+    count = 0
     if charge:
         async with session_maker() as session:
-            usage = await session.scalar(
-                select(SummarizationUsage).where(
-                    SummarizationUsage.user_id == user.id,
-                    SummarizationUsage.month == month,
+            count = (
+                await session.scalar(
+                    select(SummarizationUsage.count).where(
+                        SummarizationUsage.user_id == user.id,
+                        SummarizationUsage.month == month,
+                    )
                 )
+                or 0
             )
-            if usage is not None and usage.count >= limit:
-                return ForceSummaryResult(
-                    status="limit", title=title, url=url, title_known=cached_known
-                )
 
     # TODO: Рассмотреть платный тариф — бесконечная принудительная саммаризация
 
-    # Повторная проверка реестра: пока шли await выше, задачу мог создать другой запрос.
-    # Между проверкой и записью в реестр await нет — две задачи на документ не возникнут.
+    # Дальше до записи в реестр — ни одного await: сравнение лимита с резервом, повторная
+    # проверка реестра (пока шли await выше, задачу мог создать другой запрос) и резерв
+    # попытки неразрывны, поэтому две задачи на документ и два платных запуска на одну
+    # оставшуюся попытку не возникнут.
+    if charge and count + reserved(user.telegram_id) >= limit:
+        return ForceSummaryResult(status="limit", title=title, url=url, title_known=cached_known)
+
     task = _inflight.get(external_id)
     initiator = task is None
+    holds_reserve = False
     if task is None:
         logger.info("Саммари %s: запуск (user=%s)", external_id, user.telegram_id)
-        task = asyncio.create_task(_summarize_document(config, session_maker, external_id))
+        if charge:
+            reserve(user.telegram_id)
+            holds_reserve = True
+        task = asyncio.create_task(
+            _summarize_document(config, session_maker, external_id, on_mode)
+        )
         _inflight[external_id] = task
         task.add_done_callback(lambda t: _on_task_done(external_id, t))
     else:
@@ -198,33 +234,40 @@ async def force_summarize(
             "Саммари %s уже в работе — присоединяем запрос user=%s", external_id, user.telegram_id
         )
 
-    # shield: отмена этого запроса не отменяет работу, которую ждут остальные
-    result = await asyncio.shield(task)
+    try:
+        # shield: отмена этого запроса не отменяет работу, которую ждут остальные
+        result = await asyncio.shield(task)
 
-    if initiator and charge and result.status == "ok" and not result.from_cache:
-        async with session_maker() as session:
-            usage = await session.scalar(
-                select(SummarizationUsage).where(
-                    SummarizationUsage.user_id == user.id,
-                    SummarizationUsage.month == month,
+        if initiator and charge and result.status == "ok" and not result.from_cache:
+            async with session_maker() as session:
+                usage = await session.scalar(
+                    select(SummarizationUsage).where(
+                        SummarizationUsage.user_id == user.id,
+                        SummarizationUsage.month == month,
+                    )
                 )
-            )
-            if usage is None:
-                usage = SummarizationUsage(user_id=user.id, month=month, count=0)
-                session.add(usage)
-            usage.count += 1
-            await session.commit()
-    return result
+                if usage is None:
+                    usage = SummarizationUsage(user_id=user.id, month=month, count=0)
+                    session.add(usage)
+                usage.count += 1
+                await session.commit()
+        return result
+    finally:
+        # после коммита списания (успех) или сразу при неудаче/отмене — попытка возвращается
+        if holds_reserve:
+            release(user.telegram_id)
 
 
 async def _summarize_document(
-    config, session_maker, external_id: str
+    config, session_maker, external_id: str, on_mode: ModeCallback | None = None
 ) -> ForceSummaryResult:
     """Документная часть саммаризации: не знает про пользователя, итог отдаётся всем ожидающим.
 
     Начинает с перечитывания ``Article``: саммари уже есть — ``ok`` с ``from_cache=True``
     без портала и модели. Дальше текст / OCR → сохранение текста → саммари → сохранение
     или создание ``Article``. Лимит не проверяет и не списывает. Исключения наружу не выходят.
+    on_mode (только от инициатора) вызывается на месте: ``"text"`` — как только получен текст
+    портала, ``"ocr"`` — перед распознаванием; при готовом саммари не вызывается.
     """
     async with session_maker() as session:
         cached = await session.scalar(
@@ -254,7 +297,10 @@ async def _summarize_document(
     title_known = cached_known
     try:
         text = await get_legal_text(external_id)
-        if not text:
+        if text:
+            _notify_mode(on_mode, "text")
+        else:
+            _notify_mode(on_mode, "ocr")
             logger.info(
                 "Текст для %s отсутствует — используем OCR через GigaChat",
                 external_id,

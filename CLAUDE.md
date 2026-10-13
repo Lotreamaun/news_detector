@@ -183,7 +183,13 @@ and appends "…", which can end mid-sentence.
   не опубликовано".
 - `/summary` — force-summarize a law by id/link; rate-limited per user per
   month via `SummarizationUsage` (`FORCE_SUMMARIZE_MONTHLY_LIMIT`); chat IDs
-  in `ADMIN_CHAT_IDS` are exempt from the limit.
+  in `ADMIN_CHAT_IDS` are exempt from the limit. Delivery is async (same for the
+  "Сделать саммари" buttons): the handler replies at once with a "⏳" status and returns,
+  the work runs as a background task (`_summary_tasks`, `_run_summary_task`); the status gets
+  a time estimate (`on_mode` callback: text / OCR) and the result always comes as a **new**
+  message (the status is deleted; for the button under a notification the notification itself is turned
+  into the status, so no old notification is left next to the result). Tasks
+  live in memory — lost on restart.
 - `/settings` — a `ConversationHandler` wizard (`level_wizard_handler`) for
   choosing legal-force filter levels, backed by `user_filters`.
 - `/help` — command reference.
@@ -216,7 +222,9 @@ After a temporary summarize failure for a document there is a 60 s cooldown
 without calling GigaChat, for any user; the page shows a toast banner and a
 muted button with a countdown. Failures and cooldown do not consume the user's
 monthly limit. The force-summarize core is `app/services/force_summary.py`,
-shared with the bot (`/summary`, "Сделать саммари" buttons). At most one summarization runs per
+shared with the bot (`/summary`, "Сделать саммари" buttons). A paid summarization holds a limit
+reserve (`summary_usage.reserve/release`) while in flight, so a user cannot start more of them than
+they have attempts left; the counter shows reserved attempts as used. At most one summarization runs per
 `external_id`: a repeated request (any entry point, any user) joins the running task and
 receives its result without a model call or spending the user's limit; only the initiator is
 charged, on success (`ForceSummaryResult.from_cache` = taken from the DB, never charged).
@@ -250,7 +258,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
-| `app/services/summary_usage.py` | Read-only summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
+| `app/services/summary_usage.py` | Summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) plus in-memory "in flight" reserve (`reserve`/`release`/`reserved`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
 | `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`; its GigaChat clients use `priority="user"`) |
 | `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
 | `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |

@@ -2,6 +2,7 @@
 Telegram-обработчики команд бота.
 """
 
+import asyncio
 import logging
 from datetime import datetime, time, timedelta, timezone
 
@@ -13,6 +14,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
 from app.services.force_summary import force_summarize as run_force_summarize
+from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
 from app.services.summary_usage import format_reset_date, get_summary_usage, limit_message
 from app.services.today import FEDERAL, OTHER, REGIONAL, day_bounds, pick_top, portal_today, scope_of
@@ -356,7 +358,6 @@ def _summary_refused_plain(fallback: str, external_id: str, url: str) -> str:
 async def _deliver_summary_failure(
     context: ContextTypes.DEFAULT_TYPE,
     user: User,
-    message: object | None,
     status_message: object | None,
     config,
     title_known: bool,
@@ -365,7 +366,7 @@ async def _deliver_summary_failure(
     external_id: str,
     fallback: str,
 ) -> None:
-    """Доставляет сообщение о неудачной принудительной саммаризации.
+    """Доставляет новым сообщением итог неудачной принудительной саммаризации.
 
     У записи настоящее название — notification-style через _summary_refused
     (заголовок + причина + ссылка). Записи нет в БД (реалистично только для
@@ -380,7 +381,6 @@ async def _deliver_summary_failure(
         await _deliver(
             context,
             user,
-            message,
             final,
             status_message=status_message,
             parse_mode="MarkdownV2",
@@ -388,7 +388,7 @@ async def _deliver_summary_failure(
         )
     else:
         final = _summary_refused_plain(fallback, external_id, url)
-        await _deliver(context, user, message, final, status_message=status_message)
+        await _deliver(context, user, final, status_message=status_message)
 
 
 def _summary_final(
@@ -776,44 +776,89 @@ async def _get_or_create_user(
 async def _deliver(
     context: ContextTypes.DEFAULT_TYPE,
     user: User,
-    message: object | None,
     text: str,
     status_message: object | None = None,
     parse_mode: str | None = None,
     reply_markup=None,
 ) -> None:
-    """Шлёт текст результата: для кнопки — правит исходное сообщение, иначе — новое.
+    """Шлёт результат новым сообщением (с push); статус-сообщение перед этим удаляется.
 
-    Если задан status_message (временный индикатор «Саммари в процессе создания…»),
-    он удаляется перед отправкой результата.
+    Ошибки отправки не ловит — их обрабатывает обёртка фоновой задачи (`_run_summary_task`).
     """
-    if message is not None:
-        await context.bot.edit_message_text(
-            chat_id=message.chat_id,
-            message_id=message.message_id,
-            text=text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup,
-        )
-    else:
-        if status_message is not None:
-            try:
-                await status_message.delete()
-            except Exception:
-                logger.exception("Не удалось удалить индикатор саммаризации")
-        await context.bot.send_message(
-            chat_id=user.telegram_id,
-            text=text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup,
-        )
+    if status_message is not None:
+        try:
+            await status_message.delete()
+        except Exception:
+            logger.exception("Не удалось удалить индикатор саммаризации")
+    await context.bot.send_message(
+        chat_id=user.telegram_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
+# Фоновые задачи саммари: сильные ссылки, иначе GC может собрать задачу до завершения
+_summary_tasks: set[asyncio.Task] = set()
+
+_STATUS_PENDING = "⏳ Готовлю саммари — пришлю отдельным сообщением."
+_STATUS_TEXT = "⏳ Готовлю саммари — обычно до полуминуты. Пришлю отдельным сообщением."
+_STATUS_OCR = "⏳ Распознаю текст закона — обычно 1-3 минуты. Пришлю отдельным сообщением."
+_STATUS_BUSY = "Сейчас модель занята другими запросами — может занять больше времени."
+
+
+def _spawn_summary_task(coro) -> asyncio.Task:
+    """Запускает фоновую корутину, удерживая ссылку на задачу до её завершения."""
+    task = asyncio.create_task(coro)
+    _summary_tasks.add(task)
+    task.add_done_callback(_summary_tasks.discard)
+    return task
+
+
+def _estimate_text(mode: str, busy: bool) -> str:
+    """Текст статуса с оценкой времени по режиму (``text`` / ``ocr``); число запросов не называем."""
+    text = _STATUS_OCR if mode == "ocr" else _STATUS_TEXT
+    return f"{text}\n\n{_STATUS_BUSY}" if busy else text
+
+
+async def _edit_status(status_message: object, text: str) -> None:
+    """Правит статус-сообщение; сбой (сообщение удалено, бот заблокирован) только в лог."""
+    try:
+        await status_message.edit_text(text)
+    except Exception:
+        logger.warning("Не удалось обновить статус саммаризации", exc_info=True)
+
+
+async def _run_summary_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+    external_id: str,
+    status_message: object | None,
+) -> None:
+    """Обёртка фоновой задачи: любой сбой — в лог и одна попытка последней доставки.
+
+    Статус «⏳» не должен оставаться единственным ответом: удаляем его и шлём простой
+    текст о неудаче. Ошибка этой попытки только логируется.
+    """
+    try:
+        await _summarize_and_reply(context, user, external_id, status_message)
+    except Exception:
+        logger.exception("Сбой саммаризации %s для user=%s", external_id, user.telegram_id)
+        try:
+            await _deliver(
+                context,
+                user,
+                f"Не удалось сделать саммари. Попробуйте позже: /summary {external_id}",
+                status_message=status_message,
+            )
+        except Exception:
+            logger.exception("Не удалось доставить сообщение о сбое саммари %s", external_id)
 
 
 async def _summarize_and_reply(
     context: ContextTypes.DEFAULT_TYPE,
     user: User,
     external_id: str,
-    message: object | None = None,
     status_message: object | None = None,
 ) -> None:
     """
@@ -821,16 +866,25 @@ async def _summarize_and_reply(
 
     Проверяет месячный лимит, получает текст (при отсутствии — OCR через
     GigaChat), формирует саммари, обновляет Article и инкрементирует счётчик.
-    При лимите/сбое отправляет пользователю понятное сообщение.
+    Итог — саммари или понятное сообщение о неудаче — всегда приходит новым
+    сообщением; статус-сообщение удаляется.
 
     Args:
-        message: если задано (кнопка — исходное сообщение с кнопкой), результат
-            правится в нём (кнопка исчезает); иначе шлётся новое сообщение.
-        status_message: временный индикатор «Саммари в процессе создания…»,
-            удаляется после доставки результата (используется для команды).
+        status_message: временный индикатор «⏳ Готовлю саммари…». Как только ядро
+            узнаёт режим (текст / OCR), в нём появляется оценка времени; перед
+            результатом оно удаляется.
     """
     config = context.bot_data["config"]
-    result = await run_force_summarize(config, _session_maker(context), user, external_id)
+
+    def on_mode(mode: str) -> None:
+        # синхронно: замер очереди должен произойти до того, как запрос встанет в неё
+        if status_message is not None:
+            busy = calls_ahead_of_user() > 0
+            _spawn_summary_task(_edit_status(status_message, _estimate_text(mode, busy)))
+
+    result = await run_force_summarize(
+        config, _session_maker(context), user, external_id, on_mode=on_mode
+    )
 
     if result.status == "ok":
         final, reply_markup = _summary_final(
@@ -840,7 +894,6 @@ async def _summarize_and_reply(
         await _deliver(
             context,
             user,
-            message,
             final,
             status_message=status_message,
             parse_mode="MarkdownV2",
@@ -850,16 +903,16 @@ async def _summarize_and_reply(
         usage = await get_summary_usage(config, _session_maker(context), user)
         fallback = limit_message(usage)
         await _deliver_summary_failure(
-            context, user, message, status_message,
+            context, user, status_message,
             config, result.title_known, result.title, result.url, external_id, fallback,
         )
     elif result.status == "no_text":
         fallback = (
-            "Не удалось получить текст закона для саммаризации 😢\n"
+            "😢 Не удалось получить текст закона для саммаризации\n\n"
             f"Попробуйте позже: /summary {external_id}"
         )
         await _deliver_summary_failure(
-            context, user, message, status_message,
+            context, user, status_message,
             config, result.title_known, result.title, result.url, external_id, fallback,
         )
     elif result.text:
@@ -878,7 +931,6 @@ async def _summarize_and_reply(
         await _deliver(
             context,
             user,
-            message,
             final,
             status_message=status_message,
             parse_mode="MarkdownV2",
@@ -886,14 +938,19 @@ async def _summarize_and_reply(
         )
     else:
         await _deliver_summary_failure(
-            context, user, message, status_message,
+            context, user, status_message,
             config, result.title_known, result.title, result.url, external_id,
             "Не удалось сделать саммари. Попробуйте позже.",
         )
 
 
 async def force_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback-обработчик кнопки «Сделать саммари»."""
+    """Callback-обработчик кнопки «Сделать саммари» под уведомлением.
+
+    Само уведомление превращается в статус (текст и кнопка убираются) и запускает
+    саммаризацию фоновой задачей; по готовности статус удаляется, результат приходит
+    новым сообщением — рядом с ним старого уведомления не остаётся.
+    """
     query = update.callback_query
     if query is None or update.effective_user is None:
         return
@@ -915,11 +972,14 @@ async def force_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if user is None:
         return
 
-    if query.message is not None:
-        await query.message.edit_text(
-            "⏳ Саммари в процессе создания…", reply_markup=None
-        )
-    await _summarize_and_reply(context, user, external_id, message=query.message)
+    # статусом становится само уведомление; одним вызовом уходят и текст, и кнопка
+    status_message = query.message
+    if status_message is not None:
+        try:
+            await status_message.edit_text(_STATUS_PENDING, reply_markup=None)
+        except Exception:
+            logger.warning("Не удалось превратить уведомление в статус", exc_info=True)
+    _spawn_summary_task(_run_summary_task(context, user, external_id, status_message))
 
 
 async def force_summarize_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -929,9 +989,8 @@ async def force_summarize_digest(update: Update, context: ContextTypes.DEFAULT_T
     содержат (саммари делается в Mini-App, см. _build_digest); обработчик нужен,
     чтобы кнопки в старых сообщениях продолжали работать.
 
-    В отличие от force_summarize, НЕ правит исходное сообщение (там ещё 1-2
-    других пункта дайджеста) — результат уходит отдельным новым сообщением,
-    как при команде /summary.
+    Исходное сообщение не трогает (там ещё 1-2 других пункта дайджеста): статус
+    приходит ответом на него, результат — новым сообщением, как при /summary.
     """
     query = update.callback_query
     if query is None or update.effective_user is None:
@@ -954,8 +1013,8 @@ async def force_summarize_digest(update: Update, context: ContextTypes.DEFAULT_T
 
     status_message = None
     if query.message is not None:
-        status_message = await query.message.reply_text("⏳ Саммари в процессе создания…")
-    await _summarize_and_reply(context, user, external_id, status_message=status_message)
+        status_message = await query.message.reply_text(_STATUS_PENDING)
+    _spawn_summary_task(_run_summary_task(context, user, external_id, status_message))
 
 
 async def test_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1064,7 +1123,11 @@ def _resolve_external_id(value: str) -> str | None:
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /summary <id или ссылка>: принудительная саммаризация закона."""
+    """Обработчик /summary <id или ссылка>: принудительная саммаризация закона.
+
+    Сразу отвечает статусом и запускает саммаризацию фоновой задачей — бот не ждёт
+    GigaChat; результат придёт новым сообщением.
+    """
     if update.message is None or update.effective_user is None:
         return
     session_maker = _session_maker(context)
@@ -1091,10 +1154,8 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     status_message = None
     if update.message is not None:
-        status_message = await update.message.reply_text("⏳ Саммари в процессе создания…")
-    await _summarize_and_reply(
-        context, user, external_id, status_message=status_message
-    )
+        status_message = await update.message.reply_text(_STATUS_PENDING)
+    _spawn_summary_task(_run_summary_task(context, user, external_id, status_message))
 
 
 # ── ConversationHandler для визарда «Сила» ───────────────────────────────
@@ -1113,6 +1174,8 @@ level_wizard_handler = ConversationHandler(
         ],
     },
     fallbacks=[
+        # повторный /settings при незавершённом диалоге открывает визард заново, а не молчит
+        CommandHandler("settings", require_channel_verified(level_wizard_entry)),
         CommandHandler("cancel", level_cancel),
         CallbackQueryHandler(level_cancel, pattern=r"^level:cancel$"),
     ],
@@ -1169,5 +1232,3 @@ async def admin_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await query.answer()
     await _send_admin_link(context, query.message.chat_id, query.from_user.id)
-        # повторный /settings при незавершённом диалоге открывает визард заново, а не молчит
-        CommandHandler("settings", require_channel_verified(level_wizard_entry)),
