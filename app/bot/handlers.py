@@ -13,6 +13,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 
 from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
+from app.services.force_summary import ForceSummaryResult
 from app.services.force_summary import force_summarize as run_force_summarize
 from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
@@ -356,7 +357,7 @@ def _summary_refused_plain(fallback: str, external_id: str, url: str) -> str:
 
 
 async def _deliver_summary_failure(
-    context: ContextTypes.DEFAULT_TYPE,
+    bot,
     user: User,
     status_message: object | None,
     config,
@@ -379,7 +380,7 @@ async def _deliver_summary_failure(
             config, title, url, fallback, external_id, with_webapp_button=False
         )
         await _deliver(
-            context,
+            bot,
             user,
             final,
             status_message=status_message,
@@ -388,7 +389,7 @@ async def _deliver_summary_failure(
         )
     else:
         final = _summary_refused_plain(fallback, external_id, url)
-        await _deliver(context, user, final, status_message=status_message)
+        await _deliver(bot, user, final, status_message=status_message)
 
 
 def _summary_final(
@@ -774,7 +775,7 @@ async def _get_or_create_user(
 
 
 async def _deliver(
-    context: ContextTypes.DEFAULT_TYPE,
+    bot,
     user: User,
     text: str,
     status_message: object | None = None,
@@ -783,14 +784,15 @@ async def _deliver(
 ) -> None:
     """Шлёт результат новым сообщением (с push); статус-сообщение перед этим удаляется.
 
-    Ошибки отправки не ловит — их обрабатывает обёртка фоновой задачи (`_run_summary_task`).
+    Ошибки отправки не ловит — их обрабатывает обёртка фоновой задачи (`_run_summary_task`
+    в боте, `_deliver_later` в Mini-App).
     """
     if status_message is not None:
         try:
             await status_message.delete()
         except Exception:
             logger.exception("Не удалось удалить индикатор саммаризации")
-    await context.bot.send_message(
+    await bot.send_message(
         chat_id=user.telegram_id,
         text=text,
         parse_mode=parse_mode,
@@ -829,6 +831,24 @@ async def _edit_status(status_message: object, text: str) -> None:
         logger.warning("Не удалось обновить статус саммаризации", exc_info=True)
 
 
+async def send_summary_crash(
+    bot,
+    user: User,
+    external_id: str,
+    status_message: object | None = None,
+) -> None:
+    """Последняя попытка доставки при сбое: статус удаляется, приходит простой текст о неудаче.
+
+    Общая для бота и Mini-App. Ошибки отправки не ловит — это делает вызывающий.
+    """
+    await _deliver(
+        bot,
+        user,
+        f"Не удалось сделать саммари. Попробуйте позже: /summary {external_id}",
+        status_message=status_message,
+    )
+
+
 async def _run_summary_task(
     context: ContextTypes.DEFAULT_TYPE,
     user: User,
@@ -845,12 +865,7 @@ async def _run_summary_task(
     except Exception:
         logger.exception("Сбой саммаризации %s для user=%s", external_id, user.telegram_id)
         try:
-            await _deliver(
-                context,
-                user,
-                f"Не удалось сделать саммари. Попробуйте позже: /summary {external_id}",
-                status_message=status_message,
-            )
+            await send_summary_crash(context.bot, user, external_id, status_message)
         except Exception:
             logger.exception("Не удалось доставить сообщение о сбое саммари %s", external_id)
 
@@ -885,14 +900,32 @@ async def _summarize_and_reply(
     result = await run_force_summarize(
         config, _session_maker(context), user, external_id, on_mode=on_mode
     )
+    await send_summary_result(
+        context.bot, config, _session_maker(context), user, external_id, result, status_message
+    )
 
+
+async def send_summary_result(
+    bot,
+    config,
+    session_maker,
+    user: User,
+    external_id: str,
+    result: ForceSummaryResult,
+    status_message: object | None = None,
+) -> None:
+    """Форматирует итог принудительной саммаризации и доставляет его новым сообщением.
+
+    Общая для бота и Mini-App: один вид сообщения везде. Статус-сообщение (если есть)
+    перед отправкой удаляется. Ошибки отправки не ловит — это делает вызывающий.
+    """
     if result.status == "ok":
         final, reply_markup = _summary_final(
             config, result.title, result.url, result.summary, external_id,
             title_known=result.title_known,
         )
         await _deliver(
-            context,
+            bot,
             user,
             final,
             status_message=status_message,
@@ -900,10 +933,10 @@ async def _summarize_and_reply(
             reply_markup=reply_markup,
         )
     elif result.status == "limit":
-        usage = await get_summary_usage(config, _session_maker(context), user)
+        usage = await get_summary_usage(config, session_maker, user)
         fallback = limit_message(usage)
         await _deliver_summary_failure(
-            context, user, status_message,
+            bot, user, status_message,
             config, result.title_known, result.title, result.url, external_id, fallback,
         )
     elif result.status == "no_text":
@@ -912,7 +945,7 @@ async def _summarize_and_reply(
             f"Попробуйте позже: /summary {external_id}"
         )
         await _deliver_summary_failure(
-            context, user, status_message,
+            bot, user, status_message,
             config, result.title_known, result.title, result.url, external_id, fallback,
         )
     elif result.text:
@@ -929,7 +962,7 @@ async def _summarize_and_reply(
             title_known=result.title_known,
         )
         await _deliver(
-            context,
+            bot,
             user,
             final,
             status_message=status_message,
@@ -938,7 +971,7 @@ async def _summarize_and_reply(
         )
     else:
         await _deliver_summary_failure(
-            context, user, status_message,
+            bot, user, status_message,
             config, result.title_known, result.title, result.url, external_id,
             "Не удалось сделать саммари. Попробуйте позже.",
         )

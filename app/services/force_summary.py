@@ -5,12 +5,17 @@
 и WebApp (``POST /summarize``). Сервис не знает про Telegram и не формирует
 тексты сообщений: возвращает ``ForceSummaryResult`` со статусом, а каждая точка
 входа сама выбирает формулировки.
+
+Модуль помнит и неудачи: ``recent_failure`` отдаёт причину и время последней неудачной
+саммаризации документа (10 минут) — по ней Mini-App показывает причину и ставит кулдаун
+«повторите позже»; бот и панель реестр неудач не читают.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -34,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # уровни, для которых месячный лимит принудительной саммаризации не действует
 AUTO_LEVELS: frozenset[str] = IMPORTANT_LEVELS
+
+# Сколько реестр неудач помнит исход документа (секунды)
+FAILURE_MEMORY_SECONDS = 600
 
 # Режим работы над документом: "text" — текст получен с портала, "ocr" — нужно распознавание
 ModeCallback = Callable[[Literal["text", "ocr"]], None]
@@ -97,14 +105,53 @@ def inflight_task(external_id: str) -> asyncio.Task[ForceSummaryResult] | None:
     return _inflight.get(external_id)
 
 
+# Последние неудачи документов: external_id -> (статус, time.monotonic() момента неудачи).
+_last_failure: dict[str, tuple[str, float]] = {}
+
+
+def recent_failure(external_id: str) -> tuple[str, float] | None:
+    """Последняя неудача саммаризации документа: (статус, time.monotonic()) или None.
+
+    Запись есть, только если она моложе ``FAILURE_MEMORY_SECONDS``: причина нужна Mini-App
+    (показать, почему не вышло, и выдержать кулдаун после ``no_text`` / ``error``), давние
+    неудачи считаются неизвестными. Бот и панель модерации реестр не читают.
+    """
+    record = _last_failure.get(external_id)
+    if record is None or time.monotonic() - record[1] >= FAILURE_MEMORY_SECONDS:
+        return None
+    return record
+
+
+def _remember_failure(external_id: str, status: str) -> None:
+    """Записывает неудачу документа и вычищает записи старше ``FAILURE_MEMORY_SECONDS``."""
+    now = time.monotonic()
+    for key in [k for k, (_, at) in _last_failure.items() if now - at >= FAILURE_MEMORY_SECONDS]:
+        del _last_failure[key]
+    _last_failure[external_id] = (status, now)
+
+
 def _on_task_done(external_id: str, task: asyncio.Task[ForceSummaryResult]) -> None:
-    """Снимает задачу с реестра; исключение задачи (не отмену) пишет в лог."""
+    """Снимает задачу с реестра, обновляет реестр неудач; исключение задачи пишет в лог.
+
+    Отменённая задача (остановка сервиса) и задача с исключением стирают запись о неудаче;
+    итог ``ok`` — тоже; ``no_text`` / ``refused`` / ``error`` — записываются со временем.
+    """
     if _inflight.get(external_id) is task:
         del _inflight[external_id]
-    if not task.cancelled() and task.exception() is not None:
+    if task.cancelled():
+        _last_failure.pop(external_id, None)
+        return
+    if task.exception() is not None:
         logger.error(
             "Саммаризация %s завершилась исключением", external_id, exc_info=task.exception()
         )
+        _last_failure.pop(external_id, None)
+        return
+    status = task.result().status
+    if status in ("no_text", "refused", "error"):
+        _remember_failure(external_id, status)
+    else:
+        _last_failure.pop(external_id, None)
 
 
 def _notify_mode(on_mode: ModeCallback | None, mode: Literal["text", "ocr"]) -> None:
