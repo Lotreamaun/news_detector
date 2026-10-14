@@ -100,7 +100,7 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      decrees/resolutions (regional) are `REGIONAL`. Old rows are not reclassified.
    - If no text is ready and the act `is_important()` (`IMPORTANT_LEVELS`:
      Конституция/ФКЗ/ФЗ), OCR is attempted via GigaChat on the source PDF
-     (`ocr_document_text`).
+     (`ocr_document_text`; its generation call has a 180 s timeout, `_OCR_TIMEOUT_SECONDS`).
    - If text was obtained (directly or via OCR), `summarizer.summarize()`
      calls GigaChat for a 140–280 char summary (`SUMMARY_MIN_LEN`/`MAX_LEN`).
      GigaChat refusals are detected (`classify_reply` in `gigachat.py`) and
@@ -264,7 +264,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/models/user_filter.py` | `UserFilter` — per-user legal-force filter rows |
 | `app/models/usage.py` | `SummarizationUsage` — monthly force-summarize counter |
 | `app/services/rss_parser.py` | pravo.gov.ru list/text/OCR + level classification |
-| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection); one process-wide request queue: one API call at a time, `priority="user"` calls go ahead of `"background"` (default), `calls_ahead_of_user()` |
+| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection); one process-wide request queue: one API call at a time, `priority="user"` calls go ahead of `"background"` (default), `calls_ahead_of_user()`; a generation (`complete`) that times out is **not retried** and the queue slot is held for a 60 s pause (`_TIMEOUT_COOLDOWN_SECONDS`) so the abandoned generation does not turn the next request into a 429; `complete(timeout=)` overrides the 60 s default per call |
 | `app/services/summarizer.py` | Prompt + summarization logic |
 | `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
 | `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |

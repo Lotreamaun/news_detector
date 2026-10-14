@@ -44,6 +44,9 @@ _MAX_DOCUMENT_CHARS = 50_000
 _MAX_PDF_BYTES = 40 * 1024 * 1024
 # Максимум токенов на OCR-ответ (полный текст закона со скана)
 _MAX_OCR_TOKENS = 4_000
+# Таймаут генерации OCR (сек): по логам распознавание скана идёт 10–80 с,
+# общий таймаут клиента (60 с) для него мал
+_OCR_TIMEOUT_SECONDS = 180.0
 
 # Базовый URL редакционного API actual.pravo.gov.ru (HTTP_HOST из config.js)
 _ACTUAL_BASE_URL = "http://actual.pravo.gov.ru:8000/api/ebpi"
@@ -400,6 +403,7 @@ async def ocr_document_text(
             attachments=[file_id],
             temperature=0.1,
             max_tokens=_MAX_OCR_TOKENS,
+            timeout=_OCR_TIMEOUT_SECONDS,
         )
         text = reply.strip()
         _kind = classify_reply(text)
