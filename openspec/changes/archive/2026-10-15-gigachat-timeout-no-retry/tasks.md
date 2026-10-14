@@ -23,4 +23,4 @@
 
 - [x] 4.1 `CLAUDE.md`: в строке `app/services/gigachat.py` таблицы «Key modules» дописать, что генерация после таймаута не повторяется и поток держится паузой 60 с; в описании OCR упомянуть таймаут 180 с
 - [x] 4.2 `docs/PLAN.md`: отметить п. 5 выполненным. В P2 п. 11 (`gigachat-orphan-files-cleanup`) отметить, что удаление файла после таймаута OCR теперь идёт после паузы; дубли от повтора `upload_file` остаются
-- [ ] 4.3 После 3.3: через `/opsx:update gigachat-single-stream-queue` уточнить требование «Повторы без потери очереди» (таймаут генерации не повторяется, см. `gigachat-request-timeouts`), закрыть его задачу 4.3. Архивировать сначала `gigachat-single-stream-queue`, затем этот change
+- [x] 4.3 После 3.3: через `/opsx:update gigachat-single-stream-queue` уточнить требование «Повторы без потери очереди» (таймаут генерации не повторяется, см. `gigachat-request-timeouts`), закрыть его задачу 4.3. Архивировать сначала `gigachat-single-stream-queue`, затем этот change _(15.10: спека очереди уточнена, её 4.3 закрыта, `gigachat-single-stream-queue` заархивирован; этот change архивируется следом.)_
