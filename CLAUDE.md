@@ -250,7 +250,9 @@ charged, on success (`ForceSummaryResult.from_cache` = taken from the DB, never 
 `Dockerfile` (`python:3.14-slim`, `python -m app.main`) + `docker-compose.yml`
 (`.env`, volumes `./data` and `./logs`) — runs on Dockhost; see spec `deployment`.
 `openspec/`, `docs/`, `.env`, `data/`, `logs/` are excluded from the image.
-SQLite lives in `data/`; `app/services/backup.py` makes periodic consistent
+SQLite lives in `data/` in WAL mode (switched on at startup by `init_db_schema`; writes wait up
+to 10 s for a busy DB), so `<db>-wal`/`<db>-shm` files sit next to it — delete them before restoring
+a backup (see README). `app/services/backup.py` makes periodic consistent
 copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 
 ### Key modules
@@ -258,7 +260,7 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | File | Responsibility |
 |------|-----------------|
 | `app/core/config.py` | `Config.load()` — the single source of settings from `.env` |
-| `app/core/database.py` | Engine + async session factory + table creation |
+| `app/core/database.py` | Engine + async session factory + table creation; SQLite: WAL on start (`_enable_wal`, failure = WARNING only), `busy_timeout` 10 s |
 | `app/models/user.py` | `User` — Telegram subscribers |
 | `app/models/article.py` | `Article` — processed laws (`external_id` unique, `level`) |
 | `app/models/user_filter.py` | `UserFilter` — per-user legal-force filter rows |
