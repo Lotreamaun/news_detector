@@ -23,6 +23,7 @@ from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import aiohttp
@@ -32,8 +33,13 @@ logger = logging.getLogger(__name__)
 # Запас времени до истечения токена (сек): не даем использовать токен "на грани"
 _TOKEN_REFRESH_MARGIN_SECONDS = 60
 
+# expires_at больше порога — это миллисекунды от эпохи (10**11 с — 5138 год,
+# 10**11 мс — 1973 год). GigaChat отдаёт мс: лог 15.10, 1792011350552 = токен на 30 мин.
+_EXPIRES_AT_MS_THRESHOLD = 10**11
+
 # Ретраится только: сетевые ошибки, таймауты, 429, 5xx.
-# Остальные HTTP-ошибки (400, 401, 403 и т.д.) падают сразу.
+# Остальные HTTP-ошибки (400, 403 и т.д.) падают сразу.
+# 401 — один повтор с новым токеном в _api_request, не здесь.
 # Исключение — таймаут генерации (chat/completions): не ретраится, см. ниже.
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
@@ -421,10 +427,12 @@ class GigaChatClient:
         if not token:
             raise GigaChatAuthError(f"Ответ OAuth не содержит access_token: {data}")
 
-        # GigaChat возвращает expires_at (сек от эпохи). На случай
-        # expires_in в секундах считаем срок сами.
+        # GigaChat возвращает expires_at в мс от эпохи; секунды тоже принимаем
+        # (единица — по величине). На случай expires_in в секундах считаем срок сами.
         expires_at = data.get("expires_at")
         if isinstance(expires_at, (int, float)):
+            if expires_at > _EXPIRES_AT_MS_THRESHOLD:
+                expires_at = expires_at / 1000
             self._token_expires_at = float(expires_at)
         elif isinstance(data.get("expires_in"), (int, float)):
             self._token_expires_at = time.time() + float(data["expires_in"])
@@ -432,7 +440,10 @@ class GigaChatClient:
             logger.warning("OAuth-ответ без срока жизни токена, кэшируем на 5 мин")
             self._token_expires_at = time.time() + 300
 
-        logger.info("Получен новый access-токен GigaChat (срок до %.0f)", self._token_expires_at)
+        logger.info(
+            "Получен новый access-токен GigaChat (срок до %s)",
+            datetime.fromtimestamp(self._token_expires_at).strftime("%H:%M:%S %d.%m"),
+        )
         return str(token)
 
     async def _api_request(
@@ -455,29 +466,42 @@ class GigaChatClient:
         ``generation`` — запрос генерации: таймаут не ретраится, а слот ещё
         ``_TIMEOUT_COOLDOWN_SECONDS`` держится паузой, чтобы следующий запрос
         очереди не получил 429 от брошенной генерации.
+
+        На HTTP 401 токен обновляется и запрос один раз повторяется сразу, не
+        отдавая слот; второй 401 уходит вызывающему. Ошибки OAuth (в том числе
+        таймаут) не повторяются и паузу не вызывают.
         """
         async with _stream_slot(self._config.priority):
-            token = await self.get_access_token()  # таймаут OAuth паузу не вызывает
-            try:
-                return await self._request_json(
-                    method,
-                    url,
-                    headers={**headers, "Authorization": f"Bearer {token}"},
-                    data=data,
-                    json=json,
-                    expect_json=expect_json,
-                    retry_timeout=not generation,
-                    timeout=timeout,
-                )
-            except GigaChatTimeoutError:
-                if not generation:
+            for attempt in (1, 2):
+                token = await self.get_access_token()  # таймаут OAuth паузу не вызывает
+                try:
+                    return await self._request_json(
+                        method,
+                        url,
+                        headers={**headers, "Authorization": f"Bearer {token}"},
+                        data=data,
+                        json=json,
+                        expect_json=expect_json,
+                        retry_timeout=not generation,
+                        timeout=timeout,
+                    )
+                except GigaChatTimeoutError:
+                    if not generation:
+                        raise
+                    logger.warning(
+                        "Таймаут генерации %s (%s с): поток GigaChat на паузе %d с",
+                        url, timeout or self._config.timeout, _TIMEOUT_COOLDOWN_SECONDS,
+                    )
+                    await asyncio.sleep(_TIMEOUT_COOLDOWN_SECONDS)
                     raise
-                logger.warning(
-                    "Таймаут генерации %s (%s с): поток GigaChat на паузе %d с",
-                    url, timeout or self._config.timeout, _TIMEOUT_COOLDOWN_SECONDS,
-                )
-                await asyncio.sleep(_TIMEOUT_COOLDOWN_SECONDS)
-                raise
+                except GigaChatAPIError as exc:
+                    if exc.status != 401 or attempt == 2:
+                        raise
+                    logger.warning(
+                        "HTTP 401 от %s: access-токен обновляется, запрос повторяется", url
+                    )
+                    self._access_token = None
+        raise AssertionError("недостижимо")  # цикл всегда возвращает или пробрасывает
 
     async def _request_json(
         self,
