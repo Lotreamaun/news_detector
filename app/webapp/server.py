@@ -9,11 +9,22 @@
                                           (группы, поиск по заголовку, тексты — по раскрытию)
   GET /today_list                      — JSON {date, total, groups: [{key, title, items}]}
                                           без текстов; дата — всегда сегодня по Москве
-  GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available, summary}
+  GET /full_text?external_id=<id>      — JSON {title, url, text, is_text_available, summary,
+                                          summarizing}; summarizing — по документу сейчас идёт
+                                          принудительная саммаризация
   POST /summarize                      — принудительная саммаризация из карточки дайджеста
                                           (JSON {external_id, init_data}); пользователь
                                           определяется по подписанному Telegram initData;
-                                          в ответе — актуальный счётчик попыток ``usage``
+                                          в ответе — актуальный счётчик попыток ``usage``.
+                                          Отвечает быстро: готовый итог (ok из кэша / limit /
+                                          cooldown / ранний error) сразу, иначе ``accepted`` с
+                                          оценкой времени — саммаризация идёт в фоне, результат
+                                          уходит в чат бота, если страница не забрала итог
+  POST /summary_status                 — состояние саммаризации документа для страницы
+                                          (JSON {external_id, init_data} -> {state: running|done,
+                                          status, summary, text, message, retry_after, usage});
+                                          модель не вызывает, счётчики не меняет; ответ ``done``
+                                          считается «страница забрала итог» (чат не нужен)
   POST /usage                          — счётчик попыток саммари пользователя
                                           (JSON {init_data} -> {used, limit, unlimited, resets_on})
 
@@ -26,6 +37,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -38,7 +50,8 @@ from aiohttp import web
 from sqlalchemy import select
 
 from app.models import Article, User
-from app.services.force_summary import force_summarize
+from app.services.force_summary import force_summarize, inflight_task, recent_failure
+from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import _normalize_text
 from app.services.summary_usage import NO_SPEND_NOTE, SummaryUsage, get_summary_usage, limit_message
 from app.services.today import day_bounds, group_for_page, portal_today
@@ -52,6 +65,12 @@ INIT_DATA_MAX_AGE = 24 * 60 * 60  # страница дайджеста може
 # разрешён только через столько секунд — защита GigaChat от 429 при повторных нажатиях,
 # перезагрузке страницы и запросах других пользователей к тому же документу
 SUMMARIZE_COOLDOWN_SECONDS = 60
+# Сколько /summarize ждёт, пока станет известен режим (текст / OCR) или итог, прежде чем
+# ответить «принято» — покрывает обычную задержку портала
+ACCEPT_WAIT_SECONDS = 5
+# Сколько после готовности итога ждём, пока страница заберёт его запросом состояния, прежде чем
+# слать сообщение в чат (два пропущенных опроса страницы по 3 с)
+PICKUP_WAIT_SECONDS = 7
 
 HTML_PAGE = r"""<!doctype html>
 <html lang="ru">
@@ -209,6 +228,7 @@ HTML_PAGE = r"""<!doctype html>
 
     // после временной неудачи (нет текста, сбой GigaChat) кнопку можно нажать снова только через минуту
     const COOLDOWN_MS = 60000;
+    const SUMMARY_POLL_MS = 3000;  // как часто спрашиваем состояние готовящегося саммари
     const toastEl = document.getElementById('toast');
     let toastTimer = null;
     let toastTick = null;
@@ -351,6 +371,10 @@ HTML_PAGE = r"""<!doctype html>
       const btn = body.querySelector('.sum-btn');
       if (btn) btn.addEventListener('click', function() { startSummarize(details); });
       applyCooldown(details);
+      // по документу уже идёт саммаризация (своя после переоткрытия или чужая) — ждём вместо кнопки
+      if (data.summarizing && !data.summary && btn && tg && tg.initData && !details._busy) {
+        waitSummary(details, 'Саммари уже готовится.', false);
+      }
     }
     // непустые summary/text из ответа заменяют прежние при любом статусе
     function mergeData(data, res) {
@@ -370,9 +394,75 @@ HTML_PAGE = r"""<!doctype html>
       else btn.textContent = 'Сделать саммари';
     }
 
-    function startSummarize(details) {
+    // POST с initData; 401/403 превращаются в {stop: сообщение}, прочие не-200 — исключение
+    function postSummary(path, id) {
+      return fetch(origin + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ external_id: id, init_data: tg.initData })
+      }).then(function(r) {
+        if (r.status === 401) return { stop: 'Сессия устарела — закройте и снова откройте дайджест.' };
+        if (r.status === 403) {
+          return r.json().then(
+            function(j) { return { stop: j.message || 'Нет доступа.' }; },
+            function() { return { stop: 'Нет доступа.' }; }
+          );
+        }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+    }
+
+    // Разбор итога: ответ /summarize или состояние done из /summary_status.
+    // opts.quiet — без тостов (наблюдатель чужой саммаризации): успех как обычно, refused — причина
+    // на месте кнопки, no_text/error — приглушённая кнопка до конца retry_after
+    function applyOutcome(details, res, opts) {
+      opts = opts || {};
       const id = details._id;
       const data = details._data;
+      data.summarizing = false;
+      mergeData(data, res);
+      const final = res.status === 'limit' || res.status === 'refused';
+      if (res.status === 'no_text' || res.status === 'error' || res.status === 'cooldown') {
+        // retry_after: null — кулдауна нет, кнопка сразу доступна; нет поля — прежние 60 с
+        details._cooldownUntil = res.retry_after === null ? 0 : Date.now() + (res.retry_after ? res.retry_after * 1000 : COOLDOWN_MS);
+      }
+      // строка под кнопкой — только для окончательных исходов (кнопки больше нет, причина должна остаться);
+      // разовые неудачи сообщает баннер, кнопка остаётся для повтора после кулдауна
+      renderCard(details, data, id, res.status === 'ok' ? {} : { message: final ? res.message : '', button: !final });
+      if (opts.quiet) return;
+      if (res.status === 'cooldown') showToast('Саммари сейчас не получить.', details._cooldownUntil);
+      else if (res.status !== 'ok') showToast(res.message, final ? null : details._cooldownUntil);
+    }
+
+    // Ожидание готовящейся саммаризации: кнопка «в процессе» + опрос /summary_status.
+    // mine — запрос отправлен с этой страницы (неудача покажет тост); иначе карточка просто увидела чужую работу
+    function waitSummary(details, message, mine) {
+      details._busy = true;
+      setActionState(details, message, true);
+      function again() { setTimeout(poll, SUMMARY_POLL_MS); }
+      function poll() {
+        postSummary('/summary_status', details._id)
+          .then(function(res) {
+            if (res.stop) {
+              details._busy = false;
+              details._data.summarizing = false;
+              setActionState(details, res.stop, false);
+              if (mine) showToast(res.stop);
+              return;
+            }
+            setUsage(res.usage);
+            if (res.state === 'running') { again(); return; }
+            details._busy = false;
+            applyOutcome(details, res, { quiet: !mine });
+          })
+          .catch(function() { if (details._busy) again(); });  // сеть или 5xx — продолжаем опрос
+      }
+      again();
+    }
+
+    function startSummarize(details) {
+      const id = details._id;
       const left = (details._cooldownUntil || 0) - Date.now();
       if (left > 0) {
         showToast('Попробуйте позже.', details._cooldownUntil);
@@ -386,64 +476,43 @@ HTML_PAGE = r"""<!doctype html>
       }
       details._busy = true;
       setActionState(details, '', true);
-      fetch(origin + '/summarize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ external_id: id, init_data: tg.initData })
-      })
-        .then(function(r) {
-          if (r.status === 401) return { stop: 'Сессия устарела — закройте и снова откройте дайджест.' };
-          if (r.status === 403) {
-            return r.json().then(
-              function(j) { return { stop: j.message || 'Нет доступа.' }; },
-              function() { return { stop: 'Нет доступа.' }; }
-            );
-          }
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.json();
-        })
+      postSummary('/summarize', id)
         .then(function(res) {
-          details._busy = false;
-          if (res.stop) { setActionState(details, res.stop, false); showToast(res.stop); return; }
+          if (res.stop) { details._busy = false; setActionState(details, res.stop, false); showToast(res.stop); return; }
           setUsage(res.usage);
-          mergeData(data, res);
-          const final = res.status === 'limit' || res.status === 'refused';
-          if (res.status === 'no_text' || res.status === 'error' || res.status === 'cooldown') {
-            details._cooldownUntil = Date.now() + (res.retry_after ? res.retry_after * 1000 : COOLDOWN_MS);
-          }
-          // строка под кнопкой — только для окончательных исходов (кнопки больше нет, причина должна остаться);
-          // разовые неудачи сообщает баннер, кнопка остаётся для повтора после кулдауна
-          renderCard(details, data, id, res.status === 'ok' ? {} : { message: final ? res.message : '', button: !final });
-          if (res.status === 'cooldown') showToast('Саммари сейчас не получить.', details._cooldownUntil);
-          else if (res.status !== 'ok') showToast(res.message, final ? null : details._cooldownUntil);
+          if (res.status === 'accepted') { waitSummary(details, res.message, true); return; }
+          details._busy = false;
+          applyOutcome(details, res);
         })
         .catch(function() {
-          // запрос мог дойти до сервера, а ответ оборвал посредник — перепроверяем документ
-          const wait = 'Не удалось дождаться ответа — возможно, саммари ещё создаётся.';
-          fetchFullText(id)
-            .then(function(fresh) {
-              details._busy = false;
-              if (fresh.summary) { mergeData(data, fresh); renderCard(details, data, id); return; }
-              setActionState(details, '', false);
-              startCooldown(details, COOLDOWN_MS);
-              showToast(wait, details._cooldownUntil);
+          // запрос мог дойти до сервера, а ответ оборвал посредник — одним запросом узнаём состояние
+          function giveUp() {
+            details._busy = false;
+            setActionState(details, '', false);
+            startCooldown(details, COOLDOWN_MS);
+            showToast('Не удалось дождаться ответа — возможно, саммари ещё создаётся.', details._cooldownUntil);
+          }
+          postSummary('/summary_status', id)
+            .then(function(res) {
+              if (res.stop) { giveUp(); return; }
+              setUsage(res.usage);
+              if (res.state === 'running') { waitSummary(details, 'Саммари уже готовится.', true); return; }
+              if (res.status === 'ok') { details._busy = false; applyOutcome(details, res); return; }
+              giveUp();
             })
-            .catch(function() {
-              details._busy = false;
-              setActionState(details, '', false);
-              startCooldown(details, COOLDOWN_MS);
-              showToast(wait, details._cooldownUntil);
-            });
+            .catch(giveUp);
         });
     }
 
     // при разворачивании карточки без саммари перепроверяем: его мог сделать другой пользователь
+    // или оно уже готовится
     function recheckSummary(details) {
       if (!details.open || !details._loaded || details._busy || details._data.summary) return;
       fetchFullText(details._id)
         .then(function(fresh) {
-          if (details._busy || !fresh.summary) return;
+          if (details._busy || !(fresh.summary || fresh.summarizing)) return;
           mergeData(details._data, fresh);
+          details._data.summarizing = !!fresh.summarizing;
           renderCard(details, details._data, details._id);
         })
         .catch(function() { /* перепроверка не критична */ });
@@ -683,6 +752,7 @@ async def handle_full_text(request: web.Request) -> web.Response:
                     "text": article.original_text if is_available else None,
                     "is_text_available": is_available,
                     "summary": article.summary or None,
+                    "summarizing": inflight_task(external_id) is not None,
                 },
                 headers={"Access-Control-Allow-Origin": "*"},
             )
@@ -824,13 +894,124 @@ async def handle_usage(request: web.Request) -> web.Response:
         return web.json_response({"error": "internal error"}, status=500, headers=CORS)
 
 
+def _failure_messages(usage: SummaryUsage) -> dict[str, str]:
+    """Тексты неудач саммаризации для карточки: общие для ``/summarize`` и ``/summary_status``."""
+    return {
+        "limit": limit_message(usage),
+        "no_text": _with_note("Не удалось получить текст закона. Попробуйте позже.", usage),
+        "refused": _with_note(
+            "Языковая модель отказалась сформировать саммари для этого документа.", usage
+        ),
+        "error": _with_note("Не удалось сделать саммари. Попробуйте позже.", usage),
+    }
+
+
+def _cooldown_left(external_id: str) -> int | None:
+    """Секунды до разрешённого повтора после временной неудачи документа (None — повтор можно).
+
+    Считается по реестру неудач ядра: ``no_text`` / ``error`` моложе
+    ``SUMMARIZE_COOLDOWN_SECONDS``, откуда бы ни была запущена саммаризация.
+    """
+    failure = recent_failure(external_id)
+    if failure is None or failure[0] not in ("no_text", "error"):
+        return None
+    left = SUMMARIZE_COOLDOWN_SECONDS - (time.monotonic() - failure[1])
+    return int(left) + 1 if left > 0 else None
+
+
+def _spawn(app: web.Application, coro) -> asyncio.Task:
+    """Запускает фоновую корутину, удерживая ссылку на задачу до её завершения.
+
+    Исключение задачи забирается в done-callback (иначе «Task exception was never retrieved»,
+    если ждать некому) и пишется в лог; отмену (остановка сервиса) молча пропускаем.
+    """
+    task = asyncio.create_task(coro)
+    tasks: set[asyncio.Task] = app["summary_tasks"]
+    tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Фоновая задача Mini-App завершилась исключением", exc_info=t.exception())
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _accepted_message(mode: str | None, busy: bool) -> str:
+    """Текст «принято» для карточки: оценка времени по режиму + обещание доставки в чат."""
+    if mode == "ocr":
+        parts = ["Распознаём текст закона — обычно 1–3 минуты."]
+    elif mode == "text":
+        parts = ["Готовим саммари — обычно до полуминуты."]
+    else:
+        parts = ["Готовим саммари."]
+    if mode and busy:
+        parts.append("Сейчас модель занята другими запросами — может занять больше времени.")
+    parts.append("Если закроете страницу, результат придёт в чат бота.")
+    return " ".join(parts)
+
+
+async def _deliver_later(
+    app: web.Application, user: User, external_id: str, job: asyncio.Task, picked_up: asyncio.Event
+) -> None:
+    """Ждёт итог принятой саммаризации и шлёт его в чат бота тем же видом, что у ``/summary``.
+
+    Страница, оставшаяся открытой, сама забирает итог запросом состояния (``picked_up``) —
+    тогда сообщение в чат не нужно. Событие сбрасывается после готовности итога: запрос,
+    пришедший раньше (задача ещё не встала в реестр ядра), не считается. Не забрала за
+    ``PICKUP_WAIT_SECONDS`` (закрыта, свёрнута) — шлём. Кулдаун не трогает — его даёт реестр
+    неудач ядра. Любой сбой — в лог и одна попытка сообщения о неудаче (она отправляется
+    независимо от опроса страницы); её ошибка тоже только в лог.
+    """
+    from app.bot import handlers as bot_handlers  # здесь, а не наверху: handlers импортирует admin → этот модуль
+
+    bot = app["bot"]
+    key = (user.telegram_id, external_id)
+    try:
+        # shield: отмена этой задачи не должна отменять саммаризацию, которую ждут остальные
+        result = await asyncio.shield(job)
+        picked_up.clear()
+        try:
+            await asyncio.wait_for(picked_up.wait(), PICKUP_WAIT_SECONDS)
+        except TimeoutError:
+            pass
+        else:
+            logger.info(
+                "handle_summarize: user=%s %s -> страница забрала итог (%s), в чат не шлём",
+                user.telegram_id, external_id, result.status,
+            )
+            return
+        await bot_handlers.send_summary_result(
+            bot, app["config"], app["session_maker"], user, external_id, result
+        )
+        logger.info("handle_summarize: user=%s %s -> доставлено в чат (%s)", user.telegram_id, external_id, result.status)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Не удалось доставить итог саммари %s пользователю %s", external_id, user.telegram_id)
+        try:
+            await bot_handlers.send_summary_crash(bot, user, external_id)
+        except Exception:
+            logger.exception("Не удалось доставить сообщение о сбое саммари %s", external_id)
+    finally:
+        if app["page_pickup"].get(key) is picked_up:
+            del app["page_pickup"][key]
+
+
 async def handle_summarize(request: web.Request) -> web.Response:
     """Принудительная саммаризация документа из карточки дайджеста.
 
-    Доменные исходы (ok/limit/no_text/refused/error, а также cooldown — повтор по
-    документу после временной неудачи раньше ``SUMMARIZE_COOLDOWN_SECONDS``) — 200 со статусом и готовым
-    для карточки message; 400 — плохой запрос, 401 — нет/неверная initData,
+    Доменные исходы (ok/limit/no_text/refused/error, cooldown — повтор по документу после
+    временной неудачи раньше ``SUMMARIZE_COOLDOWN_SECONDS``, accepted — принято в фон) — 200 со
+    статусом и готовым для карточки message; 400 — плохой запрос, 401 — нет/неверная initData,
     403 — пользователь неизвестен или не подтвердил подписку, 500 — сбой сервера.
+
+    Саммаризация идёт отдельной задачей: обрыв соединения отменяет только хендлер, задача
+    доживает и списывает попытку. Хендлер ждёт до ``ACCEPT_WAIT_SECONDS``, пока станет известен
+    режим или итог: итог (кэш, лимит, ранний сбой) — отвечает сразу, режим — ``accepted`` с
+    оценкой, а результат фоновая доставка (``_deliver_later``) пришлёт в чат бота, если страница
+    не заберёт итог запросом ``/summary_status``.
     """
     try:
         payload = await request.json()
@@ -848,10 +1029,8 @@ async def handle_summarize(request: web.Request) -> web.Response:
         if isinstance(user, web.Response):
             return user
 
-        failed_at: dict[str, float] = request.app["summarize_failed_at"]
-        left = SUMMARIZE_COOLDOWN_SECONDS - (time.monotonic() - failed_at.get(external_id, float("-inf")))
-        if left > 0:
-            retry_after = int(left) + 1
+        retry_after = _cooldown_left(external_id)
+        if retry_after is not None:
             logger.info("handle_summarize: user=%s %s -> cooldown %ss", user.telegram_id, external_id, retry_after)
             usage = await get_summary_usage(config, session_maker, user)
             return web.json_response(
@@ -866,20 +1045,45 @@ async def handle_summarize(request: web.Request) -> web.Response:
                 headers=CORS,
             )
 
-        result = await force_summarize(config, session_maker, user, external_id)
-        if result.status in ("no_text", "error"):
-            failed_at[external_id] = time.monotonic()
-        else:
-            failed_at.pop(external_id, None)
+        mode: dict = {}
+        known = asyncio.Event()
+
+        def on_mode(m: str) -> None:
+            # синхронно: замер очереди должен произойти до того, как запрос встанет в неё
+            mode["mode"] = m
+            mode["busy"] = calls_ahead_of_user() > 0
+            known.set()
+
+        if inflight_task(external_id) is not None:
+            known.set()  # присоединение: колбэк не придёт, оценки нет
+        job = _spawn(
+            request.app,
+            force_summarize(config, session_maker, user, external_id, on_mode=on_mode),
+        )
+        waiter = asyncio.create_task(known.wait())
+        try:
+            await asyncio.wait({job, waiter}, timeout=ACCEPT_WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            waiter.cancel()
+
+        if not job.done():
+            picked_up = request.app["page_pickup"].setdefault((user.telegram_id, external_id), asyncio.Event())
+            _spawn(request.app, _deliver_later(request.app, user, external_id, job, picked_up))
+            usage = await get_summary_usage(config, session_maker, user)
+            logger.info(
+                "handle_summarize: user=%s %s -> accepted (%s)", user.telegram_id, external_id, mode.get("mode")
+            )
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "message": _accepted_message(mode.get("mode"), bool(mode.get("busy"))),
+                    "usage": _usage_json(usage),
+                },
+                headers=CORS,
+            )
+
+        result = job.result()
         usage = await get_summary_usage(config, session_maker, user)
-        messages = {
-            "limit": limit_message(usage),
-            "no_text": _with_note("Не удалось получить текст закона. Попробуйте позже.", usage),
-            "refused": _with_note(
-                "Языковая модель отказалась сформировать саммари для этого документа.", usage
-            ),
-            "error": _with_note("Не удалось сделать саммари. Попробуйте позже.", usage),
-        }
         logger.info("handle_summarize: user=%s %s -> %s", user.telegram_id, external_id, result.status)
         return web.json_response(
             {
@@ -887,7 +1091,7 @@ async def handle_summarize(request: web.Request) -> web.Response:
                 "summary": result.summary,
                 "text": result.text,
                 "is_text_available": bool(result.text and result.text.strip()),
-                "message": messages.get(result.status),
+                "message": _failure_messages(usage).get(result.status),
                 "usage": _usage_json(usage),
             },
             headers=CORS,
@@ -897,16 +1101,77 @@ async def handle_summarize(request: web.Request) -> web.Response:
         return web.json_response({"error": "internal error"}, status=500, headers=CORS)
 
 
-def create_app(session_maker, config) -> web.Application:
-    """Создаёт aiohttp Application с роутами WebApp."""
+async def handle_summary_status(request: web.Request) -> web.Response:
+    """Состояние саммаризации документа для страницы (JSON {external_id, init_data}).
+
+    ``running`` — по документу идёт саммаризация (своя, чужая, из бота или панели);
+    ``done`` — не идёт: либо саммари есть (``status: ok`` с ``summary``/``text``), либо нет —
+    тогда ``status`` из реестра неудач ядра (``error``, если причина неизвестна), ``message`` и
+    ``retry_after`` (остаток кулдауна для ``no_text``/``error``, иначе null). Всегда ``usage``.
+    Модель не вызывает, счётчики не меняет. Ошибки — как у ``/summarize``. Ответ ``done`` — сигнал
+    «страница забрала итог» для ``_deliver_later``: сообщение в чат тогда не шлётся.
+    """
+    try:
+        payload = await request.json()
+        external_id = str(payload.get("external_id") or "").strip()
+        init_data = str(payload.get("init_data") or "")
+    except (ValueError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400, headers=CORS)
+    if not external_id:
+        return web.json_response({"error": "missing external_id"}, status=400, headers=CORS)
+
+    try:
+        session_maker = request.app["session_maker"]
+        user = await _auth_user(request, init_data)
+        if isinstance(user, web.Response):
+            return user
+        usage = await get_summary_usage(request.app["config"], session_maker, user)
+
+        if inflight_task(external_id) is not None:
+            return web.json_response({"state": "running", "usage": _usage_json(usage)}, headers=CORS)
+
+        # состояние «готово / не удалось» отдано странице — она забрала итог, чат не нужен
+        picked_up = request.app["page_pickup"].get((user.telegram_id, external_id))
+        if picked_up is not None:
+            picked_up.set()
+
+        async with session_maker() as session:
+            article = await session.scalar(select(Article).where(Article.external_id == external_id))
+        text = article.original_text if article and article.original_text and article.original_text.strip() else None
+        body = {"state": "done", "text": text, "is_text_available": text is not None, "usage": _usage_json(usage)}
+        if article is not None and article.summary:
+            body.update(status="ok", summary=article.summary)
+        else:
+            failure = recent_failure(external_id)
+            status = failure[0] if failure else "error"
+            body.update(
+                status=status,
+                message=_failure_messages(usage).get(status),
+                retry_after=_cooldown_left(external_id),
+            )
+        return web.json_response(body, headers=CORS)
+    except Exception:
+        logger.exception("handle_summary_status: error for %s", external_id)
+        return web.json_response({"error": "internal error"}, status=500, headers=CORS)
+
+
+def create_app(session_maker, config, bot) -> web.Application:
+    """Создаёт aiohttp Application с роутами WebApp; bot нужен для доставки итога в чат."""
     app = web.Application()
     app["session_maker"] = session_maker
     app["config"] = config
-    app["summarize_failed_at"] = {}  # external_id -> time.monotonic() последней временной неудачи
+    app["bot"] = bot
+    app["summary_tasks"] = set()  # сильные ссылки на фоновые задачи саммаризации и доставки
+    # (telegram_id, external_id) -> событие «страница забрала итог» принятой саммаризации
+    app["page_pickup"] = {}
+    # кулдаун панели модерации (admin.py, синхронная): external_id -> time.monotonic() неудачи.
+    # Mini-App считает кулдаун по реестру неудач ядра (recent_failure)
+    app["summarize_failed_at"] = {}
     app.router.add_get("/app", handle_app)
     app.router.add_get("/full_text", handle_full_text)
     app.router.add_get("/today_list", handle_today_list)
     app.router.add_post("/summarize", handle_summarize)
+    app.router.add_post("/summary_status", handle_summary_status)
     app.router.add_post("/usage", handle_usage)
     app.router.add_static("/static", STATIC_DIR)
     from app.webapp.admin import setup_admin  # здесь, а не наверху: admin импортирует этот модуль
@@ -923,11 +1188,11 @@ _runner: web.AppRunner | None = None
 _site: web.TCPSite | None = None
 
 
-async def start_webapp(host: str, port: int, session_maker, config) -> None:
+async def start_webapp(host: str, port: int, session_maker, config, bot) -> None:
     """Запускает HTTP-сервер WebApp. При ошибке логирует и не роняет бота."""
     global _runner, _site
     try:
-        app = create_app(session_maker, config)
+        app = create_app(session_maker, config, bot)
         _runner = web.AppRunner(app)
         await _runner.setup()
         _site = web.TCPSite(_runner, host, port)

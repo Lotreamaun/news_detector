@@ -13,7 +13,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError, classify_reply
+from app.services.gigachat import (
+    GigaChatClient,
+    GigaChatConfig,
+    GigaChatError,
+    Priority,
+    classify_reply,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,7 @@ class SummarizerConfig:
     min_len: int  # минимальная длина выжимки в символах
     max_len: int  # максимальная длина выжимки в символах
     verify_ssl: bool = False
+    priority: Priority = "background"  # "user" — запрос живого пользователя
 
 
 class Summarizer:
@@ -61,6 +68,7 @@ class Summarizer:
                 auth_key=config.auth_key,
                 model=config.model,
                 verify_ssl=config.verify_ssl,
+                priority=config.priority,
             )
         )
 

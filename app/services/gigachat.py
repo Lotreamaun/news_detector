@@ -19,7 +19,11 @@ import re
 import ssl
 import time
 import uuid
+from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import aiohttp
@@ -29,9 +33,91 @@ logger = logging.getLogger(__name__)
 # Запас времени до истечения токена (сек): не даем использовать токен "на грани"
 _TOKEN_REFRESH_MARGIN_SECONDS = 60
 
+# expires_at больше порога — это миллисекунды от эпохи (10**11 с — 5138 год,
+# 10**11 мс — 1973 год). GigaChat отдаёт мс: лог 15.10, 1792011350552 = токен на 30 мин.
+_EXPIRES_AT_MS_THRESHOLD = 10**11
+
 # Ретраится только: сетевые ошибки, таймауты, 429, 5xx.
-# Остальные HTTP-ошибки (400, 401, 403 и т.д.) падают сразу.
+# Остальные HTTP-ошибки (400, 403 и т.д.) падают сразу.
+# 401 — один повтор с новым токеном в _api_request, не здесь.
+# Исключение — таймаут генерации (chat/completions): не ретраится, см. ниже.
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# Пауза потока после таймаута генерации (сек). Клиент перестал ждать, а GigaChat
+# доделывает генерацию и держит единственный поток ключа: по логу 08.10 таймаут
+# на 60-й секунде, 429 держались ещё ~25 с (брошенная генерация шла ~85 с).
+_TIMEOUT_COOLDOWN_SECONDS = 60
+
+# -- Очередь запросов на процесс -----------------------------------------------
+# У ключа GigaChat один поток, а клиентов в процессе много (планировщик,
+# force-summarize, OCR), поэтому очередь модульная, а не на экземпляр клиента.
+# Все запросы к API идут по одному; пользовательские — вперёд фоновых,
+# внутри приоритета — FIFO. Выполняющийся запрос не прерывается.
+
+Priority = Literal["user", "background"]
+
+_stream_busy = False
+_waiting: dict[Priority, deque[asyncio.Future[None]]] = {
+    "user": deque(),
+    "background": deque(),
+}
+
+
+def _release() -> None:
+    """Передаёт поток первому неотменённому ожидающему (user, затем background)."""
+    global _stream_busy
+    for priority in ("user", "background"):
+        queue = _waiting[priority]
+        while queue:
+            fut = queue.popleft()
+            if not fut.done():
+                fut.set_result(None)  # поток передан «из рук в руки», флаг остаётся
+                return
+    _stream_busy = False
+
+
+def calls_ahead_of_user() -> int:
+    """Сколько вызовов API окажется впереди нового пользовательского запроса.
+
+    ``1`` при занятом потоке плюс число неотменённых ожидающих пользовательских.
+    Только чтение.
+    """
+    waiting_users = sum(1 for fut in _waiting["user"] if not fut.done())
+    return (1 if _stream_busy else 0) + waiting_users
+
+
+@asynccontextmanager
+async def _stream_slot(priority: Priority) -> AsyncIterator[None]:
+    """Занимает единственный поток к API; выход из блока освобождает его."""
+    global _stream_busy
+    if not _stream_busy and not any(_waiting.values()):
+        _stream_busy = True
+    else:
+        ahead = calls_ahead_of_user() if priority == "user" else (
+            (1 if _stream_busy else 0) + sum(len(q) for q in _waiting.values())
+        )
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        _waiting[priority].append(fut)
+        started = time.monotonic()
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                _release()  # поток уже передан нам, но задачу отменили
+            else:
+                try:
+                    _waiting[priority].remove(fut)
+                except ValueError:
+                    pass
+            raise
+        logger.info(
+            "GigaChat: %s-запрос ждал очереди %.1f с (впереди было %d)",
+            priority, time.monotonic() - started, ahead,
+        )
+    try:
+        yield
+    finally:
+        _release()
 
 
 class GigaChatError(RuntimeError):
@@ -62,6 +148,14 @@ class GigaChatAPIError(GigaChatError):
         self.retryable = retryable
 
 
+class GigaChatTimeoutError(GigaChatAPIError):
+    """Клиент не дождался ответа GigaChat за отведённое время.
+
+    Сервер при этом может ещё какое-то время доделывать генерацию и держать
+    поток ключа, поэтому для генерации такой запрос не повторяют сразу.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class GigaChatConfig:
     """
@@ -74,9 +168,14 @@ class GigaChatConfig:
         model: модель для chat-completions по умолчанию.
         oauth_url: эндпоинт получения access-токена.
         api_base_url: базовый URL API (без завершающего слеша).
-        timeout: таймаут HTTP-запроса в секундах.
+        timeout: таймаут HTTP-запроса в секундах по умолчанию; генерации
+            (``complete``) можно задать свой на вызов через ``timeout=``.
         max_retries: сколько раз повторить временную ошибку.
         verify_ssl: проверять ли TLS-сертификат.
+        priority: приоритет в общей очереди запросов процесса: ``"user"`` —
+            запрос живого пользователя (идёт вперёд фоновых), ``"background"`` —
+            работа планировщика и скрипты. По умолчанию фон: забытое поле не даёт
+            запросу обойти очередь.
     """
 
     auth_key: str
@@ -87,11 +186,15 @@ class GigaChatConfig:
     timeout: float = 60.0
     max_retries: int = 3
     verify_ssl: bool = False
+    priority: Priority = "background"
 
 
 class GigaChatClient:
     """
     Клиент к GigaChat: кэширует токен, делает запросы с ретраями.
+
+    Все запросы к API процесса (со всех клиентов) идут по одному,
+    пользовательские вперёд фоновых; OAuth-запрос токена вне очереди.
 
     Поддерживает ``async with GigaChatClient(config) as client:`` для
     автоматического управления сессией aiohttp.
@@ -142,9 +245,14 @@ class GigaChatClient:
         max_tokens: int | None = None,
         attachments: list[str] | None = None,
         function_call: str | None = None,
+        timeout: float | None = None,
     ) -> str:
         """
         Отправляет диалог в chat-completions и возвращает текст ответа.
+
+        После таймаута запрос не повторяется (GigaChat ещё доделывает брошенную
+        генерацию): поток общей очереди держится паузой, затем ошибка уходит
+        вызывающему. Повторы на 429, 5xx и сетевые ошибки работают как обычно.
 
         Args:
             messages: список сообщений вида ``{"role": ..., "content": ...}``.
@@ -159,16 +267,17 @@ class GigaChatClient:
             function_call: режим функций (``"auto"``, ``"none"`` или имя).
                 При attachments по умолчанию выставляется ``"auto"`` —
                 включается автоматический режим чтения приложенных файлов.
+            timeout: таймаут этого запроса в секундах (по умолчанию —
+                ``config.timeout``); отсчёт с момента отправки в GigaChat.
 
         Returns:
             Текст ответа модели.
 
         Raises:
             GigaChatAuthError: не задан ключ или не удалось получить токен.
-            GigaChatAPIError: ошибка API или пустой ответ.
+            GigaChatAPIError: ошибка API или пустой ответ
+                (``GigaChatTimeoutError`` — таймаут).
         """
-        token = await self.get_access_token()
-
         payload: dict[str, Any] = {
             "model": model or self._config.model,
             "messages": messages,
@@ -183,15 +292,16 @@ class GigaChatClient:
                 last["attachments"] = list(attachments)
                 payload["messages"] = [*messages[:-1], last]
 
-        data = await self._request_json(
+        data = await self._api_request(
             "POST",
             f"{self._config.api_base_url}/chat/completions",
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
             },
             json=payload,
+            generation=True,
+            timeout=timeout,
         )
         return self._extract_reply(data)
 
@@ -219,19 +329,14 @@ class GigaChatClient:
         Returns:
             Идентификатор загруженного файла.
         """
-        token = await self.get_access_token()
-
         form = aiohttp.FormData()
         form.add_field("purpose", purpose)
         form.add_field("file", data, filename=filename, content_type=mime)
 
-        body = await self._request_json(
+        body = await self._api_request(
             "POST",
             f"{self._config.api_base_url}/files",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
             data=form,
         )
         file_id = body.get("id")
@@ -251,28 +356,20 @@ class GigaChatClient:
             GigaChatAuthError: не задан ключ или не удалось получить токен.
             GigaChatAPIError: ошибка API.
         """
-        token = await self.get_access_token()
-        await self._request_json(
+        await self._api_request(
             "POST",
             f"{self._config.api_base_url}/files/{file_id}/delete",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
             expect_json=False,
         )
         logger.info("Файл %s удалён из хранилища GigaChat", file_id)
 
     async def get_models(self) -> list[str]:
         """Возвращает список доступных моделей (для отладки и TODO-проверок)."""
-        token = await self.get_access_token()
-        data = await self._request_json(
+        data = await self._api_request(
             "GET",
             f"{self._config.api_base_url}/models",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
+            headers={"Accept": "application/json"},
         )
         return [item.get("id", "") for item in data.get("data", [])]
 
@@ -330,10 +427,12 @@ class GigaChatClient:
         if not token:
             raise GigaChatAuthError(f"Ответ OAuth не содержит access_token: {data}")
 
-        # GigaChat возвращает expires_at (сек от эпохи). На случай
-        # expires_in в секундах считаем срок сами.
+        # GigaChat возвращает expires_at в мс от эпохи; секунды тоже принимаем
+        # (единица — по величине). На случай expires_in в секундах считаем срок сами.
         expires_at = data.get("expires_at")
         if isinstance(expires_at, (int, float)):
+            if expires_at > _EXPIRES_AT_MS_THRESHOLD:
+                expires_at = expires_at / 1000
             self._token_expires_at = float(expires_at)
         elif isinstance(data.get("expires_in"), (int, float)):
             self._token_expires_at = time.time() + float(data["expires_in"])
@@ -341,8 +440,68 @@ class GigaChatClient:
             logger.warning("OAuth-ответ без срока жизни токена, кэшируем на 5 мин")
             self._token_expires_at = time.time() + 300
 
-        logger.info("Получен новый access-токен GigaChat (срок до %.0f)", self._token_expires_at)
+        logger.info(
+            "Получен новый access-токен GigaChat (срок до %s)",
+            datetime.fromtimestamp(self._token_expires_at).strftime("%H:%M:%S %d.%m"),
+        )
         return str(token)
+
+    async def _api_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        data: Any | None = None,
+        json: Any | None = None,
+        expect_json: bool = True,
+        generation: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Запрос к API в общей очереди процесса (ретраи — внутри слота).
+
+        Токен берётся уже внутри слота: ожидание очереди может занять минуты,
+        и заранее полученный токен успел бы протухнуть.
+
+        ``generation`` — запрос генерации: таймаут не ретраится, а слот ещё
+        ``_TIMEOUT_COOLDOWN_SECONDS`` держится паузой, чтобы следующий запрос
+        очереди не получил 429 от брошенной генерации.
+
+        На HTTP 401 токен обновляется и запрос один раз повторяется сразу, не
+        отдавая слот; второй 401 уходит вызывающему. Ошибки OAuth (в том числе
+        таймаут) не повторяются и паузу не вызывают.
+        """
+        async with _stream_slot(self._config.priority):
+            for attempt in (1, 2):
+                token = await self.get_access_token()  # таймаут OAuth паузу не вызывает
+                try:
+                    return await self._request_json(
+                        method,
+                        url,
+                        headers={**headers, "Authorization": f"Bearer {token}"},
+                        data=data,
+                        json=json,
+                        expect_json=expect_json,
+                        retry_timeout=not generation,
+                        timeout=timeout,
+                    )
+                except GigaChatTimeoutError:
+                    if not generation:
+                        raise
+                    logger.warning(
+                        "Таймаут генерации %s (%s с): поток GigaChat на паузе %d с",
+                        url, timeout or self._config.timeout, _TIMEOUT_COOLDOWN_SECONDS,
+                    )
+                    await asyncio.sleep(_TIMEOUT_COOLDOWN_SECONDS)
+                    raise
+                except GigaChatAPIError as exc:
+                    if exc.status != 401 or attempt == 2:
+                        raise
+                    logger.warning(
+                        "HTTP 401 от %s: access-токен обновляется, запрос повторяется", url
+                    )
+                    self._access_token = None
+        raise AssertionError("недостижимо")  # цикл всегда возвращает или пробрасывает
 
     async def _request_json(
         self,
@@ -353,8 +512,13 @@ class GigaChatClient:
         data: Any | None = None,
         json: Any | None = None,
         expect_json: bool = True,
+        retry_timeout: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Выполняет запрос с ретраями на временные ошибки."""
+        """Выполняет запрос с ретраями на временные ошибки.
+
+        При ``retry_timeout=False`` таймаут пробрасывается сразу, без повтора.
+        """
         last_error: GigaChatError | None = None
         for attempt in range(self._config.max_retries):
             try:
@@ -365,9 +529,12 @@ class GigaChatClient:
                     data=data,
                     json=json,
                     expect_json=expect_json,
+                    timeout=timeout,
                 )
             except GigaChatError as exc:
                 last_error = exc
+                if isinstance(exc, GigaChatTimeoutError) and not retry_timeout:
+                    raise
                 if not exc.retryable or attempt == self._config.max_retries - 1:
                     raise
                 logger.warning(
@@ -386,8 +553,14 @@ class GigaChatClient:
         data: Any | None = None,
         json: Any | None = None,
         expect_json: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         session = await self._get_session()
+        # Без своего таймаута действует таймаут сессии (config.timeout)
+        extra: dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = aiohttp.ClientTimeout(total=timeout)
+        applied_timeout = timeout if timeout is not None else self._config.timeout
         try:
             async with session.request(
                 method,
@@ -395,6 +568,7 @@ class GigaChatClient:
                 headers=headers,
                 data=data,
                 json=json,
+                **extra,
             ) as resp:
                 try:
                     body = await resp.json(content_type=None)
@@ -424,8 +598,8 @@ class GigaChatClient:
                 f"Сетевая ошибка при запросе {url}: {exc}", retryable=True
             ) from exc
         except asyncio.TimeoutError as exc:
-            raise GigaChatAPIError(
-                f"Таймаут запроса {url} ({self._config.timeout}s)", retryable=True
+            raise GigaChatTimeoutError(
+                f"Таймаут запроса {url} ({applied_timeout}s)", retryable=True
             ) from exc
         except GigaChatAPIError:
             raise

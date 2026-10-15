@@ -2,9 +2,11 @@
 Асинхронное подключение к SQLite (SQLAlchemy 2.0), сессии и создание таблиц.
 """
 
+import logging
 from typing import Optional  # аннотация типа: переманная может содержать тип или быть None
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,  # Класс-тип для соединения в рамках транзакции
     AsyncEngine,  # Класс-тип для движка: отвечает за связь с БД
@@ -14,6 +16,13 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.models import Base, Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
+
+logger = logging.getLogger(__name__)
+
+# Сколько секунд SQLite-запись ждёт освобождения занятой БД, прежде чем упасть с "database is locked".
+# Записи короткие (миллисекунды), 10 с — запас на всплески fsync сетевого диска. Больше не берём:
+# хендлер PTB, ждущий блокировку, задерживает ответы всем пользователям.
+_SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
 _engine: Optional[AsyncEngine] = None  # приватная переменная для движка
 _async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None  # для сессий
@@ -27,13 +36,19 @@ def init_database(database_url: str, *, echo: bool = False) -> None:
     Ожидается URL вида ``sqlite+aiosqlite:///...`` (см. ``DATABASE_URL`` в ``.env``).
     Вызывается один раз при старте приложения.
 
+    Для SQLite явно задаёт ожидание занятой БД (``_SQLITE_BUSY_TIMEOUT_SECONDS``);
+    для других СУБД ``connect_args`` не передаётся.
+
     Args:
         database_url: Строка подключения SQLAlchemy.
         echo: при True будет печатать в консоль все SQL-запросы
     """
     global _engine, _async_session_factory  # global указывает, что хотим изменить первые две переменные, а не создавать локальные
 
-    _engine = create_async_engine(database_url, echo=echo)  # асинхронный движок - один на все время работы бота
+    connect_args = {}
+    if make_url(database_url).get_backend_name() == "sqlite":
+        connect_args["timeout"] = _SQLITE_BUSY_TIMEOUT_SECONDS  # aiosqlite -> sqlite3.connect -> busy_timeout
+    _engine = create_async_engine(database_url, echo=echo, connect_args=connect_args)  # асинхронный движок - один на все время работы бота
     # Фабрика сессий:
         # expire_on_commit=False: запрещает SQLAlchemy "обнулять" данные в объектах после сохранения в БД
         # autoflush=False: отключает автоматическую отправку изменений в БД после каждого изменения объекта
@@ -94,13 +109,40 @@ def get_session_maker() -> async_sessionmaker[AsyncSession]:
     return _async_session_factory
 
 
+async def _enable_wal(engine: AsyncEngine) -> None:
+    """
+    Переводит SQLite-базу в режим журнала WAL и пишет фактический режим в лог.
+
+    Для других СУБД ничего не делает. Не бросает исключений: если WAL включить не удалось
+    (база занята, среда не поддерживает), пишет WARNING и оставляет прежний режим.
+    Режим хранится в файле БД и действует на все следующие соединения, поэтому
+    достаточно одного вызова на старте.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    try:
+        # Отдельное соединение: режим нельзя сменить внутри открытой транзакции
+        async with engine.connect() as connection:
+            result = await connection.execute(text("PRAGMA journal_mode=WAL"))
+            mode = str(result.scalar()).lower()
+    except Exception as exc:
+        logger.warning("Не удалось включить режим журнала WAL: %s", exc)
+        return
+    if mode == "wal":
+        logger.info("Режим журнала SQLite: %s", mode)
+    else:
+        logger.warning("Режим журнала SQLite не WAL, а %s", mode)
+
+
 async def init_db_schema() -> None:
     """
     Создаёт все зарегистрированные таблицы, если их ещё нет (CREATE IF NOT EXISTS).
 
+    Перед созданием таблиц включается режим журнала WAL (только для SQLite, см. ``_enable_wal``).
     Перед вызовом должны быть импортированы все модели (см. импорт ``User``, ``Article`` выше).
     """
     engine = get_engine()
+    await _enable_wal(engine)
     async with engine.begin() as connection:
         # run_sync запускает синхронную функцию create_all
         # Base.metadata.create_all: SQLite смотри все модели и создает таблицы, которых еще нет в БД

@@ -100,7 +100,7 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      decrees/resolutions (regional) are `REGIONAL`. Old rows are not reclassified.
    - If no text is ready and the act `is_important()` (`IMPORTANT_LEVELS`:
      Конституция/ФКЗ/ФЗ), OCR is attempted via GigaChat on the source PDF
-     (`ocr_document_text`).
+     (`ocr_document_text`; its generation call has a 180 s timeout, `_OCR_TIMEOUT_SECONDS`).
    - If text was obtained (directly or via OCR), `summarizer.summarize()`
      calls GigaChat for a 140–280 char summary (`SUMMARY_MIN_LEN`/`MAX_LEN`).
      GigaChat refusals are detected (`classify_reply` in `gigachat.py`) and
@@ -117,7 +117,8 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      for routine decrees → `0` without LLM), else GigaChat by a rubric
      (`app/services/importance.py`; input = summary, else start of text; no
      text yet → scoring deferred). Score `≥ 2` triggers a background summary
-     (text, or OCR if absent) if there is none.
+     (text, or OCR if absent) if there is none; it yields to force-summarize: re-reads the
+     summary from the DB and waits for a running user task (`inflight_task`) instead of its own call.
    - Unscored candidates are retried ("backlog") at the end of every
      `check_legislation_updates` cycle (`_rate_backlog`, ≤14 days since
      `created_at`, ≤20 per cycle); no text for >24h → one OCR before scoring.
@@ -182,7 +183,13 @@ and appends "…", which can end mid-sentence.
   не опубликовано".
 - `/summary` — force-summarize a law by id/link; rate-limited per user per
   month via `SummarizationUsage` (`FORCE_SUMMARIZE_MONTHLY_LIMIT`); chat IDs
-  in `ADMIN_CHAT_IDS` are exempt from the limit.
+  in `ADMIN_CHAT_IDS` are exempt from the limit. Delivery is async (same for the
+  "Сделать саммари" buttons): the handler replies at once with a "⏳" status and returns,
+  the work runs as a background task (`_summary_tasks`, `_run_summary_task`); the status gets
+  a time estimate (`on_mode` callback: text / OCR) and the result always comes as a **new**
+  message (the status is deleted; for the button under a notification the notification itself is turned
+  into the status, so no old notification is left next to the result). Tasks
+  live in memory — lost on restart.
 - `/settings` — a `ConversationHandler` wizard (`level_wizard_handler`) for
   choosing legal-force filter levels, backed by `user_filters`.
 - `/help` — command reference.
@@ -205,24 +212,47 @@ capped by `DIGEST_ID_CAP`), `GET /app?view=today` (all acts published today: gro
 title search, full text loaded lazily on first expand) with its light JSON
 `GET /today_list` (no params — the date is always today in Moscow, server-side),
 `GET /full_text` (JSON with title, url, text,
-`is_text_available`, `summary`), `POST /summarize` (force-summarize a digest
-card; the user is identified by Telegram `initData` signature; every domain
-outcome carries a fresh `usage`), `POST /usage` (`{init_data}` → `{used, limit,
+`is_text_available`, `summary`, `summarizing` = a summarization of the document is running),
+`POST /summarize` (force-summarize a digest card; the user is identified by Telegram `initData`
+signature; every domain outcome carries a fresh `usage`). It answers fast: a ready result
+(cached summary / `limit` / cooldown / early error) at once, otherwise `accepted` with a time
+estimate (text ≤ 30 s / OCR 1–3 min / "model busy") while the summarization runs on in the
+background (separate task, so a dropped connection no longer loses the limit charge) and its
+result goes to the user's bot chat (`send_summary_result` from `app/bot/handlers.py`, the same
+message as `/summary`; `create_app`/`start_webapp` get the `bot`) **only if the page did not pick
+it up**: `_deliver_later` waits `PICKUP_WAIT_SECONDS` (7 s) after the result is ready for a
+`/summary_status` answer with `done` from the same user and document (`app["page_pickup"]`
+events; polls that arrive before the task finished do not count), so an open page shows the result
+itself and a closed/backgrounded one gets the chat message. The crash fallback message is always sent.
+`POST /summary_status` (`{external_id, init_data}` → `running` / `done` + `status`, `summary`,
+`text`, `message`, `retry_after`, `usage`) is what the page polls every 3 s while waiting; a card
+that opens (or is re-checked) with `summarizing` set waits for the running task instead of
+showing the button, and a failure seen by such an observer passes without a toast. `POST /usage` (`{init_data}` → `{used, limit,
 unlimited, resets_on}`; counter chip on digest/today pages, same auth as
 `/summarize` via `_auth_user`) and `GET /health`.
-After a temporary summarize failure for a document there is a 60 s cooldown
-(`SUMMARIZE_COOLDOWN_SECONDS`, in-memory `app["summarize_failed_at"]`) answered
-without calling GigaChat, for any user; the page shows a toast banner and a
+After a temporary summarize failure (`no_text`/`error`) of a document there is a 60 s cooldown
+(`SUMMARIZE_COOLDOWN_SECONDS`) counted from the core's failure registry
+(`force_summary.recent_failure`, status + time, kept 10 minutes in memory), so a failure from any
+entry point (bot, panel, Mini-App) sets it; it is answered without calling GigaChat, for any user
+(the bot and the moderation panel do not apply it; the panel keeps its own
+`app["summarize_failed_at"]`); the page shows a toast banner and a
 muted button with a countdown. Failures and cooldown do not consume the user's
 monthly limit. The force-summarize core is `app/services/force_summary.py`,
-shared with the bot (`/summary`, "Сделать саммари" buttons).
+shared with the bot (`/summary`, "Сделать саммари" buttons). A paid summarization holds a limit
+reserve (`summary_usage.reserve/release`) while in flight, so a user cannot start more of them than
+they have attempts left; the counter shows reserved attempts as used. At most one summarization runs per
+`external_id`: a repeated request (any entry point, any user) joins the running task and
+receives its result without a model call or spending the user's limit; only the initiator is
+charged, on success (`ForceSummaryResult.from_cache` = taken from the DB, never charged).
 
 ### Deployment
 
 `Dockerfile` (`python:3.14-slim`, `python -m app.main`) + `docker-compose.yml`
 (`.env`, volumes `./data` and `./logs`) — runs on Dockhost; see spec `deployment`.
 `openspec/`, `docs/`, `.env`, `data/`, `logs/` are excluded from the image.
-SQLite lives in `data/`; `app/services/backup.py` makes periodic consistent
+SQLite lives in `data/` in WAL mode (switched on at startup by `init_db_schema`; writes wait up
+to 10 s for a busy DB), so `<db>-wal`/`<db>-shm` files sit next to it — delete them before restoring
+a backup (see README). `app/services/backup.py` makes periodic consistent
 copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 
 ### Key modules
@@ -230,13 +260,13 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | File | Responsibility |
 |------|-----------------|
 | `app/core/config.py` | `Config.load()` — the single source of settings from `.env` |
-| `app/core/database.py` | Engine + async session factory + table creation |
+| `app/core/database.py` | Engine + async session factory + table creation; SQLite: WAL on start (`_enable_wal`, failure = WARNING only), `busy_timeout` 10 s |
 | `app/models/user.py` | `User` — Telegram subscribers |
 | `app/models/article.py` | `Article` — processed laws (`external_id` unique, `level`) |
 | `app/models/user_filter.py` | `UserFilter` — per-user legal-force filter rows |
 | `app/models/usage.py` | `SummarizationUsage` — monthly force-summarize counter |
 | `app/services/rss_parser.py` | pravo.gov.ru list/text/OCR + level classification |
-| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection) |
+| `app/services/gigachat.py` | GigaChat HTTP client (auth token, files, completions, refusal detection); one process-wide request queue: one API call at a time, `priority="user"` calls go ahead of `"background"` (default), `calls_ahead_of_user()`; a generation (`complete`) that times out is **not retried** and the queue slot is held for a 60 s pause (`_TIMEOUT_COOLDOWN_SECONDS`) so the abandoned generation does not turn the next request into a 429; `complete(timeout=)` overrides the 60 s default per call; the access token is refreshed by its `expires_at` (milliseconds from the epoch, unit detected by magnitude), and on HTTP 401 the request is retried once with a new token inside the same queue slot |
 | `app/services/summarizer.py` | Prompt + summarization logic |
 | `app/services/importance.py` | Importance 0–3: title prefilter + GigaChat rubric (`score_importance`) |
 | `app/services/weekly_window.py` | Pure functions: Friday digest moments, daytime window, Sunday deadline |
@@ -246,12 +276,12 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
-| `app/services/summary_usage.py` | Read-only summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
-| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling) |
+| `app/services/summary_usage.py` | Summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) plus in-memory "in flight" reserve (`reserve`/`release`/`reserved`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
+| `app/services/force_summary.py` | Force-summarize core shared by bot and Mini-App (limits, cache, refusal handling, in-flight dedup by `external_id`; its GigaChat clients use `priority="user"`; `recent_failure()` — reason/time of the last failure per document, 10 min) |
 | `app/services/channel_subscription.py` | `is_subscribed()` — Telegram channel gate check (fail-closed) |
 | `app/services/backup.py` | SQLite backup job (`VACUUM INTO`) with rotation |
 | `app/services/demo_article.py` | Constants of the onboarding demo article |
-| `app/bot/handlers.py` | All Telegram command/callback/conversation handlers |
+| `app/bot/handlers.py` | All Telegram command/callback/conversation handlers; `send_summary_result`/`send_summary_crash` (take `bot`) deliver a force-summarize result to the chat for both the bot and the Mini-App |
 | `app/webapp/server.py` | aiohttp Mini-App server: full text, digest cards with summaries, force-summarize |
 
 For a much more detailed, code-line-referenced walkthrough of the same flow
