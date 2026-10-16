@@ -8,6 +8,7 @@ from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import desc, select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update, WebAppInfo
+from telegram.error import BadRequest
 from telegram.helpers import escape_markdown
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
@@ -586,6 +587,18 @@ def _subscribe_prompt() -> tuple[str, InlineKeyboardMarkup]:
     return text, markup
 
 
+async def _edit_ignoring_not_modified(
+    query, text: str, reply_markup: InlineKeyboardMarkup
+) -> None:
+    """``edit_message_text``, не падающий на «Message is not modified» (повторное нажатие)."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+        logger.debug("Сообщение не изменилось, правка пропущена: %s", exc)
+
+
 async def onboarding_show_example(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Онбординг нового пользователя: «Как это работает?» → тестовое уведомление → гейт подписки."""
     query = update.callback_query
@@ -613,9 +626,10 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Проверить подписку", callback_data="check_subscription")]]
         )
-        await query.edit_message_text(
+        await _edit_ignoring_not_modified(
+            query,
             "Подписка на канал не найдена. Подпишитесь и нажмите «Проверить подписку» ещё раз.",
-            reply_markup=markup,
+            markup,
         )
         return
 
@@ -633,7 +647,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("Пропустить → Все", callback_data="wizard:skip")],
         ]
     )
-    await query.edit_message_text("Подписка подтверждена! Настроим фильтры:", reply_markup=markup)
+    await _edit_ignoring_not_modified(query, "Подписка подтверждена! Настроим фильтры:", markup)
 
 
 def require_channel_verified(handler):
