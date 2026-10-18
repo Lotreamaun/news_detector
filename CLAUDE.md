@@ -101,6 +101,9 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
    - If no text is ready and the act `is_important()` (`IMPORTANT_LEVELS`:
      Конституция/ФКЗ/ФЗ), OCR is attempted via GigaChat on the source PDF
      (`ocr_document_text`; its generation call has a 180 s timeout, `_OCR_TIMEOUT_SECONDS`).
+     A service reply of the model about a failed recognition (label `НЕТ_ТЕКСТА`, phrases like
+     "не удалось распознать… файл", a short reply with no "№" and no year; `_is_ocr_failure`) counts
+     as no text (`None`); the summary check (`classify_reply`) is unchanged.
    - If text was obtained (directly or via OCR), `summarizer.summarize()`
      calls GigaChat for a 140–280 char summary (`SUMMARY_MIN_LEN`/`MAX_LEN`).
      GigaChat refusals are detected (`classify_reply` in `gigachat.py`) and
