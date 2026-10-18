@@ -47,6 +47,11 @@ _MAX_OCR_TOKENS = 4_000
 # Таймаут генерации OCR (сек): по логам распознавание скана идёт 10–80 с,
 # общий таймаут клиента (60 с) для него мал
 _OCR_TIMEOUT_SECONDS = 180.0
+# Метка, которой модель по промпту отвечает, если не прочитала ни одного фрагмента
+_OCR_NO_TEXT_MARKER = "НЕТ_ТЕКСТА"
+# Ответ OCR длиннее этого — точно текст, а не служебное сообщение: известные сбои
+# короче 300 символов, а настоящие акты короче 1000 содержат «№» и год (бэкапы БД, логи)
+_OCR_FAILURE_MAX_LEN = 1000
 
 # Базовый URL редакционного API actual.pravo.gov.ru (HTTP_HOST из config.js)
 _ACTUAL_BASE_URL = "http://actual.pravo.gov.ru:8000/api/ebpi"
@@ -130,8 +135,34 @@ _OCR_PROMPT = (
     "Перед тобой скан нормативного правового акта. Распознай и выведи "
     "весь текст документа без изменений и без комментариев: заголовок, "
     "преамбулу, статьи, подпись. Если какой-то фрагмент не читается — "
-    "пропускай его и продолжай."
+    "пропускай его и продолжай. Если в документе не удалось прочитать "
+    f"ни одного фрагмента — ответь ровно: {_OCR_NO_TEXT_MARKER}"
 )
+
+# Служебный ответ модели о неудаче распознавания: фраза неудачи + упоминание файла/действия
+_OCR_FAIL_PHRASE_RE = re.compile(
+    r"не\s+(?:удалось|удаётся|удается|могу)\s+распознать|не\s+распознан", re.IGNORECASE
+)
+_OCR_FAIL_CONTEXT_RE = re.compile(r"файл|повтор|попроб|формат|загруз", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _is_ocr_failure(text: str) -> bool:
+    """
+    Определяет, что ответ OCR — служебное сообщение о неудаче, а не текст акта.
+
+    Только для коротких ответов (до ``_OCR_FAILURE_MAX_LEN``); срабатывает, если есть
+    метка ``НЕТ_ТЕКСТА``, или фраза «не удалось распознать» вместе с упоминанием
+    файла/действия, или нет ни «№», ни года (у настоящего акта они есть).
+    """
+    text = text.strip()
+    if len(text) > _OCR_FAILURE_MAX_LEN:
+        return False
+    if _OCR_NO_TEXT_MARKER in text.upper():
+        return True
+    if _OCR_FAIL_PHRASE_RE.search(text) and _OCR_FAIL_CONTEXT_RE.search(text):
+        return True
+    return "№" not in text and not _YEAR_RE.search(text)
 
 
 class RssError(RuntimeError):
@@ -385,7 +416,8 @@ async def ocr_document_text(
         pdf_url: URL PDF (по умолчанию ``/file/pdf?eoNumber=<id>``).
 
     Returns:
-        Текст закона или ``None`` при любой ошибке (best-effort).
+        Текст закона или ``None`` при любой ошибке и при неудаче распознавания
+        (служебный ответ модели вместо текста) — best-effort.
     """
     pdf_bytes = await _download_pdf(external_id, pdf_url=pdf_url)
     if pdf_bytes is None:
@@ -412,6 +444,14 @@ async def ocr_document_text(
             return None
         if _kind == "refusal":
             logger.warning("GigaChat отказался распознавать текст для %s", external_id)
+            return None
+        if _is_ocr_failure(text):
+            logger.warning(
+                "OCR GigaChat не распознал документ %s (служебный ответ, %d симв.): %r",
+                external_id,
+                len(text),
+                text[:200],
+            )
             return None
         logger.info("OCR GigaChat извлёк текст для %s (%d символов)", external_id, len(text))
         normalized = _normalize_text(text) or text
