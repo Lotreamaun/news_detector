@@ -169,6 +169,31 @@ CORS. Moderation is available only with `WEEKLY_DIGEST_TIME`, `WEBAPP_URL` and `
 (otherwise the digest goes automatically; reason is logged at start). Shared Mini-App styles
 live in `app/webapp/static/webapp.css`. Spec: `weekly-digest-moderation`.
 
+**Admin panel and stats (`stats.py`, `events.py`, `webapp/admin.py`).** The panel is served when
+`WEBAPP_URL` and `ADMIN_CHAT_IDS` are set (base: `/admin`, `/admin/login`, `/admin/api/meta`,
+`/admin/api/stats`); the moderation routes (`state`/`toggle`/`summary`/`export`) are added only if
+`WEEKLY_DIGEST_TIME` is set too (otherwise 404, the tab "Подборка" is hidden via `meta.moderation`).
+The "Статистика" tab shows "Пульс" (today / 7 days by Moscow, audience, engagement, delivery,
+pipeline health, level filters, last-50 feed; auto-refresh every 60 s only while the page is visible)
+and "Тренд" (12 weeks, inline-SVG bars; "нет данных" before `MIN(events.at)`). Everything is computed
+per request from SQL; admins (`ADMIN_CHAT_IDS`, current value) are excluded from user metrics but
+shown in the feed with a mark. `/admin` replies with a service note, the moderation summary (if
+available), a one-time link and a `web_app` button (private chats only); the reminder's "Ссылка для
+браузера" callback still sends the link only. Spec: `bot-activity-stats`.
+
+**Event journal (`app/models/event.py`, `app/services/events.py`).** Table `events`
+(`at` UTC, `kind`, `telegram_id` NULL for system events, `ref`). `record_event(session_maker, kind,
+telegram_id, ref)` is fire-and-forget (background task, failure = `logger.warning`, never breaks the
+caller). Sources: `track_activity` (`TypeHandler`, group -1: `cmd` — only names from `BOT_COMMANDS`,
+else `other`; `button` — first two `callback_data` segments), `track_bot_blocked` (`my_chat_member`,
+private chats; time from the update; does not touch `is_active`), `start`/`check_subscription`/settings
+wizard, `force_summarize` (wrapper around `_force_summarize`), `_send_notification(kind=law|digest|weekly)`,
+`check_legislation_updates`, `_process_entry` (`act.processed` = `<page|ocr|none>/<ok|refused|error|none>`,
+not written by backfill), `_send_weekly_digest`, and `POST /seen` (Mini-App open, verified `initData`,
+always 204). New event kinds: add a constant in `events.py`, a line in `stats._describe` if it should
+appear in the feed, and extend `BOT_COMMANDS` when adding a command. `purge_old_events` (daily job)
+drops events older than 365 days.
+
 Known quirks (not bugs of this feature): a double GigaChat refusal while scoring
 gives importance `2` (sensitive topics must not drop out), but if the summary
 also fails the act is then excluded from the digest; `classify_level_for_title`
@@ -197,8 +222,9 @@ and appends "…", which can end mid-sentence.
   choosing legal-force filter levels, backed by `user_filters`.
 - `/help` — command reference.
 - `/test_digest real <N>` / `/test_digest weekly` — admin-only debug previews.
-- `/admin` (and the reminder's "Ссылка для браузера" button) — admin-only; sends a one-time
-  login link to the moderation panel (link preview disabled so Telegram does not burn the token).
+- `/admin` (and the reminder's "Ссылка для браузера" button) — admin-only; `/admin` sends the
+  service note + summary + one-time login link + "Открыть панель" button, the button only the link
+  (link preview disabled so Telegram does not burn the token).
 - Onboarding: `/start` registers the user and, if `REQUIRED_CHANNEL_ID` is set,
   asks to subscribe to the channel (`check_subscription` callback); a "show
   example" button sends the demo article (`app/services/demo_article.py`,
@@ -214,7 +240,7 @@ aiohttp server started from `post_init` on `WEBAPP_HOST:WEBAPP_PORT`. Routes:
 capped by `DIGEST_ID_CAP`), `GET /app?view=today` (all acts published today: groups,
 title search, full text loaded lazily on first expand) with its light JSON
 `GET /today_list` (no params — the date is always today in Moscow, server-side),
-`GET /full_text` (JSON with title, url, text,
+`POST /seen` (page-open event for the journal, see above), `GET /full_text` (JSON with title, url, text,
 `is_text_available`, `summary`, `summarizing` = a summarization of the document is running),
 `POST /summarize` (force-summarize a digest card; the user is identified by Telegram `initData`
 signature; every domain outcome carries a fresh `usage`). It answers fast: a ready result
@@ -276,7 +302,10 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/models/weekly_digest_run.py` | `WeeklyDigestRun` — one row per sent weekly period (idempotency) |
 | `app/services/today.py` | Pure rules for `/today`: Moscow "today" and day bounds, `scope_of` (group by `external_id`), importance order, `pick_top`, `group_for_page` |
 | `app/services/weekly_review.py` | Moderation rules without HTTP/DB: `final_selection`, `target_period`, short title, Markdown export |
-| `app/webapp/admin.py` | Moderation panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` |
+| `app/webapp/admin.py` | Admin panel HTTP: login tokens/sessions, `require_admin`, `/admin/api/*` (meta, stats, moderation) |
+| `app/models/event.py` | `Event` — event journal row (see "Event journal") |
+| `app/services/events.py` | Event kinds, fire-and-forget `record_event`, daily `purge_old_events` |
+| `app/services/stats.py` | `pulse()` / `trend()` SQL aggregates for the "Статистика" tab |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
 | `app/services/summary_usage.py` | Summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) plus in-memory "in flight" reserve (`reserve`/`release`/`reserved`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
@@ -321,7 +350,7 @@ This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
 `legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
 `digest-notifications`, `force-summarization`, `law-importance-scoring`,
-`weekly-important-digest`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
+`weekly-important-digest`, `bot-activity-stats`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
 in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
 change), finished ones moved under `openspec/changes/archive/` (dated). There
 are currently no active changes; `law-sphere-filter` and `law-region-filter`

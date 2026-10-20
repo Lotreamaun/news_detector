@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>Модерация подборки</title>
+<title>Админ-панель</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="/static/webapp.css">
 <style>
@@ -97,23 +97,83 @@
   .sheet textarea { width: 100%; height: 40vh; font: inherit; font-size: 16px; background: var(--bg); color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
   .center-msg { text-align: center; padding: 40px 8px; }
   .toast { z-index: 20; }
+
+  /* вкладки «Подборка | Статистика» и переключатель «Пульс | Тренд» */
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tab { flex: 1; min-height: 40px; background: var(--soft); border: 0; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: var(--muted); }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--tg-theme-button-text-color, #fff); }
+  .seg { display: inline-flex; background: var(--soft); border-radius: 10px; padding: 2px; }
+  .seg button { min-height: 36px; padding: 0 16px; border: 0; background: none; border-radius: 8px; font-size: 14px; cursor: pointer; color: var(--muted); }
+  .seg button[aria-selected="true"] { background: var(--bg); color: inherit; font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .25); }
+  .upd { font-size: 12px; color: var(--muted); }
+  .upd.warn { color: #842029; font-weight: 600; }
+  .dark .upd.warn { color: #ea868f; }
+
+  /* Пульс */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .tile { background: var(--soft); border-radius: 10px; padding: 8px 12px; min-width: 0; }
+  .tile-label { font-size: 12px; color: var(--muted); }
+  .tile-val { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.25; }
+  .tile-sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .alert { border: 1px solid #f5c2c7; border-radius: 8px; padding: 8px 10px; color: #842029; background: #f8d7da; }
+  .dark .alert { color: #ea868f; background: #2c0b0e; border-color: #842029; }
+  .panel { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 14px; line-height: 1.5; }
+  .panel + .panel { margin-top: 8px; }
+  .panel b { font-variant-numeric: tabular-nums; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 14px; }
+  .kv b { font-variant-numeric: tabular-nums; }
+  .feed { list-style: none; margin: 0; padding: 0; }
+  .feed li { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.4; }
+  .feed li:last-child { border-bottom: 0; }
+  .feed time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; padding-top: 1px; }
+  .feed-user { font-weight: 600; overflow-wrap: anywhere; }
+  .tag-admin { font-size: 11px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; margin-left: 4px; }
+
+  /* Тренд */
+  .trend-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .trend-row:last-child { border-bottom: 0; }
+  .trend-name { font-size: 14px; font-weight: 600; }
+  .trend-now { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .trend-now b { font-size: 16px; color: inherit; }
+  .spark { width: 188px; height: 36px; flex: none; }
+  .spark .bar { fill: var(--accent); }
+  .spark .bar.cur { opacity: .5; }
+  .spark .nodata { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 2; opacity: .6; }
 </style>
 </head>
 <body>
 <header class="top">
   <div class="top-inner">
-    <div class="top-row">
-      <h1>Подборка недели</h1>
-      <span id="saved" class="saved" role="status" aria-live="polite"></span>
+    <div id="tabs" class="tabs" role="tablist" hidden>
+      <button type="button" class="tab" role="tab" data-tab="digest">Подборка</button>
+      <button type="button" class="tab" role="tab" data-tab="stats">Статистика</button>
     </div>
-    <div id="stats" class="stats"></div>
-    <div id="when" class="when"></div>
+    <div id="digest-head">
+      <div class="top-row">
+        <h1>Подборка недели</h1>
+        <span id="saved" class="saved" role="status" aria-live="polite"></span>
+      </div>
+      <div id="stats" class="stats"></div>
+      <div id="when" class="when"></div>
+    </div>
+    <div id="stats-head" hidden>
+      <div class="top-row">
+        <h1>Статистика</h1>
+        <div class="seg" id="seg" role="tablist">
+          <button type="button" role="tab" data-kind="pulse">Пульс</button>
+          <button type="button" role="tab" data-kind="trend">Тренд</button>
+        </div>
+      </div>
+      <div id="upd" class="upd" role="status" aria-live="polite">&nbsp;</div>
+    </div>
   </div>
 </header>
 <main>
-  <div id="main" class="main-inner" aria-busy="true"><div class="center-msg loading">Загрузка…</div></div>
+  <div id="fatal" class="main-inner center-msg" hidden></div>
+  <div id="main" class="main-inner" aria-busy="true" hidden><div class="center-msg loading">Загрузка…</div></div>
+  <div id="stats-main" class="main-inner" aria-busy="true" hidden><div class="center-msg loading">Загрузка…</div></div>
 </main>
-<footer class="bar">
+<footer class="bar" id="bar" hidden>
   <div class="bar-inner">
     <div id="barline" class="bar-line">&nbsp;</div>
     <button id="copy" type="button" class="sum-btn" disabled>Скопировать Markdown</button>
@@ -542,12 +602,274 @@
   });
   document.addEventListener('visibilitychange', function() { if (!document.hidden) refreshIfIdle(); });
   function refreshIfIdle() {
+    if (!moderation || tab !== 'digest') return;
     if (view === 'expired' || view === 'forbidden' || pending.size || busy.size) return;
     load(true);
   }
   setInterval(function() { if (!document.hidden) refreshIfIdle(); }, REFRESH_MS);
   setInterval(updateClock, 15000);
-  load();
+
+  // ---- статистика: Пульс и Тренд ----
+  const STATS_REFRESH_MS = 60000;
+  const LEVEL_LABELS = { CONSTITUTION: 'Конституция', FKZ: 'ФКЗ', FZ: 'ФЗ', DECREE: 'Указы', GOV_RESOLUTION: 'Постановления', DEPARTMENTAL: 'Ведомственные', REGIONAL: 'Региональные' };
+  const SOURCE_LABELS = [['page', 'страница'], ['ocr', 'OCR'], ['none', 'нет текста']];
+  const OUTCOME_LABELS = [['ok', 'готово'], ['refused', 'отказ'], ['error', 'ошибка'], ['none', 'без саммари']];
+  const NS = 'http://www.w3.org/2000/svg';
+  let moderation = false;
+  let tab = 'stats';           // digest | stats
+  let statsKind = 'pulse';     // pulse | trend
+  const sv = { pulse: null, trend: null, error: '', fatal: '', lastOk: 0, stale: false, loading: {} };
+
+  function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* без запоминания работает как раньше */ } }
+
+  function ago(ms) {
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return 'только что';
+    if (m < 60) return m + ' мин назад';
+    const hh = Math.floor(m / 60);
+    return hh < 24 ? hh + ' ч назад' : Math.floor(hh / 24) + ' д назад';
+  }
+  function mskTime(iso) {
+    return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
+  }
+  function mskDay(iso) {
+    return new Date(iso).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' });
+  }
+
+  function statsStatus() {
+    if (sv.fatal) return sv.fatal;
+    if (sv[statsKind]) return 'ready';
+    return sv.error ? 'error' : 'loading';
+  }
+  async function loadStats(kind, silent) {
+    if (sv.loading[kind]) return;   // запрос этого вида уже идёт (Пульс и Тренд грузятся независимо)
+    sv.loading[kind] = true;
+    try {
+      sv[kind] = await api('/admin/api/stats?view=' + kind);
+      sv.error = '';
+      sv.stale = false;
+      if (kind === 'pulse') sv.lastOk = Date.now();
+    } catch (e) {
+      if (e.kind === 'expired' || e.kind === 'forbidden') sv.fatal = e.kind;
+      else if (sv[kind]) { sv.stale = true; if (!silent) showToast(e.message); }   // прежние данные остаются на экране
+      else sv.error = e.message;
+    }
+    sv.loading[kind] = false;
+    if (tab === 'stats' && statsKind === kind) renderStatsTab();
+  }
+  function refreshPulse() {
+    if (document.hidden || tab !== 'stats' || statsKind !== 'pulse' || sv.fatal) return;
+    loadStats('pulse', true);
+  }
+
+  function tile(label, value, sub) {
+    return h('div', { class: 'tile' },
+      h('div', { class: 'tile-label', text: label }),
+      h('div', { class: 'tile-val', text: String(value) }),
+      sub != null && h('div', { class: 'tile-sub', text: sub }));
+  }
+  function periodTile(label, pair) {
+    return tile(label, pair.today, '7 дн: ' + pair.week);
+  }
+  function kv(label, value) {
+    return h('div', { class: 'kv' }, h('span', { text: label }), h('b', { text: String(value) }));
+  }
+  function block(title, hint, body) {
+    return h('section', {}, h('h2', { class: 'sec-title', text: title }), hint && h('p', { class: 'sec-hint', text: hint }), body);
+  }
+
+  function pipelineBlock(p) {
+    const body = [];
+    const c = p.last_check;
+    if (!c) {
+      body.push(h('div', { class: 'panel', text: 'Проверок pravo.gov.ru в журнале пока нет.' }));
+    } else {
+      const age = ago(Date.now() - new Date(c.at).getTime());
+      const text = c.ok
+        ? 'Последняя проверка: ' + age + ' (' + mskTime(c.at) + '), новых актов: ' + (c.new == null ? '—' : c.new)
+        : 'Последняя проверка не удалась: ' + age + ' (' + mskTime(c.at) + ')';
+      body.push(h('div', { class: 'panel' + (c.attention ? ' alert' : '') },
+        (c.attention ? '⚠️ ' : '') + text,
+        c.attention && c.ok && h('div', { text: 'Проверок давно не было — бот мог остановиться.' })));
+    }
+    const a = p.acts_24h;
+    const parts = function(labels, counts) { return labels.map(function(l) { return l[1] + ' ' + counts[l[0]]; }).join(' · '); };
+    body.push(h('div', { class: 'panel' },
+      h('div', {}, 'Акты за 24 часа: ', h('b', { text: String(a.total) })),
+      a.total > 0 && h('div', { class: 'sec-hint', style: 'margin:4px 0 0', text: 'Текст: ' + parts(SOURCE_LABELS, a.source) }),
+      a.total > 0 && h('div', { class: 'sec-hint', style: 'margin:2px 0 0', text: 'Саммари: ' + parts(OUTCOME_LABELS, a.outcome) })));
+    return block('Конвейер', null, body);
+  }
+  function filtersBlock(f) {
+    const rows = f.levels.map(function(l) { return kv(LEVEL_LABELS[l.level] || l.level, l.count); });
+    rows.push(kv('Без ограничений (все уровни)', f.unrestricted));
+    return block('Фильтры подписчиков', 'Сколько подписчиков выбрали каждый уровень силы.', h('div', { class: 'panel' }, rows));
+  }
+  function feedBlock(feed) {
+    const body = feed.length
+      ? h('ul', { class: 'feed' }, feed.map(function(e) {
+          return h('li', {},
+            h('time', { datetime: e.at, text: e.time }),
+            h('span', {},
+              e.user && h('span', { class: 'feed-user', text: e.user }),
+              e.is_admin && h('span', { class: 'tag-admin', text: 'админ' }),
+              (e.user ? ' ' : '') + e.text));
+        }))
+      : h('div', { class: 'empty', text: 'Событий пока нет. Они появятся, как только бот начнёт работать с журналом.' });
+    return block('Лента', 'Последние события (время по Москве). Рассылки и успешные проверки сюда не попадают.', body);
+  }
+  function pulseView(d) {
+    const a = d.audience, e = d.engagement, dl = d.delivery;
+    return h('div', {},
+      block('Аудитория сейчас', null, h('div', { class: 'tiles' },
+        tile('Подписчики', a.subscribers, 'получают уведомления'),
+        tile('Зарегистрировано', a.registered),
+        tile('Без проверки канала', a.unverified),
+        tile('Заблокировали бота', a.blocked))),
+      block('Сегодня и за 7 дней', 'Календарные дни по Москве, администраторы не учитываются.', h('div', { class: 'tiles' },
+        periodTile('Новые', a.new),
+        periodTile('Заблокировали бота', a.blocked_new),
+        periodTile('Активные', e.active),
+        periodTile('Открытия Mini-App', e.opens),
+        periodTile('Саммари по запросу', e.summaries),
+        periodTile('Доставлено', dl.sent),
+        periodTile('Не доставлено', dl.failed),
+        tile('Упёрлись в лимит', e.limit_month, 'в этом месяце'))),
+      pipelineBlock(d.pipeline),
+      filtersBlock(d.filters),
+      feedBlock(d.feed));
+  }
+
+  function spark(series, weeks) {
+    const n = series.values.length, bw = 12, gap = 4, H = 36, W = n * (bw + gap) - gap;
+    const max = Math.max.apply(null, [1].concat(series.values.map(function(v) { return v == null ? 0 : v; })));
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('class', 'spark');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', series.title + ' по неделям: ' + series.values.map(function(v) { return v == null ? 'нет данных' : v; }).join(', '));
+    series.values.forEach(function(v, i) {
+      const rect = document.createElementNS(NS, 'rect');
+      const x = i * (bw + gap);
+      const tip = document.createElementNS(NS, 'title');
+      const label = mskDay(weeks[i].start + 'T00:00:00+03:00') + (weeks[i].current ? ' (идёт)' : '');
+      tip.textContent = label + ': ' + (v == null ? 'нет данных' : v);
+      if (v == null) {
+        rect.setAttribute('class', 'nodata');   // «нет данных» — пунктирный контур, не нулевой столбик
+        rect.setAttribute('x', x + 0.5); rect.setAttribute('y', 0.5);
+        rect.setAttribute('width', bw - 1); rect.setAttribute('height', H - 1);
+      } else {
+        const ht = v === 0 ? 1 : Math.max(2, Math.round(v / max * (H - 2)));
+        rect.setAttribute('class', 'bar' + (weeks[i].current ? ' cur' : ''));
+        rect.setAttribute('x', x); rect.setAttribute('y', H - ht);
+        rect.setAttribute('width', bw); rect.setAttribute('height', ht);
+      }
+      rect.appendChild(tip);
+      svg.appendChild(rect);
+    });
+    return svg;
+  }
+  function trendView(d) {
+    const first = d.weeks[0].start, hasGaps = d.series.some(function(s) { return s.values.indexOf(null) >= 0; });
+    const hint = 'Недели пн–вс по Москве, с ' + mskDay(first + 'T00:00:00+03:00') + '. Последний (бледный) столбец — текущая неделя, она ещё идёт.'
+      + (hasGaps ? ' Пунктир — «нет данных»: журнал событий ведётся с ' + (d.tracking_since ? mskDay(d.tracking_since) : 'первого события') + '.' : '');
+    return block('Последние 12 недель', hint, d.series.map(function(s) {
+      const cur = s.values[s.values.length - 1];
+      return h('div', { class: 'trend-row' },
+        h('div', {}, h('div', { class: 'trend-name', text: s.title }),
+          h('div', { class: 'trend-now' }, 'эта неделя: ', h('b', { text: cur == null ? 'нет данных' : String(cur) }))),
+        spark(s, d.weeks));
+    }));
+  }
+
+  function updateStatsClock() {
+    const el = $('upd');
+    el.classList.remove('warn');
+    if (statsKind === 'pulse' && sv.lastOk) {
+      const age = Date.now() - sv.lastOk;
+      if (sv.stale) { el.textContent = '⚠️ Не удалось обновить — данные ' + ago(age); el.classList.add('warn'); }
+      else el.textContent = 'Обновлено ' + ago(age) + ' · автообновление раз в минуту';
+    } else if (statsKind === 'trend' && sv.trend) {
+      el.textContent = (sv.stale ? '⚠️ Не удалось обновить — ' : '') + 'Данные на ' + mskTime(sv.trend.generated_at) + ' · Тренд сам не обновляется';
+      if (sv.stale) el.classList.add('warn');
+    } else {
+      el.innerHTML = '&nbsp;';
+    }
+  }
+  function renderStatsTab() {
+    const root = $('stats-main');
+    const scrollY = window.scrollY;     // перестройка блоков не должна сбрасывать прокрутку
+    const st = statsStatus();
+    root.setAttribute('aria-busy', st === 'loading' ? 'true' : 'false');
+    root.textContent = '';
+    if (st === 'loading') {
+      root.append(h('div', { class: 'center-msg loading', text: 'Загрузка…' }));
+    } else if (st === 'expired') {
+      root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Сессия закончилась. Отправьте боту команду /admin и откройте новую ссылку (в Telegram — кнопку «Открыть панель» в ответе).' })));
+    } else if (st === 'forbidden') {
+      root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Доступ только для администраторов.' })));
+    } else if (st === 'error') {
+      root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: sv.error || 'Не удалось загрузить статистику.' }),
+        h('button', { type: 'button', class: 'sum-btn', onclick: function() { sv.error = ''; renderStatsTab(); loadStats(statsKind); } }, 'Повторить')));
+    } else {
+      root.append(statsKind === 'pulse' ? pulseView(sv.pulse) : trendView(sv.trend));
+    }
+    updateStatsClock();
+    window.scrollTo(0, scrollY);
+  }
+  function setStatsKind(kind) {
+    statsKind = kind;
+    lsSet('adminStatsKind', kind);
+    document.querySelectorAll('#seg button').forEach(function(b) { b.setAttribute('aria-selected', String(b.dataset.kind === kind)); });
+    sv.error = '';
+    renderStatsTab();
+    loadStats(kind, true);   // Тренд обновляется при каждом открытии, автоматически — только Пульс
+  }
+
+  // ---- вкладки ----
+  function setTab(next) {
+    tab = next;
+    lsSet('adminTab', next);
+    const isDigest = next === 'digest';
+    $('digest-head').hidden = !isDigest;
+    $('stats-head').hidden = isDigest;
+    $('main').hidden = !isDigest;
+    $('stats-main').hidden = isDigest;
+    $('bar').hidden = !isDigest;
+    document.querySelectorAll('#tabs .tab').forEach(function(b) { b.setAttribute('aria-selected', String(b.dataset.tab === next)); });
+    window.scrollTo(0, 0);
+    if (isDigest) { if (state) load(true); else { view = 'loading'; render(); load(); } }
+    else setStatsKind(statsKind);
+  }
+  document.querySelectorAll('#tabs .tab').forEach(function(b) { b.addEventListener('click', function() { if (b.dataset.tab !== tab) setTab(b.dataset.tab); }); });
+  document.querySelectorAll('#seg button').forEach(function(b) { b.addEventListener('click', function() { if (b.dataset.kind !== statsKind) setStatsKind(b.dataset.kind); }); });
+
+  document.addEventListener('visibilitychange', function() { if (!document.hidden) refreshPulse(); });
+  setInterval(refreshPulse, STATS_REFRESH_MS);
+  setInterval(function() { if (tab === 'stats') updateStatsClock(); }, 15000);
+
+  async function init() {
+    $('fatal').hidden = true;
+    try {
+      moderation = !!(await api('/admin/api/meta')).moderation;
+    } catch (e) {
+      $('digest-head').hidden = true;
+      $('fatal').hidden = false;
+      $('fatal').textContent = '';
+      if (e.kind === 'expired') $('fatal').append(h('p', { class: 'error', text: 'Сессия закончилась. Отправьте боту команду /admin и откройте новую ссылку (в Telegram — кнопку «Открыть панель» в ответе).' }));
+      else if (e.kind === 'forbidden') $('fatal').append(h('p', { class: 'error', text: 'Доступ только для администраторов.' }));
+      else $('fatal').append(h('p', { class: 'error', text: e.message }), h('button', { type: 'button', class: 'sum-btn', onclick: init }, 'Повторить'));
+      return;
+    }
+    $('tabs').hidden = !moderation;
+    const savedKind = lsGet('adminStatsKind');
+    if (savedKind === 'pulse' || savedKind === 'trend') statsKind = savedKind;
+    const savedTab = lsGet('adminTab');
+    // без модерации вкладки «Подборка» нет — открывается только статистика
+    setTab(moderation && (savedTab === 'digest' || savedTab === null) ? 'digest' : 'stats');
+  }
+  init();
 })();
 </script>
 </body>

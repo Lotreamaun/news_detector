@@ -14,19 +14,30 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 
 from app.models import Article, User
 from app.services.channel_subscription import is_subscribed
+from app.services.events import (
+    BUTTON,
+    CMD,
+    SETTINGS_CHANGED,
+    USER_BLOCKED,
+    USER_REGISTERED,
+    USER_UNBLOCKED,
+    USER_VERIFIED,
+    record_event,
+)
 from app.services.force_summary import ForceSummaryResult
 from app.services.force_summary import force_summarize as run_force_summarize
 from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
 from app.services.summary_usage import format_reset_date, get_summary_usage, limit_message
 from app.services.today import FEDERAL, OTHER, REGIONAL, day_bounds, pick_top, portal_today, scope_of
-from app.services.weekly_review import moderation_unavailable_reason
+from app.services.weekly_review import moderation_unavailable_reason, panel_unavailable_reason
 from app.webapp.admin import issue_login_token, login_url
 from app.services.scheduler import (
     DIGEST_SUMMARIZE_PREFIX,
     FORCE_SUMMARIZE_PREFIX,
     _build_digest,
     _build_notification,
+    build_admin_summary_now,
     build_review_ping_now,
     build_weekly_preview,
 )
@@ -57,9 +68,52 @@ DEFAULT_LEVELS: set[str] = set(IMPORTANT_LEVELS)
 LEVEL_STATE: int = 0
 
 
+# Команды бота для журнала событий: остальное пишется как ``other``, чтобы произвольный текст
+# пользователя не попадал в БД. Добавили команду — дополните список.
+BOT_COMMANDS = frozenset({"start", "today", "summary", "settings", "cancel", "help", "admin", "test_digest"})
+
+
 def _session_maker(context: ContextTypes.DEFAULT_TYPE):
     """Достает фабрику сессий, положенную в bot_data при старте приложения."""
     return context.bot_data["session_maker"]
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пишет в журнал команду (``cmd``) или нажатие кнопки (``button``); остальные апдейты игнорирует.
+
+    Регистрируется в группе -1 и не бросает ``ApplicationHandlerStop``, поэтому обычные
+    обработчики работают как раньше. Действие считается, даже если его отклонит гейт канала.
+    """
+    user = update.effective_user
+    if user is None:
+        return
+    message = update.message
+    if message is not None and message.text and message.text.startswith("/"):
+        name = message.text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
+        record_event(_session_maker(context), CMD, user.id, name if name in BOT_COMMANDS else "other")
+    elif update.callback_query is not None:
+        # первые два сегмента callback_data: вид кнопки без идентификаторов документов
+        kind = ":".join((update.callback_query.data or "").split(":")[:2])
+        record_event(_session_maker(context), BUTTON, user.id, kind or None)
+
+
+async def track_bot_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Блокировка/разблокировка бота пользователем по ``my_chat_member`` (только личные чаты).
+
+    Время берётся из апдейта. ``is_active`` не трогаем: его снятие по этому событию — отдельная
+    задача (issue #23).
+    """
+    change = update.my_chat_member
+    if change is None or change.chat.type != "private":
+        return
+    old_status, new_status = change.old_chat_member.status, change.new_chat_member.status
+    if new_status == "kicked":
+        kind = USER_BLOCKED
+    elif old_status == "kicked" and new_status == "member":
+        kind = USER_UNBLOCKED
+    else:
+        return
+    record_event(_session_maker(context), kind, change.chat.id, at=change.date)
 
 
 def _build_level_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
@@ -207,6 +261,7 @@ async def level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     if data == "wizard:skip":
         await _save_user_levels(_session_maker(context), user_id, set())
+        record_event(_session_maker(context), SETTINGS_CHANGED, update.effective_user.id)
         await query.answer()
         await query.edit_message_text("Готово! Фильтр — «Все уровни». Изменить: /settings")
         return ConversationHandler.END
@@ -247,6 +302,7 @@ async def level_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if not to_save and len(levels) == 0:
             to_save = set()
         await _save_user_levels(_session_maker(context), user_id, to_save)
+        record_event(_session_maker(context), SETTINGS_CHANGED, update.effective_user.id)
         await query.answer()
         if not to_save:
             await query.edit_message_text("Готово! Фильтр — «Все уровни». Изменить: /settings")
@@ -452,6 +508,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await session.refresh(user)
             logger.info("Зарегистрирован новый пользователь telegram_id=%s", telegram_id)
             is_new = True
+            record_event(_session_maker(context), USER_REGISTERED, telegram_id)
         else:
             logger.info("Пользователь telegram_id=%s уже зарегистрирован", telegram_id)
 
@@ -638,8 +695,11 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     async with session_maker() as session:
         user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
         if user is not None:
+            first_time = not user.channel_verified
             user.channel_verified = True
             await session.commit()
+            if first_time:
+                record_event(session_maker, USER_VERIFIED, telegram_id)
 
     markup = InlineKeyboardMarkup(
         [
@@ -1234,38 +1294,76 @@ level_wizard_handler = ConversationHandler(
 )
 
 
+_ADMIN_HEADER = "🛠 Служебное сообщение для администратора"
+
+
+def _admin_link_text(config, telegram_id: int) -> str:
+    """Абзац со свежей одноразовой ссылкой входа в панель (для браузера)."""
+    url = login_url(config.WEBAPP_URL, issue_login_token(telegram_id))
+    return (
+        "Ссылка для входа в панель в браузере. "
+        "Одноразовая, действует 10 минут — не пересылайте её:\n\n"
+        f"{url}"
+    )
+
+
 async def _send_admin_link(context: ContextTypes.DEFAULT_TYPE, chat_id: int, telegram_id: int) -> None:
-    """Присылает администратору свежую одноразовую ссылку входа в панель (для браузера).
+    """Присылает администратору только свежую одноразовую ссылку входа в панель (для браузера).
 
     Предпросмотр ссылки отключён: иначе Telegram сам откроет её и сожжёт одноразовый токен.
     """
     config = context.bot_data["config"]
-    reason = moderation_unavailable_reason(config)
+    reason = panel_unavailable_reason(config)
     if reason:
-        await context.bot.send_message(chat_id=chat_id, text=f"Панель модерации недоступна: {reason}.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Панель недоступна: {reason}.")
         return
-    url = login_url(config.WEBAPP_URL, issue_login_token(telegram_id))
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "🛠 Служебное сообщение для администратора\n\n"
-            "Ссылка для входа в панель модерации в браузере. "
-            "Одноразовая, действует 10 минут — не пересылайте её:\n\n"
-            f"{url}"
-        ),
+        text=f"{_ADMIN_HEADER}\n\n{_admin_link_text(config, telegram_id)}",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def _send_admin_panel(context: ContextTypes.DEFAULT_TYPE, chat, telegram_id: int) -> None:
+    """Ответ на ``/admin``: пометка, сводка подборки (если модерация доступна), ссылка и кнопка Mini-App.
+
+    Кнопка ``web_app`` только в личном чате: в группах Telegram такие inline-кнопки не принимает.
+    Предпросмотр ссылки отключён, иначе Telegram сожжёт одноразовый токен.
+    """
+    config = context.bot_data["config"]
+    reason = panel_unavailable_reason(config)
+    if reason:
+        await context.bot.send_message(chat_id=chat.id, text=f"Панель недоступна: {reason}.")
+        return
+    parts = [_ADMIN_HEADER]
+    if moderation_unavailable_reason(config) is None:
+        try:
+            parts.append(await build_admin_summary_now(_session_maker(context), config))
+        except Exception:
+            logger.exception("Не удалось собрать сводку подборки для /admin")
+    parts.append(_admin_link_text(config, telegram_id))
+    markup = None
+    if chat.type == "private":
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 Открыть панель", web_app=WebAppInfo(url=f"{config.WEBAPP_URL.rstrip('/')}/admin"))]]
+        )
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="\n\n".join(parts),
+        reply_markup=markup,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /admin: администратору — ссылка на панель модерации подборки для браузера."""
+    """Обработчик /admin: администратору — вход в панель (сводка подборки, ссылка для браузера, кнопка Mini-App)."""
     if update.message is None or update.effective_user is None:
         return
     config = context.bot_data["config"]
     if update.effective_user.id not in config.ADMIN_CHAT_IDS:
         await update.message.reply_text("Команда доступна только администраторам.")
         return
-    await _send_admin_link(context, update.message.chat_id, update.effective_user.id)
+    await _send_admin_panel(context, update.message.chat, update.effective_user.id)
 
 
 async def admin_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
