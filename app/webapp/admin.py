@@ -1,8 +1,13 @@
-"""Админ-панель модерации недельной подборки (HTTP-слой).
+"""Админ-панель: статистика бота и модерация недельной подборки (HTTP-слой).
 
-Роуты (регистрируются только если модерация доступна, см. ``setup_admin``):
+Роуты базы панели (при заданных ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, см. ``setup_admin``):
   GET  /admin                — статичная страница панели (без данных)
   GET  /admin/login?t=<токен> — обмен одноразовой ссылки на сессию (cookie) и редирект на /admin
+  GET  /admin/api/meta       — {moderation: bool}: доступна ли вкладка модерации
+  GET  /admin/api/stats?view=pulse|trend — статистика по журналу событий
+
+Роуты модерации (дополнительно, только если модерация доступна: нужен ``WEEKLY_DIGEST_TIME``;
+иначе они не регистрируются и отвечают 404):
   GET  /admin/api/state      — подборка целевого периода: сводка и разделы
   POST /admin/api/toggle     — включить/исключить документ
   POST /admin/api/summary    — сделать саммари через GigaChat либо сохранить вручную
@@ -28,6 +33,7 @@ from sqlalchemy import update
 
 from app.models import Article, User
 from app.services.force_summary import force_summarize
+from app.services import stats
 from app.services.rss_parser import _normalize_text
 from app.services.scheduler import load_review_target
 from app.services.weekly_review import (
@@ -35,8 +41,10 @@ from app.services.weekly_review import (
     INCLUDE,
     SUMMARY_MANUAL_MAX_LEN,
     build_export_markdown,
+    deadline_label,
     final_selection,
     moderation_unavailable_reason,
+    panel_unavailable_reason,
     review_counts,
     short_title,
     split_sections,
@@ -48,7 +56,6 @@ logger = logging.getLogger(__name__)
 LOGIN_TOKEN_TTL = 10 * 60  # одноразовая ссылка действует 10 минут
 SESSION_TTL = 12 * 60 * 60
 SESSION_COOKIE = "admin_session"
-_WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
 # token / session_id -> (telegram_id, истекает по time.monotonic())
 _login_tokens: dict[str, tuple[int, float]] = {}
@@ -155,6 +162,28 @@ async def handle_admin_page(request: web.Request) -> web.Response:
     )
 
 
+# -- Статистика ---------------------------------------------------------------
+
+async def handle_meta(request: web.Request) -> web.Response:
+    """Что доступно в панели: ``moderation`` — есть ли вкладка «Подборка»."""
+    require_admin(request)
+    return _json({"moderation": moderation_unavailable_reason(request.app["config"]) is None})
+
+
+async def handle_stats(request: web.Request) -> web.Response:
+    """Пульс или Тренд по журналу событий (``?view=pulse|trend``), считается при каждом запросе."""
+    require_admin(request)
+    view = request.query.get("view")
+    if view not in ("pulse", "trend"):
+        raise _deny(web.HTTPBadRequest, "bad_request", "Некорректный запрос.")
+    try:
+        build = stats.pulse if view == "pulse" else stats.trend
+        return _json(await build(request.app["session_maker"], request.app["config"]))
+    except Exception:
+        logger.exception("admin stats %s: error", view)
+        return _json({"error": "internal", "message": "Не удалось загрузить статистику."}, 500)
+
+
 # -- Состояние ----------------------------------------------------------------
 
 def _card(a: Article) -> dict:
@@ -169,11 +198,6 @@ def _card(a: Article) -> dict:
     }
 
 
-def _deadline_label(period_end: datetime, tz: ZoneInfo) -> str:
-    local = period_end.astimezone(tz)
-    return f"{_WEEKDAYS[local.weekday()]} {local:%H:%M}"
-
-
 async def _build_state(request: web.Request) -> dict:
     """Текущее состояние панели: целевой период, сводка и разделы."""
     config = request.app["config"]
@@ -184,7 +208,7 @@ async def _build_state(request: web.Request) -> dict:
     seconds_left = int((target.period_end - now).total_seconds())
     return {
         "period_end": target.period_end.isoformat(),
-        "deadline_label": _deadline_label(target.period_end, ZoneInfo(config.WEEKLY_DIGEST_TZ)),
+        "deadline_label": deadline_label(target.period_end, ZoneInfo(config.WEEKLY_DIGEST_TZ)),
         "seconds_left": seconds_left,
         "overdue": seconds_left <= 0,  # отправка за этот период отложена и ещё не началась
         "sending": target.sending,
@@ -315,14 +339,21 @@ async def handle_export(request: web.Request) -> web.Response:
 
 
 def setup_admin(app: web.Application) -> None:
-    """Регистрирует роуты панели, если модерация доступна; иначе пишет причину в лог."""
-    reason = moderation_unavailable_reason(app["config"])
+    """Регистрирует роуты панели: базу — при ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, модерацию — ещё и при ``WEEKLY_DIGEST_TIME``."""
+    config = app["config"]
+    reason = panel_unavailable_reason(config)
     if reason:
         logger.info("Админ-панель не подключена: %s", reason)
         return
     app.router.add_get("/admin", handle_admin_page)
     # allow_head=False: HEAD-запрос предпросмотра ссылки не должен сжигать одноразовый токен
     app.router.add_get("/admin/login", handle_login, allow_head=False)
+    app.router.add_get("/admin/api/meta", handle_meta)
+    app.router.add_get("/admin/api/stats", handle_stats)
+    reason = moderation_unavailable_reason(config)
+    if reason:
+        logger.info("Модерация подборки в панели не подключена: %s", reason)
+        return
     app.router.add_get("/admin/api/state", handle_state)
     app.router.add_post("/admin/api/toggle", handle_toggle)
     app.router.add_post("/admin/api/summary", handle_summary)

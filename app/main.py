@@ -10,7 +10,13 @@ from zoneinfo import ZoneInfo
 from logging.handlers import TimedRotatingFileHandler
 
 from telegram import BotCommand, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    TypeHandler,
+)
 
 from app.bot.handlers import (
     admin_command,
@@ -27,6 +33,8 @@ from app.bot.handlers import (
     summary_command,
     test_digest_command,
     today,
+    track_activity,
+    track_bot_blocked,
 )
 from app.core.config import Config
 from app.core.database import (
@@ -45,6 +53,7 @@ from app.services.demo_article import (
     DEMO_ARTICLE_TITLE,
     DEMO_ARTICLE_URL,
 )
+from app.services.events import purge_old_events
 from app.services.scheduler import check_legislation_updates, weekly_digest_job, weekly_review_job
 from app.services.weekly_review import ADMIN_LINK_CALLBACK, moderation_unavailable_reason
 
@@ -125,6 +134,10 @@ def _build_application(config: Config) -> Application:
     # подписки. Всё остальное регистрируется через require_channel_verified —
     # default-deny, чтобы новый хендлер без явного исключения был защищён
     # автоматически (см. openspec/changes/enforce-channel-subscription-gate).
+    # Журнал событий: трекер в группе -1 видит все апдейты до остальных обработчиков и не
+    # останавливает их; блокировка бота приходит отдельным апдейтом my_chat_member.
+    application.add_handler(TypeHandler(Update, track_activity), group=-1)
+    application.add_handler(ChatMemberHandler(track_bot_blocked, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(level_wizard_handler)
     application.add_handler(CallbackQueryHandler(show_example, pattern=r"^show_example$"))
     application.add_handler(
@@ -222,6 +235,14 @@ def _schedule_jobs(application: Application, config: Config) -> None:
         )
     else:
         logger.info("Напоминание администраторам выключено (WEEKLY_REVIEW_TIME пуст), панель доступна по /admin")
+
+    # Очистка журнала событий: раз в сутки, первый запуск через 5 минут после старта
+    job_queue.run_repeating(
+        purge_old_events,
+        interval=24 * 3600,
+        first=300,
+        name="purge_old_events",
+    )
 
     if resolve_sqlite_path(config.DATABASE_URL) is None:
         logger.warning(

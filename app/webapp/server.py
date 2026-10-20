@@ -27,6 +27,9 @@
                                           считается «страница забрала итог» (чат не нужен)
   POST /usage                          — счётчик попыток саммари пользователя
                                           (JSON {init_data} -> {used, limit, unlimited, resets_on})
+  POST /seen                           — страница сообщает об открытии (JSON {init_data, view},
+                                          view = law|digest|today); при верной подписи пишет
+                                          событие журнала ``webapp.open``; всегда 204 без тела
 
 Режим ``ids`` переиспользует существующий ``/full_text`` (по одному запросу на
 документ), а не отдельный batch-эндпоинт — проще и достаточно для размеров
@@ -50,6 +53,7 @@ from aiohttp import web
 from sqlalchemy import select
 
 from app.models import Article, User
+from app.services.events import WEBAPP_OPEN, record_event
 from app.services.force_summary import force_summarize, inflight_task, recent_failure
 from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import _normalize_text
@@ -219,6 +223,15 @@ HTML_PAGE = r"""<!doctype html>
   const params = new URLSearchParams(window.location.search);
   const idsParam = params.get('ids');
   const viewToday = params.get('view') === 'today';
+  // сообщаем серверу об открытии (журнал событий); вне Telegram initData пуст — ничего не шлём
+  if (tg && tg.initData) {
+    fetch(window.location.origin + '/seen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: tg.initData, view: viewToday ? 'today' : (idsParam ? 'digest' : 'law') }),
+      keepalive: true
+    }).catch(function() { /* журнал событий не нужен для работы страницы */ });
+  }
   if (idsParam || viewToday) {
     document.getElementById('single').style.display = 'none';
     const digestEl = document.getElementById('digest');
@@ -894,6 +907,27 @@ async def handle_usage(request: web.Request) -> web.Response:
         return web.json_response({"error": "internal error"}, status=500, headers=CORS)
 
 
+SEEN_VIEWS = frozenset({"law", "digest", "today"})
+
+
+async def handle_seen(request: web.Request) -> web.Response:
+    """Открытие страницы Mini-App (JSON {init_data, view}): пишет ``webapp.open`` от пользователя.
+
+    Любой исход — 204 без тела, чтобы наружу не утекло, прошла ли проверка. Пользователь не
+    ищется в ``users`` и гейтом канала не проверяется: это факт открытия, а не доступ к данным.
+    """
+    try:
+        payload = await request.json()
+        init_data = str(payload.get("init_data") or "")
+        view = str(payload.get("view") or "")
+        telegram_id = _verify_init_data(init_data, request.app["config"].TELEGRAM_BOT_TOKEN)
+        if telegram_id is not None and view in SEEN_VIEWS:
+            record_event(request.app["session_maker"], WEBAPP_OPEN, telegram_id, view)
+    except Exception:
+        logger.debug("handle_seen: плохой запрос", exc_info=True)
+    return web.Response(status=204, headers=CORS)
+
+
 def _failure_messages(usage: SummaryUsage) -> dict[str, str]:
     """Тексты неудач саммаризации для карточки: общие для ``/summarize`` и ``/summary_status``."""
     return {
@@ -1173,6 +1207,7 @@ def create_app(session_maker, config, bot) -> web.Application:
     app.router.add_post("/summarize", handle_summarize)
     app.router.add_post("/summary_status", handle_summary_status)
     app.router.add_post("/usage", handle_usage)
+    app.router.add_post("/seen", handle_seen)
     app.router.add_static("/static", STATIC_DIR)
     from app.webapp.admin import setup_admin  # здесь, а не наверху: admin импортирует этот модуль
 

@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,  # Функция для создания объекта движка
 )
 
-from app.models import Base, Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
+from app.models import Base, Article, Event, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing  # SQLAlchemy "увидит" модели и создаст таблицы в metadata
 
 logger = logging.getLogger(__name__)
 

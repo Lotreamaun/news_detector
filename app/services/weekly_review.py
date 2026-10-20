@@ -38,6 +38,19 @@ SUMMARY_MANUAL_MAX_LEN = 600
 ADMIN_LINK_CALLBACK = "admin:link"
 
 
+def panel_unavailable_reason(config) -> str | None:
+    """Почему админ-панель (статистика, вход по ``/admin``) недоступна; ``None`` — доступна.
+
+    Нужны ``WEBAPP_URL`` (адрес панели) и хотя бы один администратор. Время подборки не нужно:
+    без него панель открывается только со статистикой (модерация — ``moderation_unavailable_reason``).
+    """
+    if not config.WEBAPP_URL:
+        return "WEBAPP_URL не задан"
+    if not config.ADMIN_CHAT_IDS:
+        return "ADMIN_CHAT_IDS пуст"
+    return None
+
+
 def moderation_unavailable_reason(config) -> str | None:
     """Почему модерация недоступна (для лога при старте); ``None`` — доступна.
 
@@ -151,6 +164,15 @@ def target_period(
     if run_finished is None and now <= sunday_at(last, DAY_END):
         return TargetPeriod(last, previous_digest_moment(last), last, run_started is not None)
     return TargetPeriod(next_digest_moment(last), last, now, False)
+
+
+_WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def deadline_label(period_end: datetime, tz: ZoneInfo) -> str:
+    """Момент отправки подборки для людей: «пт 18:00» (день недели и время в часовом поясе подборки)."""
+    local = period_end.astimezone(tz)
+    return f"{_WEEKDAYS[local.weekday()]} {local:%H:%M}"
 
 
 def format_time_left(delta: timedelta) -> str:

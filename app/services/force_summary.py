@@ -23,6 +23,7 @@ from typing import Literal
 from sqlalchemy import select
 
 from app.models import Article, SummarizationUsage, User
+from app.services.events import SUMMARY_LIMIT, SUMMARY_REQUESTED, SUMMARY_RESULT, record_event
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.rss_parser import (
     IMPORTANT_LEVELS,
@@ -165,6 +166,28 @@ def _notify_mode(on_mode: ModeCallback | None, mode: Literal["text", "ocr"]) -> 
 
 
 async def force_summarize(
+    config,
+    session_maker,
+    user: User,
+    external_id: str,
+    on_mode: ModeCallback | None = None,
+) -> ForceSummaryResult:
+    """Принудительная саммаризация закона (см. ``_force_summarize``) + события журнала.
+
+    ``summary.requested`` пишется при входе, по итогу — ``summary.limit`` либо
+    ``summary.result`` со статусом, для каждого вызывающего, в том числе присоединившегося
+    к чужой задаче: одинаково для бота, Mini-App и панели.
+    """
+    record_event(session_maker, SUMMARY_REQUESTED, user.telegram_id, external_id)
+    result = await _force_summarize(config, session_maker, user, external_id, on_mode)
+    if result.status == "limit":
+        record_event(session_maker, SUMMARY_LIMIT, user.telegram_id)
+    else:
+        record_event(session_maker, SUMMARY_RESULT, user.telegram_id, result.status)
+    return result
+
+
+async def _force_summarize(
     config,
     session_maker,
     user: User,

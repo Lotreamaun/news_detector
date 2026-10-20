@@ -32,6 +32,15 @@ from telegram.ext import ContextTypes
 from telegram.helpers import escape_markdown
 
 from app.models import Article, User, UserFilter, WeeklyDigestRun, WeeklyReviewPing
+from app.services.events import (
+    ACT_PROCESSED,
+    CHECK_FAILED,
+    CHECK_OK,
+    NOTIFY_FAILED,
+    NOTIFY_SENT,
+    WEEKLY_SENT,
+    record_event,
+)
 from app.services.force_summary import inflight_task
 from app.services.gigachat import GigaChatClient, GigaChatConfig, GigaChatError
 from app.services.importance import (
@@ -60,6 +69,7 @@ from app.services.weekly_review import (
     WEEKLY_MIN_IMPORTANCE,
     TargetPeriod,
     final_selection,
+    deadline_label,
     format_time_left,
     is_awaiting_rating,
     moderation_unavailable_reason,
@@ -133,8 +143,10 @@ async def check_legislation_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
     except RssError:
         logger.exception("Не удалось загрузить/разобрать API — пропускаем эту часть цикла")
         new_entries = []
+        record_event(session_maker, CHECK_FAILED)
     else:
         logger.info("В API %d документов, из них новых: %d", len(entries), len(new_entries))
+        record_event(session_maker, CHECK_OK, ref=str(len(new_entries)))
 
     if new_entries:
         async with _llm_tools(config) as (summarizer, llm_client):
@@ -264,9 +276,12 @@ async def _process_entry(
     """
     logger.info("Обработка нового документа %s: %s", entry.external_id, entry.title)
 
+    source = "none"  # откуда текст: page / ocr / none
+    outcome = "none"  # исход саммари: ok / refused / error / none
     try:
         text = await get_legal_text(entry.external_id)
         if text:
+            source = "page"
             logger.info("Текст %s получен с actual.pravo.gov.ru", entry.external_id)
         elif is_important(entry):
             logger.info(
@@ -275,6 +290,7 @@ async def _process_entry(
             )
             text = await ocr_document_text(entry.external_id, client=llm_client)
             if text:
+                source = "ocr"
                 logger.info("OCR GigaChat вернул текст для %s", entry.external_id)
             else:
                 logger.warning("OCR для %s не дал текста", entry.external_id)
@@ -283,13 +299,19 @@ async def _process_entry(
         if text:
             try:
                 summary = await summarizer.summarize(text)
+                outcome = "ok"
             except GigaChatError as exc:
                 logger.warning("Не удалось сделать саммари для %s: %s", entry.external_id, exc)
+                refused = "отказался" in str(exc) or "пустой ответ" in str(exc)
+                outcome = "refused" if refused else "error"
 
         article = await _save_article(session_maker, entry, text, summary)
     except Exception:
         logger.exception("Ошибка обработки документа %s", entry.external_id)
         return None
+
+    if article is not None:
+        record_event(session_maker, ACT_PROCESSED, ref=f"{source}/{outcome}")
 
     if article is not None and article.level in CANDIDATE_LEVELS:
         try:
@@ -711,6 +733,33 @@ async def _maybe_send_review_ping(context) -> None:
             logger.exception("Ошибка отправки напоминания администраторам")
 
 
+def build_review_summary(counts, when: str, time_left: timedelta) -> str:
+    """Строки сводки подборки для администратора: когда уйдёт и три числа (без заголовка).
+
+    ``when`` — как назвать момент отправки («сегодня в 18:00», «в пт 18:00»). Если момент
+    прошёл, а подборка ещё не ушла (ждёт дневного окна или оценки), вместо времени —
+    «отправка ожидается».
+    """
+    if time_left.total_seconds() > 0:
+        head = f"Недельная подборка уйдёт {when} (через {format_time_left(time_left)})."
+    else:
+        head = "Недельная подборка: отправка ожидается."
+    return (
+        f"{head}\n"
+        f"• В подборке: {counts.included}\n"
+        f"• Важных без саммари: {counts.no_summary}\n"
+        f"• Ещё не оценено: {counts.unrated}"
+    )
+
+
+async def build_admin_summary_now(session_maker, config) -> str:
+    """Сводка ближайшей неотправленной подборки на момент вызова — для ответа на ``/admin``."""
+    now = datetime.now(timezone.utc)
+    target, window = await load_review_target(session_maker, config, now)
+    when = "в " + deadline_label(target.period_end, ZoneInfo(config.WEEKLY_DIGEST_TZ))
+    return build_review_summary(review_counts(window), when, target.period_end - now)
+
+
 def build_review_ping(
     config, counts, time_left: timedelta, period_end: datetime
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -719,10 +768,7 @@ def build_review_ping(
     when = period_end.astimezone(tz).strftime("%H:%M")
     text = (
         "🛠 Служебное сообщение для администратора\n\n"
-        f"Недельная подборка уйдёт сегодня в {when} (через {format_time_left(time_left)}).\n"
-        f"• В подборке: {counts.included}\n"
-        f"• Важных без саммари: {counts.no_summary}\n"
-        f"• Ещё не оценено: {counts.unrated}\n\n"
+        f"{build_review_summary(counts, f'сегодня в {when}', time_left)}\n\n"
         "Проверьте состав и саммари в панели — это пара минут. "
         "Не успеете — подборка уйдёт автоматически."
     )
@@ -853,12 +899,13 @@ async def _send_weekly_digest(context) -> None:
     for user in users:
         # фильтры пользователя не применяются: подборка одинакова для всех
         try:
-            if await _send_notification(context, session_maker, user, text, markup):
+            if await _send_notification(context, session_maker, user, text, markup, "weekly"):
                 sent += 1
         except Exception:
             logger.exception("Ошибка отправки подборки пользователю %s — пропуск", user.telegram_id)
         await asyncio.sleep(0.05)
     await _weekly_run_finish(session_maker, period_end)
+    record_event(session_maker, WEEKLY_SENT, ref=str(len(included)))
     logger.info("Недельная подборка за %s: %d законов, отправлена %d из %d пользователей",
                 period_end, len(included), sent, len(users))
 
@@ -925,17 +972,18 @@ async def _notify_users_batch(context, session_maker, articles: list[Article]) -
             important = [a for a in matched if a.level in IMPORTANT_LEVELS]
             rest = [a for a in matched if a.level not in IMPORTANT_LEVELS]
 
-            messages: list[tuple[str, InlineKeyboardMarkup]] = [
-                _build_notification(a, webapp_url) for a in important
+            # (текст, кнопки, вид уведомления для журнала событий)
+            messages: list[tuple[str, InlineKeyboardMarkup, str]] = [
+                (*_build_notification(a, webapp_url), "law") for a in important
             ]
             if len(rest) == 1:
-                messages.append(_build_notification(rest[0], webapp_url))
+                messages.append((*_build_notification(rest[0], webapp_url), "law"))
             elif len(rest) >= 2:
-                messages.append(_build_digest(rest, webapp_url))
+                messages.append((*_build_digest(rest, webapp_url), "digest"))
 
             user_sent = False
-            for message, reply_markup in messages:
-                result = await _send_notification(context, session_maker, user, message, reply_markup)
+            for message, reply_markup, kind in messages:
+                result = await _send_notification(context, session_maker, user, message, reply_markup, kind)
                 if result is None:
                     # пользователь заблокировал бота и деактивирован — дальше слать нечего
                     break
@@ -955,7 +1003,24 @@ async def _notify_users_batch(context, session_maker, articles: list[Article]) -
     logger.info("Уведомления отправлены %d из %d пользователей", sent, len(users))
 
 
-async def _send_notification(context, session_maker, user: User, message: str, reply_markup) -> bool | None:
+async def _send_notification(
+    context, session_maker, user: User, message: str, reply_markup, kind: str
+) -> bool | None:
+    """Отправляет одно сообщение пользователю и пишет итог в журнал событий.
+
+    ``kind`` — вид уведомления (``law`` / ``digest`` / ``weekly``): ``notify.sent`` с этим видом
+    при успехе, ``notify.failed`` с ``blocked`` (403) или ``error`` при неудаче.
+    Возвращает то же, что ``_deliver_notification``.
+    """
+    result = await _deliver_notification(context, session_maker, user, message, reply_markup)
+    if result:
+        record_event(session_maker, NOTIFY_SENT, user.telegram_id, kind)
+    else:
+        record_event(session_maker, NOTIFY_FAILED, user.telegram_id, "blocked" if result is None else "error")
+    return result
+
+
+async def _deliver_notification(context, session_maker, user: User, message: str, reply_markup) -> bool | None:
     """Отправляет одно сообщение пользователю с обработкой лимита 429 и блокировки 403.
 
     Возвращает True, если сообщение в итоге доставлено, False при обычной неудаче,
