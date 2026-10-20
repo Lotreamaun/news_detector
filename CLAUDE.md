@@ -125,6 +125,12 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
    - Unscored candidates are retried ("backlog") at the end of every
      `check_legislation_updates` cycle (`_rate_backlog`, ≤14 days since
      `created_at`, ≤20 per cycle); no text for >24h → one OCR before scoring.
+     A reply with `"level": null` ("no information") is not retried: the act is scored by title,
+     then `1` (`NO_INFO_FALLBACK_SCORE`; `2` if the model refused on one of the steps). Any other
+     invalid reply (after 2 attempts) counts as a failed cycle in `bot_data["importance_invalid"]`;
+     after `IMPORTANCE_MAX_INVALID_CYCLES` = 3 the act is skipped (and left out of the backlog query)
+     until the weekly final pass or a restart. `GigaChatError` is not counted (`score_importance`
+     re-raises it, `None` = invalid reply only).
 4. Notifications respect each user's `UserFilter` rows (chosen legal-force
    levels in `user_filters`; no rows = no filter, receive everything) and
    skip users who blocked the bot (`Forbidden`). Only active users who passed
@@ -144,8 +150,9 @@ channel-verified user in one teaser (`_build_digest` with its own header),
 ignoring `UserFilter`. `_maybe_send_weekly_digest` is the single entry point
 (Friday job, `_post_init` catch-up, end of each check cycle), under an
 `asyncio.Lock`; idempotent per period via `weekly_digest_runs`. Sends only
-09:00–22:00 local; waits while window candidates are unscored (final pass scores
-leftovers, by title if needed); hard deadline Sunday 22:00 (in the last hour
+09:00–22:00 local; waits while window candidates are unscored, unless ≥ 3 acts already
+qualify (`WEEKLY_MIN_ACTS_WITHOUT_WAIT`, `expected_selection`, summary not required) (final pass
+scores leftovers, by title if needed); hard deadline Sunday 22:00 (in the last hour
 unscored ones are dropped; later the period is skipped). Acts with no summary
 after two background attempts are excluded (ids logged) — no placeholder text.
 Empty digest (including after that exclusion) = nothing sent. Admin preview:

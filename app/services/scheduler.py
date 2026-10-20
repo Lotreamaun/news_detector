@@ -66,8 +66,10 @@ from app.services.weekly_review import (
     EXCLUDE,
     INCLUDE,
     ADMIN_LINK_CALLBACK,
+    WEEKLY_MIN_ACTS_WITHOUT_WAIT,
     WEEKLY_MIN_IMPORTANCE,
     TargetPeriod,
+    expected_selection,
     final_selection,
     deadline_label,
     format_time_left,
@@ -111,6 +113,9 @@ IMPORTANCE_BACKLOG_LIMIT = 20
 # Публикация старше стольких дней — явная история (бэкфилл), в добор не берём:
 # покрывает текущее окно подборки и предыдущее, если его отправка отложена
 IMPORTANCE_BACKLOG_PUBLISHED_DAYS = 21
+# Столько циклов подряд с невалидным ответом модели — и акт больше не оценивается до финального
+# прохода подборки. Счётчик в памяти процесса (bot_data), сбрасывается при перезапуске
+IMPORTANCE_MAX_INVALID_CYCLES = 3
 # Нет текста дольше стольких часов после приёма — один OCR до оценки
 OCR_AFTER_HOURS = 24
 
@@ -396,12 +401,21 @@ async def _rate_article(
 
     После оценки ``>= 2`` акт без саммари саммаризуется в фоне (попытка 1), если это не
     делали раньше (``summary_tried``).
+
+    Циклы с невалидным ответом модели считаются в ``bot_data["importance_invalid"]``; после
+    ``IMPORTANCE_MAX_INVALID_CYCLES`` акт пропускается до финального прохода (``final``).
+    Сбой сети/API (``GigaChatError``) в счётчик не входит.
     """
     if prefilter_zero(article.level, article.title):
         await _update_article(session_maker, article.id, importance=0)
         article.importance = 0
         logger.info("Оценка %s: 0 (предфильтр по заголовку)", article.external_id)
         return 0
+
+    invalid: dict[str, int] = context.bot_data.setdefault("importance_invalid", {})
+    if not final and invalid.get(article.external_id, 0) >= IMPORTANCE_MAX_INVALID_CYCLES:
+        logger.debug("Оценка %s пропущена: лимит циклов с невалидным ответом", article.external_id)
+        return None
 
     text = article.original_text
     title_only_ok = final
@@ -430,9 +444,25 @@ async def _rate_article(
         logger.debug("Оценка %s отложена: нет ни саммари, ни текста", article.external_id)
         return None
 
-    score = await score_importance(llm_client, article.title, body)
-    if score is None:
+    try:
+        score = await score_importance(llm_client, article.title, body, ref=article.external_id)
+    except GigaChatError as exc:
+        logger.warning("Оценка %s не удалась (%s) — повтор при доборе", article.external_id, exc)
         return None
+    if score is None:
+        cycles = invalid[article.external_id] = invalid.get(article.external_id, 0) + 1
+        if cycles >= IMPORTANCE_MAX_INVALID_CYCLES:
+            logger.warning(
+                "Оценка %s: %d циклов с невалидным ответом — добор пропускает до финального прохода",
+                article.external_id, cycles,
+            )
+        else:
+            logger.info(
+                "Оценка %s: невалидный ответ (цикл %d из %d)",
+                article.external_id, cycles, IMPORTANCE_MAX_INVALID_CYCLES,
+            )
+        return None
+    invalid.pop(article.external_id, None)
     await _update_article(session_maker, article.id, importance=score)
     article.importance = score
     logger.info(
@@ -516,24 +546,31 @@ async def _rate_backlog(context) -> None:
 
     Не более ``IMPORTANCE_BACKLOG_LIMIT`` за цикл, старые раньше. Кандидаты без текста и
     саммари до суток (и до OCR) пропускаются без вызова LLM — оценка дождётся текста.
+    Акты с исчерпанным лимитом невалидных циклов исключаются в выборке, чтобы не занимать
+    места в ``IMPORTANCE_BACKLOG_LIMIT``.
     """
     config = context.bot_data["config"]
     session_maker = context.bot_data["session_maker"]
     now = datetime.now(timezone.utc)
+    exhausted = [
+        ref
+        for ref, cycles in context.bot_data.get("importance_invalid", {}).items()
+        if cycles >= IMPORTANCE_MAX_INVALID_CYCLES
+    ]
+    query = select(Article).where(
+        Article.importance.is_(None),
+        Article.level.in_(CANDIDATE_LEVELS),
+        Article.is_demo.is_(False),
+        Article.created_at >= now - timedelta(days=IMPORTANCE_BACKLOG_DAYS),
+        Article.published_at >= now - timedelta(days=IMPORTANCE_BACKLOG_PUBLISHED_DAYS),
+    )
+    if exhausted:
+        query = query.where(Article.external_id.notin_(exhausted))
     async with session_maker() as session:
         articles = list(
             (
                 await session.scalars(
-                    select(Article)
-                    .where(
-                        Article.importance.is_(None),
-                        Article.level.in_(CANDIDATE_LEVELS),
-                        Article.is_demo.is_(False),
-                        Article.created_at >= now - timedelta(days=IMPORTANCE_BACKLOG_DAYS),
-                        Article.published_at >= now - timedelta(days=IMPORTANCE_BACKLOG_PUBLISHED_DAYS),
-                    )
-                    .order_by(Article.created_at)
-                    .limit(IMPORTANCE_BACKLOG_LIMIT)
+                    query.order_by(Article.created_at).limit(IMPORTANCE_BACKLOG_LIMIT)
                 )
             ).all()
         )
@@ -858,7 +895,10 @@ async def _send_weekly_digest(context) -> None:
             window = await _load_weekly_window(session_maker, period_start, period_end)
             unrated = [a for a in window if is_awaiting_rating(a)]
             if unrated:
-                if datetime.now(timezone.utc) < sunday_at(period_end, SUNDAY_LAST_HOUR_START):
+                if (
+                    len(expected_selection(window)) < WEEKLY_MIN_ACTS_WITHOUT_WAIT
+                    and datetime.now(timezone.utc) < sunday_at(period_end, SUNDAY_LAST_HOUR_START)
+                ):
                     logger.info("Недельная подборка отложена: неоценённых кандидатов %d", len(unrated))
                     return
                 logger.warning(
