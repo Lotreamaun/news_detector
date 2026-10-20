@@ -160,7 +160,10 @@ async def main() -> None:
                 continue
             entry = await _load_entry(row, summarizer, cache)
             body = build_body(entry["summary"], entry["text"])
-            score = await score_importance(client, row["title"], body)
+            try:
+                score = await score_importance(client, row["title"], body, ref=row["external_id"])
+            except GigaChatError:
+                score = None
             groups.setdefault(row["group"], []).append((row, score))
     _CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
 

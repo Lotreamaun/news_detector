@@ -27,6 +27,8 @@ from app.services.weekly_window import (
 
 # Недельная подборка автоматически включает акты с оценкой не ниже этой
 WEEKLY_MIN_IMPORTANCE = 2
+# Если в подборку уже проходит не меньше стольких актов, неоценённые кандидаты её не задерживают
+WEEKLY_MIN_ACTS_WITHOUT_WAIT = 3
 INCLUDE = "include"
 EXCLUDE = "exclude"
 # Предел вручную введённого саммари: тизер из трёх законов должен уложиться в лимит
@@ -95,23 +97,26 @@ def _order(articles: list[Article]) -> list[Article]:
     )
 
 
-def final_selection(window: list[Article]) -> list[Article]:
-    """Итоговый набор подборки: документы окна с саммари, включённые администратором
-    либо (без решения) с оценкой не ниже ``WEEKLY_MIN_IMPORTANCE``; в порядке подборки."""
+def expected_selection(window: list[Article]) -> list[Article]:
+    """Документы окна, проходящие в подборку по решению или оценке, без требования саммари:
+    включённые администратором либо (без решения) с оценкой не ниже ``WEEKLY_MIN_IMPORTANCE``;
+    в порядке подборки."""
     chosen = [
         a
         for a in window
-        if a.summary
-        and (
-            a.digest_override == INCLUDE
-            or (
-                a.digest_override is None
-                and a.importance is not None
-                and a.importance >= WEEKLY_MIN_IMPORTANCE
-            )
+        if a.digest_override == INCLUDE
+        or (
+            a.digest_override is None
+            and a.importance is not None
+            and a.importance >= WEEKLY_MIN_IMPORTANCE
         )
     ]
     return _order(chosen)
+
+
+def final_selection(window: list[Article]) -> list[Article]:
+    """Итоговый набор подборки: ``expected_selection`` только с документами, у которых есть саммари."""
+    return [a for a in expected_selection(window) if a.summary]
 
 
 def split_sections(window: list[Article]) -> tuple[list[Article], list[Article], list[Article]]:

@@ -10,7 +10,8 @@
    запросом (не совмещённым с суммаризацией).
 
 Оценка внутренняя, пользователю не показывается. Результат ``None`` значит
-«не оценено» (сбой, невалидный ответ) — вызывающий код повторит оценку позже.
+«не оценено» (невалидный ответ) — вызывающий код повторит оценку позже; сбой сети/API
+(``GigaChatError``) пробрасывается наружу.
 
 Промпты и шаблоны — константы модуля (prompt management, vision.md).
 """
@@ -33,6 +34,14 @@ CANDIDATE_LEVELS: frozenset[str] = frozenset(
 
 # Оценка при повторном отказе модели: чувствительная тема не должна выпадать из подборки
 REFUSAL_FALLBACK_SCORE = 2
+
+# Оценка, если модель ответила «нет информации» (level: null) и по тексту, и по названию.
+# Именно 1, а не 2, как при отказе: отказ — признак чувствительной темы, а «нет информации» —
+# признак бессодержательного входа, такому акту в подборке делать нечего.
+NO_INFO_FALLBACK_SCORE = 1
+
+# Служебные коды _ask (вместе с -1 для отказа); наружу из score_importance не выходят
+_NO_INFO = -2
 
 # Сколько символов саммари/текста отдаём модели
 _MAX_BODY_CHARS = 3_000
@@ -241,6 +250,7 @@ _FEW_SHOT_MESSAGES = _few_shot_messages()
 
 # Если JSON сломан (например, неэкранированные кавычки в reason), достаём метку напрямую
 _LEVEL_RE = re.compile(r'"level"\s*:\s*"?([0-3])\b')
+_LEVEL_NULL_RE = re.compile(r'"level"\s*:\s*null\b')
 
 
 def build_body(summary: str | None, text: str | None) -> str | None:
@@ -259,7 +269,12 @@ def build_body(summary: str | None, text: str | None) -> str | None:
 
 
 def _parse_level(reply: str) -> int | None:
-    """Достаёт уровень 0–3 из ответа модели; None, если ответ не по формату."""
+    """
+    Достаёт уровень 0–3 из ответа модели.
+
+    ``_NO_INFO``, если модель ответила ``"level": null`` («нет информации»); None, если
+    ответ не по формату.
+    """
     match = re.search(r"\{.*\}", reply, re.DOTALL)
     if match:
         try:
@@ -267,18 +282,27 @@ def _parse_level(reply: str) -> int | None:
             level = data.get("level") if isinstance(data, dict) else None
             if isinstance(level, int) and not isinstance(level, bool) and 0 <= level <= 3:
                 return level
+            if isinstance(data, dict) and "level" in data and level is None:
+                return _NO_INFO
         except ValueError:
             pass
     fallback = _LEVEL_RE.search(reply)
-    return int(fallback.group(1)) if fallback else None
+    if fallback:
+        return int(fallback.group(1))
+    return _NO_INFO if _LEVEL_NULL_RE.search(reply) else None
 
 
-async def _ask(client: GigaChatClient, title: str, body: str | None) -> int | None:
+async def _ask(
+    client: GigaChatClient, title: str, body: str | None, ref: str | None = None
+) -> int | None:
     """
     Один запрос оценки (с одним повтором при невалидном ответе).
 
+    ``ref`` (external_id акта) нужен только для логов.
+
     Returns:
-        Уровень 0–3, ``-1`` при отказе модели, ``None`` при невалидном ответе.
+        Уровень 0–3, ``-1`` при отказе модели, ``_NO_INFO`` при ответе «нет информации»
+        (без повтора: тот же запрос даст тот же ответ), ``None`` при невалидном ответе.
     Raises:
         GigaChatError: сбой сети/API (временная ошибка).
     """
@@ -302,11 +326,16 @@ async def _ask(client: GigaChatClient, title: str, body: str | None) -> int | No
             return level
         if classify_reply(reply) == "refusal":
             return -1
-        logger.warning("Оценка важности: невалидный ответ (попытка %d): %r", attempt, reply[:200])
+        logger.warning(
+            "Оценка важности %s: невалидный ответ (попытка %d): %r",
+            ref or title[:150], attempt, reply[:200],
+        )
     return None
 
 
-async def score_importance(client: GigaChatClient, title: str, body: str | None) -> int | None:
+async def score_importance(
+    client: GigaChatClient, title: str, body: str | None, *, ref: str | None = None
+) -> int | None:
     """
     Оценивает важность акта: 0 — не важно, 1 — нейтрально, 2 — важно, 3 — критически важно.
 
@@ -314,25 +343,34 @@ async def score_importance(client: GigaChatClient, title: str, body: str | None)
         client: клиент GigaChat.
         title: полный заголовок акта.
         body: саммари/начало текста (см. ``build_body``) или None — оценка по одному названию.
+        ref: external_id акта — только для логов.
 
     Returns:
-        Оценка 0–3. ``None`` — не оценено (временный сбой или невалидный ответ), оценку
-        нужно повторить позже. Отказ модели: повторная оценка по одному названию, при
-        повторном отказе — ``REFUSAL_FALLBACK_SCORE`` (чувствительная тема не должна
-        выпадать из подборки).
+        Оценка 0–3. ``None`` — не оценено (невалидный ответ), оценку нужно повторить позже.
+        Отказ или «нет информации» по входу с текстом: повторная оценка по одному названию.
+        Повторный отказ — ``REFUSAL_FALLBACK_SCORE`` (чувствительная тема не должна выпадать
+        из подборки); «нет информации» и по названию — ``NO_INFO_FALLBACK_SCORE``, а если
+        на одном из шагов был отказ — ``REFUSAL_FALLBACK_SCORE``.
+    Raises:
+        GigaChatError: сбой сети/API (временная ошибка, не путать с невалидным ответом).
     """
-    try:
-        result = await _ask(client, title, body)
-        if result == -1 and body:
-            logger.info("Оценка важности: отказ модели, повторяем по одному названию: %s", title[:150])
-            result = await _ask(client, title, None)
-    except GigaChatError as exc:
-        logger.warning("Оценка важности не удалась (%s): %s", exc, title[:150])
-        return None
+    label = ref or title[:150]
+    result = await _ask(client, title, body, ref=ref)
+    refused = result == -1
+    if result in (-1, _NO_INFO) and body:
+        logger.info(
+            "Оценка важности %s: %s, повторяем по одному названию",
+            label, "отказ модели" if refused else "нет информации",
+        )
+        result = await _ask(client, title, None, ref=ref)
     if result == -1:
         logger.warning(
-            "Оценка важности: отказ модели и по названию — ставим %d: %s",
-            REFUSAL_FALLBACK_SCORE, title[:150],
+            "Оценка важности %s: отказ модели и по названию — ставим %d",
+            label, REFUSAL_FALLBACK_SCORE,
         )
         return REFUSAL_FALLBACK_SCORE
+    if result == _NO_INFO:
+        score = REFUSAL_FALLBACK_SCORE if refused else NO_INFO_FALLBACK_SCORE
+        logger.warning("Оценка важности %s: нет информации для оценки — ставим %d", label, score)
+        return score
     return result
