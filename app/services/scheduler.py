@@ -25,7 +25,7 @@ from typing import Callable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ContextTypes
@@ -547,7 +547,9 @@ async def _rate_backlog(context) -> None:
     Не более ``IMPORTANCE_BACKLOG_LIMIT`` за цикл, старые раньше. Кандидаты без текста и
     саммари до суток (и до OCR) пропускаются без вызова LLM — оценка дождётся текста.
     Акты с исчерпанным лимитом невалидных циклов исключаются в выборке, чтобы не занимать
-    места в ``IMPORTANCE_BACKLOG_LIMIT``.
+    места в ``IMPORTANCE_BACKLOG_LIMIT``. Так же и документы, исключённые администратором
+    (``digest_override = 'exclude'``): они не оцениваются и не занимают места в лимите за цикл;
+    включённые оцениваются как обычно.
     """
     config = context.bot_data["config"]
     session_maker = context.bot_data["session_maker"]
@@ -561,6 +563,7 @@ async def _rate_backlog(context) -> None:
         Article.importance.is_(None),
         Article.level.in_(CANDIDATE_LEVELS),
         Article.is_demo.is_(False),
+        or_(Article.digest_override.is_(None), Article.digest_override != EXCLUDE),
         Article.created_at >= now - timedelta(days=IMPORTANCE_BACKLOG_DAYS),
         Article.published_at >= now - timedelta(days=IMPORTANCE_BACKLOG_PUBLISHED_DAYS),
     )

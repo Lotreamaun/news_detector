@@ -130,7 +130,8 @@ Layering is strict and intentional (see `.cursor/rules/conventions.mdc`):
      invalid reply (after 2 attempts) counts as a failed cycle in `bot_data["importance_invalid"]`;
      after `IMPORTANCE_MAX_INVALID_CYCLES` = 3 the act is skipped (and left out of the backlog query)
      until the weekly final pass or a restart. `GigaChatError` is not counted (`score_importance`
-     re-raises it, `None` = invalid reply only).
+     re-raises it, `None` = invalid reply only). Acts with `digest_override = 'exclude'` are left out of the backlog query
+     (not rated, no slot in the per-cycle limit); `include` ones are rated as usual.
 4. Notifications respect each user's `UserFilter` rows (chosen legal-force
    levels in `user_filters`; no rows = no filter, receive everything) and
    skip users who blocked the bot (`Forbidden`). Only active users who passed
@@ -163,7 +164,8 @@ Empty digest (including after that exclusion) = nothing sent. Admin preview:
 admin decision lives in `Article.digest_override` (`'include'` / `'exclude'` / NULL) and is
 final: `final_selection(window)` (window docs with a summary that are `include`, or NULL with
 importance ≥ 2; order = rating, unrated last, then newer first) feeds the send, the panel, the
-Markdown export and `/test_digest weekly`. The final pass rates/waits only for unrated docs
+Markdown export and `/test_digest weekly`. An unrated doc can be excluded at once with the "Исключить" button in the "Ещё не оценены"
+section (no summary needed). The final pass rates/waits only for unrated docs
 with no decision, and the "attempt 2" summary runs only for docs that will actually go (not
 `exclude`). On Friday at `WEEKLY_REVIEW_TIME` (default 12:00; empty = off) `_maybe_send_review_ping`
 sends a service message **only to `ADMIN_CHAT_IDS`** straight via `bot.send_message` (never
