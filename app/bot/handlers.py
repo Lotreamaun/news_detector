@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, time, timedelta, timezone
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update as sql_update
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update, WebAppInfo
 from telegram.error import BadRequest
 from telegram.helpers import escape_markdown
@@ -100,8 +100,9 @@ async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def track_bot_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Блокировка/разблокировка бота пользователем по ``my_chat_member`` (только личные чаты).
 
-    Время берётся из апдейта. ``is_active`` не трогаем: его снятие по этому событию — отдельная
-    задача (issue #23).
+    Время берётся из апдейта. Разблокировка снова включает рассылку зарегистрированному
+    пользователю (``is_active = True``); блокировка только пишется в журнал — рассылку отключает
+    отказ (403) при отправке.
     """
     change = update.my_chat_member
     if change is None or change.chat.type != "private":
@@ -114,6 +115,15 @@ async def track_bot_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         return
     record_event(_session_maker(context), kind, change.chat.id, at=change.date)
+    if kind == USER_UNBLOCKED:
+        try:
+            async with _session_maker(context)() as session:
+                await session.execute(
+                    sql_update(User).where(User.telegram_id == change.chat.id).values(is_active=True)
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("Не удалось включить рассылку после разблокировки telegram_id=%s", change.chat.id)
 
 
 def _build_level_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
@@ -484,7 +494,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обработчик /start: регистрирует пользователя в БД и приветствует.
 
-    Для нового пользователя предлагает визард настройки фильтров.
+    Для нового пользователя предлагает визард настройки фильтров. Повторный /start включает
+    рассылку, отключённую после отказа из-за блокировки бота.
     """
     if update.effective_user is None or update.message is None:
         return
@@ -509,6 +520,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Зарегистрирован новый пользователь telegram_id=%s", telegram_id)
             is_new = True
             record_event(_session_maker(context), USER_REGISTERED, telegram_id)
+        elif not user.is_active:
+            user.is_active = True
+            await session.commit()
+            logger.info("Пользователь telegram_id=%s вернулся — рассылка снова включена", telegram_id)
         else:
             logger.info("Пользователь telegram_id=%s уже зарегистрирован", telegram_id)
 

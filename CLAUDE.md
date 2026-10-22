@@ -195,7 +195,7 @@ available), a one-time link and a `web_app` button (private chats only); the rem
 telegram_id, ref)` is fire-and-forget (background task, failure = `logger.warning`, never breaks the
 caller). Sources: `track_activity` (`TypeHandler`, group -1: `cmd` — only names from `BOT_COMMANDS`,
 else `other`; `button` — first two `callback_data` segments), `track_bot_blocked` (`my_chat_member`,
-private chats; time from the update; does not touch `is_active`), `start`/`check_subscription`/settings
+private chats; time from the update; unblock sets `is_active = True` for a registered user, block only goes to the journal), `start`/`check_subscription`/settings
 wizard, `force_summarize` (wrapper around `_force_summarize`), `_send_notification(kind=law|digest|weekly)`,
 `check_legislation_updates`, `_process_entry` (`act.processed` = `<page|ocr|none>/<ok|refused|error|none>`,
 not written by backfill), `_send_weekly_digest`, and `POST /seen` (Mini-App open, verified `initData`,
@@ -212,7 +212,8 @@ and appends "…", which can end mid-sentence.
 
 ### Bot commands / handlers (`app/bot/handlers.py`, registered in `app/main.py`)
 
-- `/start` — registers the user (`users.telegram_id`, unique).
+- `/start` — registers the user (`users.telegram_id`, unique). A repeated `/start` re-enables
+  delivery (`is_active = True`) for a user deactivated after a 403.
 - `/today` — all acts published today (`published_at` = today in Moscow, see
   `app/services/today.py`), ignoring `UserFilter`: one teaser with group counters
   (Федеральные / Региональные / Прочие, group by `external_id` prefix `00`), top‑3 by
