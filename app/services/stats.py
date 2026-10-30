@@ -17,6 +17,7 @@ from app.models import Article, Event, User, UserFilter, WeeklyDigestRun
 from app.services import events as ev
 from app.services.today import PORTAL_TZ, portal_today
 
+# Пояснения к метрикам — `HINTS` в webapp/static/admin.html: меняешь подсчёт — поправь текст
 # Виды событий, по которым пользователь считается активным
 ACTIVE_KINDS = (ev.CMD, ev.BUTTON, ev.SETTINGS_CHANGED, ev.WEBAPP_OPEN, ev.SUMMARY_REQUESTED)
 # Массовые события, которые не попадают в ленту (их отражают плитки и строка проверки)
