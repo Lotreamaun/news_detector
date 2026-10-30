@@ -137,6 +137,25 @@
   .trend-name { font-size: 14px; font-weight: 600; }
   .trend-now { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .trend-now b { font-size: 16px; color: inherit; }
+  /* Пояснения к метрикам */
+  button.tile { display: block; width: 100%; border: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  button.tile:active, .hint-link:active { opacity: .6; }
+  button.tile:focus-visible, .hint-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .hint-mark { color: var(--muted); font-size: 12px; margin-left: 4px; font-weight: 400; }
+  .hint-link { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; min-height: 32px; display: inline-flex; align-items: center; }
+  .hint-sheet { position: fixed; inset: auto 0 0 0; margin: 0 auto; width: 100%; max-width: 800px; max-height: 80vh; padding: 0; border: 0; border-radius: 14px 14px 0 0; background: var(--bg); color: var(--tg-theme-text-color, CanvasText); overflow: auto; overscroll-behavior: contain; }
+  .hint-sheet::backdrop { background: rgba(0, 0, 0, .45); }
+  .hint-inner { padding: 14px 16px calc(16px + env(safe-area-inset-bottom)); }
+  .hint-close { float: right; background: none; border: 0; font-size: 20px; line-height: 1; padding: 6px 8px; color: var(--muted); cursor: pointer; min-height: 36px; }
+  .hint-sheet h3 { font-size: 16px; margin: 0 0 8px; }
+  .hint-sheet h4 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; }
+  .hint-sheet p { margin: 0 0 8px; font-size: 14px; line-height: 1.5; }
+  .hint-sheet .hint-how { font-size: 12px; color: var(--muted); }
+  .hint-sheet dl { margin: 0; }
+  .hint-sheet dt { font-weight: 600; font-size: 14px; margin-top: 10px; }
+  .hint-sheet dd { margin: 2px 0 0; font-size: 14px; line-height: 1.5; }
+  .hint-sheet dd .hint-how { margin: 2px 0 0; }
+  body:has(.hint-sheet[open]) { overflow: hidden; }
   .spark { width: 188px; height: 36px; flex: none; }
   .spark .bar { fill: var(--accent); }
   .spark .bar.cur { opacity: .5; }
@@ -186,6 +205,7 @@
   <textarea id="sheet-text" readonly></textarea>
   <div class="btn-row" style="margin-top:8px"><button id="sheet-close" type="button" class="ghost-btn">Закрыть</button></div>
 </div>
+<dialog id="hint-sheet" class="hint-sheet" aria-labelledby="hint-title"><div id="hint-inner" class="hint-inner"></div></dialog>
 <div id="toast" class="error toast" role="alert" aria-live="assertive"></div>
 <script>
 (function() {
@@ -618,6 +638,46 @@
   // ---- статистика: Пульс и Тренд ----
   const STATS_REFRESH_MS = 60000;
   const LEVEL_LABELS = { CONSTITUTION: 'Конституция', FKZ: 'ФКЗ', FZ: 'ФЗ', DECREE: 'Указы', GOV_RESOLUTION: 'Постановления', DEPARTMENTAL: 'Ведомственные', REGIONAL: 'Региональные' };
+  // Пояснения к метрикам. Меняешь подсчёт в app/services/stats.py — поправь текст здесь.
+  const HINTS = {
+    'pulse.subscribers': { title: 'Подписчики', what: 'Те, кому сейчас реально уходят уведомления о законах.', how: 'Прошли проверку подписки на канал, рассылка им не отключена, бот не заблокирован. Администраторы не учитываются.' },
+    'pulse.registered': { title: 'Зарегистрировано', what: 'Все, кто хоть раз нажал /start, включая тех, кто потом ушёл.', how: 'Все пользователи в базе без администраторов. Не прошедшие проверку канала и заблокировавшие бота входят сюда.' },
+    'pulse.unverified': { title: 'Без проверки канала', what: 'Нажали /start, но не подтвердили подписку на канал. Уведомления им не уходят, команды недоступны.', how: 'Пользователи, не прошедшие шаг онбординга с проверкой подписки, без администраторов.' },
+    'pulse.blocked': { title: 'Заблокировали бота', what: 'У скольких людей бот сейчас заблокирован.', how: 'По последнему уведомлению Telegram о статусе бота в чате: блокировка или разблокировка. Если таких уведомлений нет — рассылка получила от Telegram отказ «бот заблокирован» и отключила уведомления. Без администраторов.' },
+    'pulse.new': { title: 'Новые', what: 'Новые пользователи бота.', how: 'По дате первой регистрации (/start). Сегодня — с полуночи по Москве, 7 дн — последние 7 календарных дней включая сегодня. Без администраторов.' },
+    'pulse.blocked_new': { title: 'Заблокировали бота (за период)', what: 'Сколько людей заблокировали бота за период.', how: 'Разные люди с событием блокировки. Разблокировал потом — всё равно учтён. Без администраторов.' },
+    'pulse.active': { title: 'Активные', what: 'Сколько разных людей сами что-то сделали в боте.', how: 'Разные люди хотя бы с одним действием: команда, нажатие кнопки, смена фильтров, открытие Mini-App, запрос саммари. Получение рассылки не считается. Без администраторов.' },
+    'pulse.opens': { title: 'Открытия Mini-App', what: 'Сколько раз открывали страницы Mini-App: закон, дайджест, «Все за сегодня».', how: 'Каждое открытие отдельно, повторные тоже. Только открытия из Telegram: в обычном браузере открытие не привязать к человеку. Без администраторов.' },
+    'pulse.summaries': { title: 'Саммари по запросу', what: 'Сколько раз люди получили саммари, которое сами заказали: /summary, кнопка «Сделать саммари», Mini-App.', how: 'Успешные запросы, в том числе если саммари уже было готово или пришло из уже идущей задачи. Отказы модели, ошибки и упор в лимит не считаются. Без администраторов.' },
+    'pulse.sent': { title: 'Доставлено', what: 'Сколько уведомлений бот доставил: о законах, дайджесты, недельная подборка.', how: 'Одно сообщение одному человеку = 1. Ответы на команды не считаются. Без администраторов.' },
+    'pulse.failed': { title: 'Не доставлено', what: 'Уведомления, которые Telegram не принял.', how: 'Причина — блокировка бота или ошибка отправки; каждая попытка видна в «Ленте». Без администраторов.' },
+    'pulse.limit_month': { title: 'Упёрлись в лимит', what: 'Сколько людей в этом месяце хотели саммари сверх месячного лимита.', how: 'Разные люди с отказом по лимиту с 1-го числа текущего месяца по Москве. Без администраторов.' },
+    'pulse.pipeline': { title: 'Конвейер', what: 'Работает ли приём законов с pravo.gov.ru: последняя проверка и что стало с актами.', how: 'Строка проверки выделяется, если проверка не удалась или её не было дольше трёх интервалов проверки. «Акты за 24 часа» — скользящие сутки от текущего момента. «Текст»: страница — взят с портала, OCR — распознан из PDF, нет текста. «Саммари»: готово, отказ модели, ошибка, без саммари (не делали — например, нет текста). Администраторы здесь ни при чём: это работа бота.' },
+    'pulse.filters': { title: 'Фильтры подписчиков', what: 'Какие уровни силы актов выбрали подписчики в /settings.', how: 'Только подписчики. Человек может выбрать несколько уровней, поэтому сумма больше числа подписчиков. «Без ограничений» — фильтр пуст, приходят все уровни.' },
+    'pulse.feed': { title: 'Лента', what: 'Последние 50 событий, от новых к старым.', how: 'Время по Москве; пользователь — @username, иначе Telegram ID. Массовые события (успешные проверки, доставленные уведомления, обработка актов) сюда не попадают. Действия администраторов видны с пометкой «админ».' },
+    'trend.registrations': { title: 'Регистрации', what: 'Новые пользователи за неделю.', how: 'По дате регистрации, по всей истории базы, без администраторов.' },
+    'trend.blocks': { title: 'Заблокировали бота', what: 'Блокировки бота за неделю.', how: 'Каждое событие блокировки: заблокировал дважды — 2. Из журнала событий, без администраторов.' },
+    'trend.active': { title: 'Активные пользователи', what: 'Сколько разных людей что-то сделали в боте за неделю.', how: 'Те же действия, что у плитки «Активные»; человек считается один раз за неделю. Из журнала, без администраторов.' },
+    'trend.opens': { title: 'Открытия Mini-App', what: 'Открытия страниц Mini-App за неделю.', how: 'Каждое открытие из Telegram. Из журнала, без администраторов.' },
+    'trend.summaries': { title: 'Саммари по запросу', what: 'Полученные по запросу саммари за неделю.', how: 'Как у плитки «Саммари по запросу». Из журнала, без администраторов.' },
+    'trend.delivered': { title: 'Доставлено уведомлений', what: 'Доставленные уведомления за неделю.', how: 'Одно сообщение одному человеку = 1. Из журнала, без администраторов.' },
+    'trend.accepted': { title: 'Принято актов', what: 'Сколько новых актов бот принял с pravo.gov.ru за неделю.', how: 'По дате, когда бот принял акт, а не по дате публикации. По всей истории базы, демо-акт не считается.' },
+    'trend.with_summary': { title: 'Из них с саммари', what: 'Сколько из принятых за неделю актов сейчас имеют саммари.', how: 'Считается на момент открытия: сюда входят и саммари, сделанные позже — по запросу или вручную в панели.' },
+    'trend.check_failures': { title: 'Сбои проверок pravo.gov.ru', what: 'Сколько раз за неделю не удалось получить список актов с портала.', how: 'Неудачные проверки из журнала. В норме — 0.' },
+    'trend.digest': { title: 'Недельная подборка отправлена', what: 'Ушла ли недельная подборка важных законов.', how: '1 — подборка за период, закончившийся на этой неделе, разослана; 0 — нет (не было актов, пропущена или функция выключена).' }
+  };
+  const HINT_GROUPS = {
+    pulse: [
+      ['Аудитория сейчас', ['pulse.subscribers', 'pulse.registered', 'pulse.unverified', 'pulse.blocked']],
+      ['Сегодня и за 7 дней', ['pulse.new', 'pulse.blocked_new', 'pulse.active', 'pulse.opens', 'pulse.summaries', 'pulse.sent', 'pulse.failed', 'pulse.limit_month']],
+      ['Панели', ['pulse.pipeline', 'pulse.filters', 'pulse.feed']]
+    ],
+    trend: [
+      ['Люди и доставка', ['trend.registrations', 'trend.blocks', 'trend.active', 'trend.opens', 'trend.summaries', 'trend.delivered']],
+      ['Акты и подборка', ['trend.accepted', 'trend.with_summary', 'trend.check_failures', 'trend.digest']]
+    ]
+  };
+  const HINT_TREND_NOTE = 'Недели пн–вс по Москве, последний столбец — текущая неделя, она ещё идёт. Ряды из журнала событий для недель до его начала — «нет данных», а не ноль.';
   const SOURCE_LABELS = [['page', 'страница'], ['ocr', 'OCR'], ['none', 'нет текста']];
   const OUTCOME_LABELS = [['ok', 'готово'], ['refused', 'отказ'], ['error', 'ошибка'], ['none', 'без саммари']];
   const NS = 'http://www.w3.org/2000/svg';
@@ -669,20 +729,72 @@
     loadStats('pulse', true);
   }
 
-  function tile(label, value, sub) {
-    return h('div', { class: 'tile' },
-      h('div', { class: 'tile-label', text: label }),
-      h('div', { class: 'tile-val', text: String(value) }),
-      sub != null && h('div', { class: 'tile-sub', text: sub }));
+  // ---- шторка с пояснениями ----
+  const hintSheet = $('hint-sheet');
+  let hintOpener = '';
+  function showHintSheet(opener, nodes) {
+    const inner = $('hint-inner');
+    inner.textContent = '';
+    inner.append(h('button', { type: 'button', class: 'hint-close', 'aria-label': 'Закрыть', onclick: function() { hintSheet.close(); } }, '✕'));
+    nodes.forEach(function(n) { inner.append(n); });
+    hintOpener = opener || '';
+    if (typeof hintSheet.showModal === 'function') { if (!hintSheet.open) hintSheet.showModal(); }
+    else hintSheet.setAttribute('open', '');
+    hintSheet.scrollTop = 0;
   }
-  function periodTile(label, pair) {
-    return tile(label, pair.today, '7 дн: ' + pair.week);
+  function hintBody(hint) {
+    return [h('p', { text: hint.what }), h('p', { class: 'hint-how', text: 'Как считается: ' + hint.how })];
+  }
+  function openHint(key) {
+    const hint = HINTS[key];
+    if (!hint) return;
+    showHintSheet('hint:' + key, [h('h3', { id: 'hint-title', text: hint.title })].concat(hintBody(hint)));
+  }
+  function openAllHints(kind) {
+    const nodes = [h('h3', { id: 'hint-title', text: 'Пояснения: ' + (kind === 'pulse' ? 'Пульс' : 'Тренд') })];
+    if (kind === 'trend') nodes.push(h('p', { class: 'hint-how', text: HINT_TREND_NOTE }));
+    HINT_GROUPS[kind].forEach(function(group) {
+      nodes.push(h('h4', { text: group[0] }));
+      nodes.push(h('dl', {}, group[1].map(function(key) {
+        const hint = HINTS[key];
+        return [h('dt', { text: hint.title }), h('dd', {}, hintBody(hint))];
+      }).reduce(function(acc, pair) { return acc.concat(pair); }, [])));
+    });
+    showHintSheet('', nodes);
+  }
+  hintSheet.addEventListener('click', function(e) { if (e.target === hintSheet) hintSheet.close(); });
+  hintSheet.addEventListener('close', function() {
+    const el = hintOpener && document.querySelector('[data-key="' + hintOpener + '"]');
+    if (el) el.focus();
+  });
+  function hintLink(label, key) {
+    return h('button', { type: 'button', class: 'hint-link', 'data-key': 'hint:' + key, 'aria-haspopup': 'dialog', onclick: function() { openHint(key); } },
+      label, h('span', { class: 'hint-mark', 'aria-hidden': 'true', text: 'ⓘ' }));
+  }
+  function allHintsLink(kind) {
+    return h('button', { type: 'button', class: 'link-btn', onclick: function() { openAllHints(kind); } }, 'Все пояснения');
+  }
+
+  function tile(label, value, sub, hintKey) {
+    const inner = [
+      h('div', { class: 'tile-label' }, label, hintKey && h('span', { class: 'hint-mark', 'aria-hidden': 'true', text: 'ⓘ' })),
+      h('div', { class: 'tile-val', text: String(value) }),
+      sub != null && h('div', { class: 'tile-sub', text: sub })];
+    if (!hintKey) return h('div', { class: 'tile' }, inner);
+    return h('button', {
+      type: 'button', class: 'tile hint-trigger', 'data-key': 'hint:' + hintKey, 'aria-haspopup': 'dialog',
+      'aria-label': label + ': ' + value + (sub != null ? ', ' + sub : '') + '. Открыть пояснение',
+      onclick: function() { openHint(hintKey); }
+    }, inner);
+  }
+  function periodTile(label, pair, hintKey) {
+    return tile(label, pair.today, '7 дн: ' + pair.week, hintKey);
   }
   function kv(label, value) {
     return h('div', { class: 'kv' }, h('span', { text: label }), h('b', { text: String(value) }));
   }
-  function block(title, hint, body) {
-    return h('section', {}, h('h2', { class: 'sec-title', text: title }), hint && h('p', { class: 'sec-hint', text: hint }), body);
+  function block(title, hint, body, hintKey) {
+    return h('section', {}, h('h2', { class: 'sec-title' }, hintKey ? hintLink(title, hintKey) : title), hint && h('p', { class: 'sec-hint', text: hint }), body);
   }
 
   function pipelineBlock(p) {
@@ -705,12 +817,12 @@
       h('div', {}, 'Акты за 24 часа: ', h('b', { text: String(a.total) })),
       a.total > 0 && h('div', { class: 'sec-hint', style: 'margin:4px 0 0', text: 'Текст: ' + parts(SOURCE_LABELS, a.source) }),
       a.total > 0 && h('div', { class: 'sec-hint', style: 'margin:2px 0 0', text: 'Саммари: ' + parts(OUTCOME_LABELS, a.outcome) })));
-    return block('Конвейер', null, body);
+    return block('Конвейер', null, body, 'pulse.pipeline');
   }
   function filtersBlock(f) {
     const rows = f.levels.map(function(l) { return kv(LEVEL_LABELS[l.level] || l.level, l.count); });
     rows.push(kv('Без ограничений (все уровни)', f.unrestricted));
-    return block('Фильтры подписчиков', 'Сколько подписчиков выбрали каждый уровень силы.', h('div', { class: 'panel' }, rows));
+    return block('Фильтры подписчиков', 'Сколько подписчиков выбрали каждый уровень силы.', h('div', { class: 'panel' }, rows), 'pulse.filters');
   }
   function feedBlock(feed) {
     const body = feed.length
@@ -723,28 +835,29 @@
               (e.user ? ' ' : '') + e.text));
         }))
       : h('div', { class: 'empty', text: 'Событий пока нет. Они появятся, как только бот начнёт работать с журналом.' });
-    return block('Лента', 'Последние события (время по Москве). Рассылки и успешные проверки сюда не попадают.', body);
+    return block('Лента', 'Последние события (время по Москве). Рассылки и успешные проверки сюда не попадают.', body, 'pulse.feed');
   }
   function pulseView(d) {
     const a = d.audience, e = d.engagement, dl = d.delivery;
     return h('div', {},
       block('Аудитория сейчас', null, h('div', { class: 'tiles' },
-        tile('Подписчики', a.subscribers, 'получают уведомления'),
-        tile('Зарегистрировано', a.registered),
-        tile('Без проверки канала', a.unverified),
-        tile('Заблокировали бота', a.blocked))),
+        tile('Подписчики', a.subscribers, 'получают уведомления', 'pulse.subscribers'),
+        tile('Зарегистрировано', a.registered, null, 'pulse.registered'),
+        tile('Без проверки канала', a.unverified, null, 'pulse.unverified'),
+        tile('Заблокировали бота', a.blocked, null, 'pulse.blocked'))),
       block('Сегодня и за 7 дней', 'Календарные дни по Москве, администраторы не учитываются.', h('div', { class: 'tiles' },
-        periodTile('Новые', a.new),
-        periodTile('Заблокировали бота', a.blocked_new),
-        periodTile('Активные', e.active),
-        periodTile('Открытия Mini-App', e.opens),
-        periodTile('Саммари по запросу', e.summaries),
-        periodTile('Доставлено', dl.sent),
-        periodTile('Не доставлено', dl.failed),
-        tile('Упёрлись в лимит', e.limit_month, 'в этом месяце'))),
+        periodTile('Новые', a.new, 'pulse.new'),
+        periodTile('Заблокировали бота', a.blocked_new, 'pulse.blocked_new'),
+        periodTile('Активные', e.active, 'pulse.active'),
+        periodTile('Открытия Mini-App', e.opens, 'pulse.opens'),
+        periodTile('Саммари по запросу', e.summaries, 'pulse.summaries'),
+        periodTile('Доставлено', dl.sent, 'pulse.sent'),
+        periodTile('Не доставлено', dl.failed, 'pulse.failed'),
+        tile('Упёрлись в лимит', e.limit_month, 'в этом месяце', 'pulse.limit_month'))),
       pipelineBlock(d.pipeline),
       filtersBlock(d.filters),
-      feedBlock(d.feed));
+      feedBlock(d.feed),
+      allHintsLink('pulse'));
   }
 
   function spark(series, weeks) {
@@ -780,13 +893,15 @@
     const first = d.weeks[0].start, hasGaps = d.series.some(function(s) { return s.values.indexOf(null) >= 0; });
     const hint = 'Недели пн–вс по Москве, с ' + mskDay(first + 'T00:00:00+03:00') + '. Последний (бледный) столбец — текущая неделя, она ещё идёт.'
       + (hasGaps ? ' Пунктир — «нет данных»: журнал событий ведётся с ' + (d.tracking_since ? mskDay(d.tracking_since) : 'первого события') + '.' : '');
-    return block('Последние 12 недель', hint, d.series.map(function(s) {
+    const rows = d.series.map(function(s) {
       const cur = s.values[s.values.length - 1];
+      const key = 'trend.' + s.key;
       return h('div', { class: 'trend-row' },
-        h('div', {}, h('div', { class: 'trend-name', text: s.title }),
+        h('div', {}, h('div', { class: 'trend-name' }, HINTS[key] ? hintLink(s.title, key) : s.title),
           h('div', { class: 'trend-now' }, 'эта неделя: ', h('b', { text: cur == null ? 'нет данных' : String(cur) }))),
         spark(s, d.weeks));
-    }));
+    });
+    return h('div', {}, block('Последние 12 недель', hint, rows), allHintsLink('trend'));
   }
 
   function updateStatsClock() {
