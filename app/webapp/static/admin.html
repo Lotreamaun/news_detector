@@ -100,7 +100,7 @@
   .center-msg { text-align: center; padding: 40px 8px; }
   .toast { z-index: 20; }
 
-  /* вкладки «Подборка | Статистика» и переключатель «Пульс | Тренд» */
+  /* вкладки «Подборка | Статистика | Рассылки» и переключатель «Пульс | Тренд» */
   .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
   .tab { flex: 1; min-height: 40px; background: var(--soft); border: 0; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: var(--muted); }
   .tab[aria-selected="true"] { background: var(--accent); color: var(--tg-theme-button-text-color, #fff); }
@@ -160,6 +160,25 @@
   .spark .bar { fill: var(--accent); }
   .spark .bar.cur { opacity: .5; }
   .spark .nodata { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 2; opacity: .6; }
+
+  /* Рассылки */
+  .field { margin: 0 0 12px; }
+  .field-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .bc-input { width: 100%; min-height: 40px; border: 1px solid var(--sum-border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 16px; line-height: 1.4; background: var(--bg); color: inherit; }
+  .bc-opts { display: grid; gap: 6px; }
+  .bc-msg { font-size: 14px; margin: 8px 0 0; }
+  .bc-msg:empty { display: none; }
+  .bc-ok { color: #198754; }
+  .dark .bc-ok { color: #75b798; }
+  .bc-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; font-size: 13px; color: var(--muted); }
+  .bc-head b { color: var(--tg-theme-text-color, #222); }
+  .bc-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+  .bc-opt { margin-top: 6px; }
+  .bc-opt-row { display: flex; justify-content: space-between; gap: 12px; }
+  .bc-opt-row span { overflow-wrap: anywhere; }
+  .bc-opt-bar { height: 6px; border-radius: 3px; background: var(--soft); overflow: hidden; margin-top: 2px; }
+  .bc-opt-bar span { display: block; height: 100%; background: var(--accent); }
+  .chip-sending { color: var(--accent); border-color: var(--sum-border); }
 </style>
 </head>
 <body>
@@ -168,6 +187,7 @@
     <div id="tabs" class="tabs" role="tablist" hidden>
       <button type="button" class="tab" role="tab" data-tab="digest">Подборка</button>
       <button type="button" class="tab" role="tab" data-tab="stats">Статистика</button>
+      <button type="button" class="tab" role="tab" data-tab="broadcasts">Рассылки</button>
     </div>
     <div id="digest-head">
       <div class="top-row">
@@ -187,12 +207,16 @@
       </div>
       <div id="upd" class="upd" role="status" aria-live="polite">&nbsp;</div>
     </div>
+    <div id="bc-head" hidden>
+      <div class="top-row"><h1>Рассылки</h1></div>
+    </div>
   </div>
 </header>
 <main>
   <div id="fatal" class="main-inner center-msg" hidden></div>
   <div id="main" class="main-inner" aria-busy="true" hidden><div class="center-msg loading">Загрузка…</div></div>
   <div id="stats-main" class="main-inner" aria-busy="true" hidden><div class="center-msg loading">Загрузка…</div></div>
+  <div id="bc-main" class="main-inner" aria-busy="true" hidden><div class="center-msg loading">Загрузка…</div></div>
 </main>
 <footer class="bar" id="bar" hidden>
   <div class="bar-inner">
@@ -649,18 +673,18 @@
     'pulse.active': { title: 'Активные', what: 'Сколько разных людей сами что-то сделали в боте.', how: 'Разные люди хотя бы с одним действием: команда, нажатие кнопки, смена фильтров, открытие Mini-App, запрос саммари. Получение рассылки не считается. Без администраторов.' },
     'pulse.opens': { title: 'Открытия Mini-App', what: 'Сколько раз открывали страницы Mini-App: закон, дайджест, «Все за сегодня».', how: 'Каждое открытие отдельно, повторные тоже. Только открытия из Telegram: в обычном браузере открытие не привязать к человеку. Без администраторов.' },
     'pulse.summaries': { title: 'Саммари по запросу', what: 'Сколько раз люди получили саммари, которое сами заказали: /summary, кнопка «Сделать саммари», Mini-App.', how: 'Успешные запросы, в том числе если саммари уже было готово или пришло из уже идущей задачи. Отказы модели, ошибки и упор в лимит не считаются. Без администраторов.' },
-    'pulse.sent': { title: 'Доставлено', what: 'Сколько уведомлений бот доставил: о законах, дайджесты, недельная подборка.', how: 'Одно сообщение одному человеку = 1. Ответы на команды не считаются. Без администраторов.' },
-    'pulse.failed': { title: 'Не доставлено', what: 'Уведомления, которые Telegram не принял.', how: 'Причина — блокировка бота или ошибка отправки; каждая попытка видна в «Ленте». Без администраторов.' },
+    'pulse.sent': { title: 'Доставлено', what: 'Сколько уведомлений бот доставил: о законах, дайджесты, недельная подборка, рассылки администратора.', how: 'Одно сообщение одному человеку = 1. Рассылки из вкладки «Рассылки» тоже считаются, тестовая отправка себе — нет. Ответы на команды не считаются. Без администраторов.' },
+    'pulse.failed': { title: 'Не доставлено', what: 'Уведомления, которые Telegram не принял, включая сообщения рассылок администратора.', how: 'Причина — блокировка бота или ошибка отправки; каждая попытка видна в «Ленте». Без администраторов.' },
     'pulse.limit_month': { title: 'Упёрлись в лимит', what: 'Сколько людей в этом месяце хотели саммари сверх месячного лимита.', how: 'Разные люди с отказом по лимиту с 1-го числа текущего месяца по Москве. Без администраторов.' },
     'pulse.pipeline': { title: 'Конвейер', what: 'Работает ли приём законов с pravo.gov.ru: последняя проверка и что стало с актами.', how: 'Строка проверки выделяется, если проверка не удалась или её не было дольше трёх интервалов проверки. «Акты за 24 часа» — скользящие сутки от текущего момента. «Текст»: страница — взят с портала, OCR — распознан из PDF, нет текста. «Саммари»: готово, отказ модели, ошибка, без саммари (не делали — например, нет текста). Администраторы здесь ни при чём: это работа бота.' },
     'pulse.filters': { title: 'Фильтры подписчиков', what: 'Какие уровни силы актов выбрали подписчики в /settings.', how: 'Только подписчики. Человек может выбрать несколько уровней, поэтому сумма больше числа подписчиков. «Без ограничений» — фильтр пуст, приходят все уровни.' },
-    'pulse.feed': { title: 'Лента', what: 'Последние 50 событий, от новых к старым.', how: 'Время по Москве; пользователь — @username, иначе Telegram ID. Массовые события (успешные проверки, доставленные уведомления, обработка актов) сюда не попадают. Действия администраторов видны с пометкой «админ».' },
+    'pulse.feed': { title: 'Лента', what: 'Последние 50 событий, от новых к старым.', how: 'Время по Москве; пользователь — @username, иначе Telegram ID. Массовые события (успешные проверки, доставленные уведомления, обработка актов) сюда не попадают; запуск рассылки администратора — попадает. Действия администраторов видны с пометкой «админ».' },
     'trend.registrations': { title: 'Регистрации', what: 'Новые пользователи за неделю.', how: 'По дате регистрации, по всей истории базы, без администраторов.' },
     'trend.blocks': { title: 'Заблокировали бота', what: 'Блокировки бота за неделю.', how: 'Каждое событие блокировки: заблокировал дважды — 2. Из журнала событий, без администраторов.' },
     'trend.active': { title: 'Активные пользователи', what: 'Сколько разных людей что-то сделали в боте за неделю.', how: 'Те же действия, что у плитки «Активные»; человек считается один раз за неделю. Из журнала, без администраторов.' },
     'trend.opens': { title: 'Открытия Mini-App', what: 'Открытия страниц Mini-App за неделю.', how: 'Каждое открытие из Telegram. Из журнала, без администраторов.' },
     'trend.summaries': { title: 'Саммари по запросу', what: 'Полученные по запросу саммари за неделю.', how: 'Как у плитки «Саммари по запросу». Из журнала, без администраторов.' },
-    'trend.delivered': { title: 'Доставлено уведомлений', what: 'Доставленные уведомления за неделю.', how: 'Одно сообщение одному человеку = 1. Из журнала, без администраторов.' },
+    'trend.delivered': { title: 'Доставлено уведомлений', what: 'Доставленные уведомления за неделю, включая рассылки администратора.', how: 'Одно сообщение одному человеку = 1. Из журнала, без администраторов.' },
     'trend.accepted': { title: 'Принято актов', what: 'Сколько новых актов бот принял с pravo.gov.ru за неделю.', how: 'По дате, когда бот принял акт, а не по дате публикации. По всей истории базы, демо-акт не считается.' },
     'trend.with_summary': { title: 'Из них с саммари', what: 'Сколько из принятых за неделю актов сейчас имеют саммари.', how: 'Считается на момент открытия: сюда входят и саммари, сделанные позже — по запросу или вручную в панели.' },
     'trend.check_failures': { title: 'Сбои проверок pravo.gov.ru', what: 'Сколько раз за неделю не удалось получить список актов с портала.', how: 'Неудачные проверки из журнала. В норме — 0.' },
@@ -682,7 +706,7 @@
   const OUTCOME_LABELS = [['ok', 'готово'], ['refused', 'отказ'], ['error', 'ошибка'], ['none', 'без саммари']];
   const NS = 'http://www.w3.org/2000/svg';
   let moderation = false;
-  let tab = 'stats';           // digest | stats
+  let tab = 'stats';           // digest | stats | broadcasts
   let statsKind = 'pulse';     // pulse | trend
   const sv = { pulse: null, trend: null, error: '', fatal: '', lastOk: 0, stale: false, loading: {} };
 
@@ -835,7 +859,7 @@
               (e.user ? ' ' : '') + e.text));
         }))
       : h('div', { class: 'empty', text: 'Событий пока нет. Они появятся, как только бот начнёт работать с журналом.' });
-    return block('Лента', 'Последние события (время по Москве). Рассылки и успешные проверки сюда не попадают.', body, 'pulse.feed');
+    return block('Лента', 'Последние события (время по Москве). Доставленные уведомления и успешные проверки сюда не попадают.', body, 'pulse.feed');
   }
   function pulseView(d) {
     const a = d.audience, e = d.engagement, dl = d.delivery;
@@ -948,20 +972,255 @@
     loadStats(kind, true);   // Тренд обновляется при каждом открытии, автоматически — только Пульс
   }
 
+  // ---- рассылки ----
+  const BC_TEXT_MAX = 3500;
+  const BC_BUTTON_MAX = 40;
+  const BC_POLL_MS = 3000;
+  const BC_CONFIRM_MS = 5000;
+  // form — элементы формы (собирается один раз и не перерисовывается: ввод не теряется при опросе списка)
+  const bc = { data: null, error: '', fatal: '', loading: false, form: null, listEl: null, token: '', audience: null, confirmUntil: 0, confirmTimer: null, busy: '' };
+
+  function newToken() {
+    const bytes = new Uint8Array(16);
+    if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    return Array.from(bytes, function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+  }
+  function bcSending() {
+    return bc.data ? bc.data.broadcasts.find(function(b) { return b.status === 'sending'; }) : null;
+  }
+  async function loadBc(silent) {
+    if (bc.loading) return;
+    bc.loading = true;
+    try {
+      bc.data = await api('/admin/api/broadcasts');
+      bc.error = '';
+    } catch (e) {
+      if (e.kind === 'expired' || e.kind === 'forbidden') bc.fatal = e.kind;
+      else if (bc.data) { if (!silent) showToast(e.message); }   // прежний список остаётся на экране
+      else bc.error = e.message;
+    }
+    bc.loading = false;
+    if (tab === 'broadcasts') renderBcTab();
+  }
+  function bcFail(e) {
+    if (e.kind === 'expired' || e.kind === 'forbidden') { bc.fatal = e.kind; renderBcTab(); return; }
+    showBcMsg(e.message, true);
+  }
+  function showBcMsg(text, isError) {
+    const el = bc.form.msg;
+    el.textContent = text || '';
+    el.className = 'bc-msg' + (text ? (isError ? ' error' : ' bc-ok') : '');
+    if (text && isError && tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('error');
+  }
+  async function loadAudience() {
+    const segment = bc.form.segment.value;
+    bc.audience = null;
+    updateBcForm();
+    try {
+      const res = await api('/admin/api/broadcasts/audience?segment=' + encodeURIComponent(segment));
+      if (bc.form.segment.value === segment) bc.audience = res.count;
+    } catch (e) {
+      bcFail(e);
+    }
+    updateBcForm();
+  }
+  function bcDraft() {
+    const f = bc.form;
+    const kind = f.action.value;
+    return {
+      text: f.text.value,
+      options: f.options.map(function(input) { return input.value; }),
+      action: kind === 'none' ? null : { kind: kind, label: f.label.value, url: f.url.value },
+      segment: f.segment.value,
+      client_token: bc.token
+    };
+  }
+  function onBcEdit() {
+    bc.confirmUntil = 0;   // поменяли форму — подтверждение запуска заново
+    showBcMsg('');
+    updateBcForm();
+  }
+  function buildBcForm() {
+    const d = bc.data;
+    const f = {};
+    f.text = h('textarea', { class: 'sum-edit', id: 'bc-text' });
+    f.counter = h('span', { class: 'counter' });
+    f.options = [1, 2, 3, 4].map(function(n) {
+      return h('input', { class: 'bc-input', type: 'text', maxlength: BC_BUTTON_MAX, placeholder: 'Вариант ' + n, 'aria-label': 'Вариант ответа ' + n });
+    });
+    f.action = h('select', { class: 'bc-input', id: 'bc-action' },
+      h('option', { value: 'none' }, 'Без кнопки'),
+      h('option', { value: 'link' }, 'Ссылка'),
+      d.check_subscription_available && h('option', { value: 'check_subscription' }, '«Проверить подписку»'));
+    f.label = h('input', { class: 'bc-input', type: 'text', maxlength: BC_BUTTON_MAX, placeholder: 'Подпись кнопки', 'aria-label': 'Подпись кнопки-ссылки' });
+    f.url = h('input', { class: 'bc-input', type: 'url', inputmode: 'url', placeholder: 'https://…', 'aria-label': 'Адрес ссылки' });
+    f.linkBox = h('div', { class: 'bc-opts', style: 'margin-top:6px' }, f.label, f.url);
+    f.segment = h('select', { class: 'bc-input', id: 'bc-segment' }, d.segments.map(function(sg) { return h('option', { value: sg.key }, sg.label); }));
+    f.audience = h('div', { class: 'sec-hint', style: 'margin:4px 0 0' });
+    f.test = h('button', { type: 'button', class: 'ghost-btn', onclick: sendBcTest });
+    f.send = h('button', { type: 'button', class: 'sum-btn', onclick: launchBc });
+    f.note = h('div', { class: 'sum-status' });
+    f.msg = h('div', { class: 'bc-msg', role: 'status', 'aria-live': 'polite' });
+    [f.text, f.label, f.url].concat(f.options).forEach(function(el) { el.addEventListener('input', onBcEdit); });
+    f.action.addEventListener('change', onBcEdit);
+    f.segment.addEventListener('change', function() { onBcEdit(); loadAudience(); });
+    f.root = h('section', { 'aria-labelledby': 'bc-new' },
+      h('h2', { class: 'sec-title', id: 'bc-new' }, 'Новая рассылка'),
+      h('p', { class: 'sec-hint', text: 'Простой текст без разметки — получатель увидит его как есть. Ответ — только кнопками вариантов. Каждый получатель получит сообщение один раз.' }),
+      h('div', { class: 'field' }, h('label', { class: 'field-label', for: 'bc-text' }, 'Текст'), f.text, h('div', { class: 'edit-meta' }, h('span'), f.counter)),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Варианты ответа — необязательно, до 4'), h('div', { class: 'bc-opts' }, f.options)),
+      h('div', { class: 'field' }, h('label', { class: 'field-label', for: 'bc-action' }, 'Кнопка действия'), f.action, f.linkBox),
+      h('div', { class: 'field' }, h('label', { class: 'field-label', for: 'bc-segment' }, 'Аудитория'), f.segment, f.audience),
+      h('div', { class: 'btn-row' }, f.test, f.send),
+      f.note, f.msg);
+    bc.form = f;
+    bc.token = newToken();
+    loadAudience();
+  }
+  function resetBcForm() {
+    const f = bc.form;
+    f.text.value = '';
+    f.options.forEach(function(input) { input.value = ''; });
+    f.action.value = 'none';
+    f.label.value = '';
+    f.url.value = '';
+    bc.token = newToken();   // следующая рассылка — новая форма
+    loadAudience();
+  }
+  function updateBcForm() {
+    const f = bc.form;
+    if (!f) return;
+    const len = f.text.value.trim().length;
+    f.counter.textContent = len + '/' + BC_TEXT_MAX;
+    f.counter.className = 'counter' + (len > BC_TEXT_MAX ? ' over' : '');
+    f.linkBox.hidden = f.action.value !== 'link';
+    const n = bc.audience;
+    f.audience.textContent = n == null ? 'Считаю получателей…' : 'Получателей: ' + n + (n === 0 ? ' — разослать некому' : '') + '. Администраторы в рассылку не входят.';
+    const sending = bcSending();
+    const invalid = len === 0 || len > BC_TEXT_MAX;
+    f.test.disabled = !!bc.busy || invalid;
+    f.test.replaceChildren.apply(f.test, bc.busy === 'test' ? [h('span', { class: 'spin' }), 'Отправляю…'] : ['Отправить себе']);
+    f.send.disabled = !!bc.busy || invalid || !n || !!sending;
+    let label;
+    if (bc.busy === 'send') label = [h('span', { class: 'spin' }), 'Запускаю…'];
+    else if (bc.confirmUntil > Date.now()) label = ['Нажмите ещё раз, чтобы разослать ' + n];
+    else label = ['Разослать' + (n ? ' ' + n + ' ' + plural(n, 'получателю', 'получателям', 'получателям') : '')];
+    f.send.replaceChildren.apply(f.send, label);
+    f.note.textContent = sending ? 'Идёт отправка рассылки #' + sending.id + ' — новую можно запустить после неё.' : '';
+  }
+  async function sendBcTest() {
+    bc.busy = 'test';
+    showBcMsg('');
+    updateBcForm();
+    try {
+      await api('/admin/api/broadcasts/test', bcDraft());
+      showBcMsg('Тест отправлен вам в чат с ботом ✓');
+    } catch (e) {
+      bcFail(e);
+    }
+    bc.busy = '';
+    updateBcForm();
+  }
+  async function launchBc() {
+    if (bc.confirmUntil <= Date.now()) {
+      // первое нажатие только просит подтвердить (confirm() в Mini-App ведёт себя по-разному)
+      bc.confirmUntil = Date.now() + BC_CONFIRM_MS;
+      clearTimeout(bc.confirmTimer);
+      bc.confirmTimer = setTimeout(updateBcForm, BC_CONFIRM_MS + 50);
+      updateBcForm();
+      return;
+    }
+    bc.confirmUntil = 0;
+    clearTimeout(bc.confirmTimer);
+    bc.busy = 'send';
+    showBcMsg('');
+    updateBcForm();
+    try {
+      const res = await api('/admin/api/broadcasts', bcDraft());
+      resetBcForm();
+      showBcMsg('Рассылка #' + res.id + ' запущена: ' + res.recipients + ' ' + plural(res.recipients, 'получатель', 'получателя', 'получателей') + ' ✓');
+      loadBc(true);
+    } catch (e) {
+      bcFail(e);
+      if (e.kind === 'conflict') loadBc(true);
+    }
+    bc.busy = '';
+    updateBcForm();
+  }
+  function bcItem(b) {
+    const c = b.counts;
+    const num = function(v) { return h('b', { text: String(v) }); };
+    return h('article', { class: 'panel' },
+      h('div', { class: 'bc-head' },
+        h('b', { text: '#' + b.id }), h('span', { text: b.time }), h('span', { text: b.segment_label }),
+        b.status === 'sending' && h('span', { class: 'chip chip-sending', text: 'идёт отправка' })),
+      h('div', { class: 'bc-text', text: b.preview }),
+      b.action_label && h('div', { class: 'sec-hint', style: 'margin:0 0 4px', text: 'Кнопка: ' + b.action_label }),
+      h('div', {}, 'Получателей ', num(b.recipients), ' · отправлено ', num(c.sent), ' · заблокировали ', num(c.blocked),
+        ' · ошибка ', num(c.error), ' · в очереди ', num(c.pending)),
+      b.options.length > 0 && h('div', {}, b.options.map(function(o) {
+        return h('div', { class: 'bc-opt' },
+          h('div', { class: 'bc-opt-row' }, h('span', { text: o.text }), h('b', { text: o.count + ' · ' + o.share + '%' })),
+          h('div', { class: 'bc-opt-bar', 'aria-hidden': 'true' }, h('span', { style: 'width:' + Math.min(100, o.share) + '%' })));
+      })));
+  }
+  function bcListView() {
+    const items = bc.data.broadcasts;
+    return h('section', { 'aria-labelledby': 'bc-sent' },
+      h('h2', { class: 'sec-title', id: 'bc-sent' }, 'Отправленные', h('span', { class: 'sec-count', text: '· ' + items.length })),
+      items.length > 0 && h('p', { class: 'sec-hint', text: 'Последние 20, время по Москве. Ответы — числа по вариантам, доля — от отправленных.' }),
+      items.length ? items.map(bcItem) : h('div', { class: 'empty', text: 'Рассылок пока не было.' }));
+  }
+  function renderBcTab() {
+    const root = $('bc-main');
+    const scrollY = window.scrollY;
+    const st = bc.fatal || (bc.data ? 'ready' : bc.error ? 'error' : 'loading');
+    root.setAttribute('aria-busy', st === 'loading' ? 'true' : 'false');
+    if (st !== 'ready') {
+      root.textContent = '';
+      if (st === 'loading') root.append(h('div', { class: 'center-msg loading', text: 'Загрузка…' }));
+      else if (st === 'expired') root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Сессия закончилась. Отправьте боту команду /admin и откройте новую ссылку (в Telegram — кнопку «Открыть панель» в ответе).' })));
+      else if (st === 'forbidden') root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: 'Доступ только для администраторов.' })));
+      else root.append(h('div', { class: 'center-msg' }, h('p', { class: 'error', text: bc.error || 'Не удалось загрузить рассылки.' }),
+        h('button', { type: 'button', class: 'sum-btn', onclick: function() { bc.error = ''; renderBcTab(); loadBc(); } }, 'Повторить')));
+      return;
+    }
+    if (!bc.form) buildBcForm();
+    if (!root.contains(bc.form.root)) {
+      bc.listEl = h('div', {});
+      root.textContent = '';
+      root.append(bc.form.root, bc.listEl);
+    }
+    bc.listEl.replaceChildren(bcListView());
+    updateBcForm();
+    window.scrollTo(0, scrollY);
+  }
+  function openBroadcasts() {
+    renderBcTab();
+    loadBc(true);
+    if (bc.form) loadAudience();
+  }
+  document.addEventListener('visibilitychange', function() { if (!document.hidden && tab === 'broadcasts' && !bc.fatal) loadBc(true); });
+  // пока идёт отправка — итоги обновляются сами, только при видимой странице
+  setInterval(function() { if (tab === 'broadcasts' && !document.hidden && !bc.fatal && bcSending()) loadBc(true); }, BC_POLL_MS);
+
   // ---- вкладки ----
   function setTab(next) {
     tab = next;
     lsSet('adminTab', next);
-    const isDigest = next === 'digest';
-    $('digest-head').hidden = !isDigest;
-    $('stats-head').hidden = isDigest;
-    $('main').hidden = !isDigest;
-    $('stats-main').hidden = isDigest;
-    $('bar').hidden = !isDigest;
+    $('digest-head').hidden = next !== 'digest';
+    $('stats-head').hidden = next !== 'stats';
+    $('bc-head').hidden = next !== 'broadcasts';
+    $('main').hidden = next !== 'digest';
+    $('stats-main').hidden = next !== 'stats';
+    $('bc-main').hidden = next !== 'broadcasts';
+    $('bar').hidden = next !== 'digest';
     document.querySelectorAll('#tabs .tab').forEach(function(b) { b.setAttribute('aria-selected', String(b.dataset.tab === next)); });
     window.scrollTo(0, 0);
-    if (isDigest) { if (state) load(true); else { view = 'loading'; render(); load(); } }
-    else setStatsKind(statsKind);
+    if (next === 'digest') { if (state) load(true); else { view = 'loading'; render(); load(); } }
+    else if (next === 'stats') setStatsKind(statsKind);
+    else openBroadcasts();
   }
   document.querySelectorAll('#tabs .tab').forEach(function(b) { b.addEventListener('click', function() { if (b.dataset.tab !== tab) setTab(b.dataset.tab); }); });
   document.querySelectorAll('#seg button').forEach(function(b) { b.addEventListener('click', function() { if (b.dataset.kind !== statsKind) setStatsKind(b.dataset.kind); }); });
@@ -983,12 +1242,13 @@
       else $('fatal').append(h('p', { class: 'error', text: e.message }), h('button', { type: 'button', class: 'sum-btn', onclick: init }, 'Повторить'));
       return;
     }
-    $('tabs').hidden = !moderation;
+    // «Статистика» и «Рассылки» есть всегда; без модерации вкладки «Подборка» нет
+    $('tabs').hidden = false;
+    document.querySelector('#tabs [data-tab="digest"]').hidden = !moderation;
     const savedKind = lsGet('adminStatsKind');
     if (savedKind === 'pulse' || savedKind === 'trend') statsKind = savedKind;
     const savedTab = lsGet('adminTab');
-    // без модерации вкладки «Подборка» нет — открывается только статистика
-    setTab(moderation && (savedTab === 'digest' || savedTab === null) ? 'digest' : 'stats');
+    setTab(moderation && (savedTab === 'digest' || savedTab === null) ? 'digest' : savedTab === 'broadcasts' ? 'broadcasts' : 'stats');
   }
   init();
 })();

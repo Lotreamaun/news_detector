@@ -1,10 +1,14 @@
-"""Админ-панель: статистика бота и модерация недельной подборки (HTTP-слой).
+"""Админ-панель: статистика бота, рассылки и модерация недельной подборки (HTTP-слой).
 
-Роуты базы панели (при заданных ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, см. ``setup_admin``):
+Роуты базы панели и рассылок (при заданных ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, см. ``setup_admin``):
   GET  /admin                — статичная страница панели (без данных)
   GET  /admin/login?t=<токен> — обмен одноразовой ссылки на сессию (cookie) и редирект на /admin
   GET  /admin/api/meta       — {moderation: bool}: доступна ли вкладка модерации
   GET  /admin/api/stats?view=pulse|trend — статистика по журналу событий
+  GET  /admin/api/broadcasts  — последние рассылки с итогами и доступные сегменты
+  POST /admin/api/broadcasts  — запуск рассылки (повтор ``client_token`` — та же рассылка)
+  GET  /admin/api/broadcasts/audience?segment= — {count}: получателей в сегменте
+  POST /admin/api/broadcasts/test — отправить черновик только себе
 
 Роуты модерации (дополнительно, только если модерация доступна: нужен ``WEEKLY_DIGEST_TIME``;
 иначе они не регистрируются и отвечают 404):
@@ -32,6 +36,7 @@ from aiohttp import web
 from sqlalchemy import update
 
 from app.models import Article, User
+from app.services import broadcasts
 from app.services.force_summary import force_summarize
 from app.services import stats
 from app.services.rss_parser import _normalize_text
@@ -182,6 +187,83 @@ async def handle_stats(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("admin stats %s: error", view)
         return _json({"error": "internal", "message": "Не удалось загрузить статистику."}, 500)
+
+
+# -- Рассылки -----------------------------------------------------------------
+
+_BROADCAST_ERROR_STATUS = {"bad_request": web.HTTPBadRequest, "empty": web.HTTPBadRequest, "sending": web.HTTPConflict}
+
+
+def _broadcast_denied(exc: broadcasts.BroadcastError) -> web.HTTPException:
+    return _deny(_BROADCAST_ERROR_STATUS[exc.code], exc.code, exc.message)
+
+
+async def handle_broadcasts(request: web.Request) -> web.Response:
+    """Последние рассылки с итогами и сегменты, доступные для выбора (``unverified`` — при гейте)."""
+    require_admin(request)
+    config = request.app["config"]
+    try:
+        items = await broadcasts.list_broadcasts(request.app["session_maker"])
+    except Exception:
+        logger.exception("admin broadcasts: error")
+        return _json({"error": "internal", "message": "Не удалось загрузить рассылки."}, 500)
+    segments = broadcasts.available_segments(config)
+    return _json({
+        "broadcasts": items,
+        "segments": [{"key": key, "label": broadcasts.SEGMENT_LABELS[key]} for key in segments],
+        "unverified_available": broadcasts.UNVERIFIED in segments,
+        "check_subscription_available": bool(config.REQUIRED_CHANNEL_ID),
+    })
+
+
+async def handle_broadcast_audience(request: web.Request) -> web.Response:
+    """Число получателей сегмента; неизвестный или недоступный сегмент — 400."""
+    require_admin(request)
+    try:
+        async with request.app["session_maker"]() as session:
+            users = await broadcasts.segment_users(session, request.app["config"], request.query.get("segment", ""))
+    except broadcasts.BroadcastError as exc:
+        raise _broadcast_denied(exc)
+    return _json({"count": len(users)})
+
+
+async def handle_broadcast_test(request: web.Request) -> web.Response:
+    """Отправляет черновик только вызвавшему администратору; в БД ничего не пишет."""
+    admin_id = require_admin(request)
+    body = await _read_body(request)
+    try:
+        draft = broadcasts.validate_draft(body, request.app["config"])
+    except broadcasts.BroadcastError as exc:
+        raise _broadcast_denied(exc)
+    try:
+        await broadcasts.send_test(request.app["bot"], admin_id, draft)
+    except Exception:
+        logger.exception("admin %s: тестовая рассылка не отправлена", admin_id)
+        return _json({
+            "error": "send_failed",
+            "message": "Не удалось отправить тест. Проверьте, что вы не заблокировали бота.",
+        }, 502)
+    return _json({"status": "ok"})
+
+
+async def handle_broadcast_start(request: web.Request) -> web.Response:
+    """Запускает рассылку: ``{id, recipients}``; идёт другая — 409, в сегменте никого — 400."""
+    admin_id = require_admin(request)
+    body = await _read_body(request)
+    client_token = str(body.get("client_token") or "")
+    if not 8 <= len(client_token) <= 64:
+        raise _deny(web.HTTPBadRequest, "bad_request", "Некорректный запрос.")
+    session_maker = request.app["session_maker"]
+    try:
+        draft = broadcasts.validate_draft(body, request.app["config"])
+        broadcast, created = await broadcasts.start_broadcast(
+            session_maker, request.app["config"], admin_id, draft, client_token
+        )
+    except broadcasts.BroadcastError as exc:
+        raise _broadcast_denied(exc)
+    if created:
+        broadcasts.spawn_broadcast(request.app["bot"], session_maker, broadcast.id)
+    return _json({"id": broadcast.id, "recipients": broadcast.recipients})
 
 
 # -- Состояние ----------------------------------------------------------------
@@ -339,7 +421,7 @@ async def handle_export(request: web.Request) -> web.Response:
 
 
 def setup_admin(app: web.Application) -> None:
-    """Регистрирует роуты панели: базу — при ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, модерацию — ещё и при ``WEEKLY_DIGEST_TIME``."""
+    """Регистрирует роуты панели: базу и рассылки — при ``WEBAPP_URL`` и ``ADMIN_CHAT_IDS``, модерацию — ещё и при ``WEEKLY_DIGEST_TIME``."""
     config = app["config"]
     reason = panel_unavailable_reason(config)
     if reason:
@@ -350,6 +432,10 @@ def setup_admin(app: web.Application) -> None:
     app.router.add_get("/admin/login", handle_login, allow_head=False)
     app.router.add_get("/admin/api/meta", handle_meta)
     app.router.add_get("/admin/api/stats", handle_stats)
+    app.router.add_get("/admin/api/broadcasts", handle_broadcasts)
+    app.router.add_post("/admin/api/broadcasts", handle_broadcast_start)
+    app.router.add_get("/admin/api/broadcasts/audience", handle_broadcast_audience)
+    app.router.add_post("/admin/api/broadcasts/test", handle_broadcast_test)
     reason = moderation_unavailable_reason(config)
     if reason:
         logger.info("Модерация подборки в панели не подключена: %s", reason)

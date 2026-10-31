@@ -21,6 +21,7 @@ from telegram.ext import (
 from app.bot.handlers import (
     admin_command,
     admin_link_callback,
+    broadcast_answer,
     check_subscription,
     force_summarize,
     force_summarize_digest,
@@ -44,6 +45,7 @@ from app.core.database import (
     init_db_schema,
 )
 from app.services.backup import resolve_sqlite_path, run_backup_job
+from app.services.broadcasts import resume_broadcasts
 from app.services.demo_article import (
     DEMO_ARTICLE_EXTERNAL_ID,
     DEMO_ARTICLE_LEVEL,
@@ -130,8 +132,9 @@ def _build_application(config: Config) -> Application:
     application.bot_data["session_maker"] = get_session_maker()
     application.bot_data["config"] = config
 
-    # Allowlist гейта подписки: только сам /start и экраны онбординга/подтверждения
-    # подписки. Всё остальное регистрируется через require_channel_verified —
+    # Allowlist гейта подписки: только сам /start, экраны онбординга/подтверждения
+    # подписки и ответ на опрос рассылки администратора (рассылка может идти как раз
+    # не прошедшим гейт). Всё остальное регистрируется через require_channel_verified —
     # default-deny, чтобы новый хендлер без явного исключения был защищён
     # автоматически (см. openspec/changes/enforce-channel-subscription-gate).
     # Журнал событий: трекер в группе -1 видит все апдейты до остальных обработчиков и не
@@ -144,6 +147,7 @@ def _build_application(config: Config) -> Application:
         CallbackQueryHandler(onboarding_show_example, pattern=r"^onboarding:example$")
     )
     application.add_handler(CallbackQueryHandler(check_subscription, pattern=r"^check_subscription$"))
+    application.add_handler(CallbackQueryHandler(broadcast_answer, pattern=r"^bc:\d+:\d+$"))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("today", require_channel_verified(today)))
     application.add_handler(CommandHandler("help", require_channel_verified(help_command)))
@@ -262,9 +266,10 @@ def _schedule_jobs(application: Application, config: Config) -> None:
 
 
 async def _post_init(application: Application) -> None:
-    """post_init: регистрирует список команд, запускает WebApp и первые прогоны проверки/бэкапа."""
+    """post_init: регистрирует список команд, запускает WebApp, возобновляет рассылки и делает первые прогоны проверки/бэкапа."""
     await _register_commands(application)
     await _start_webapp(application)
+    await _resume_broadcasts(application)
     await _run_initial_check(application)
     await _run_initial_weekly_digest(application)
     await _ensure_demo_article(application)
@@ -283,6 +288,14 @@ async def _start_webapp(application: Application) -> None:
         )
     except Exception:
         logger.exception("Не удалось запустить WebApp")
+
+
+async def _resume_broadcasts(application: Application) -> None:
+    """Продолжает рассылки администратора, прерванные рестартом (фоновыми задачами)."""
+    try:
+        await resume_broadcasts(application.bot, application.bot_data["session_maker"])
+    except Exception:
+        logger.exception("Не удалось возобновить рассылки администратора")
 
 
 async def _register_commands(application: Application) -> None:

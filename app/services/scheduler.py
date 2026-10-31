@@ -942,7 +942,7 @@ async def _send_weekly_digest(context) -> None:
     for user in users:
         # фильтры пользователя не применяются: подборка одинакова для всех
         try:
-            if await _send_notification(context, session_maker, user, text, markup, "weekly"):
+            if await _send_notification(context.bot, session_maker, user, text, markup, "weekly"):
                 sent += 1
         except Exception:
             logger.exception("Ошибка отправки подборки пользователю %s — пропуск", user.telegram_id)
@@ -1026,7 +1026,7 @@ async def _notify_users_batch(context, session_maker, articles: list[Article]) -
 
             user_sent = False
             for message, reply_markup, kind in messages:
-                result = await _send_notification(context, session_maker, user, message, reply_markup, kind)
+                result = await _send_notification(context.bot, session_maker, user, message, reply_markup, kind)
                 if result is None:
                     # пользователь заблокировал бота и деактивирован — дальше слать нечего
                     break
@@ -1047,15 +1047,16 @@ async def _notify_users_batch(context, session_maker, articles: list[Article]) -
 
 
 async def _send_notification(
-    context, session_maker, user: User, message: str, reply_markup, kind: str
+    bot, session_maker, user: User, message: str, reply_markup, kind: str
 ) -> bool | None:
     """Отправляет одно сообщение пользователю и пишет итог в журнал событий.
 
-    ``kind`` — вид уведомления (``law`` / ``digest`` / ``weekly``): ``notify.sent`` с этим видом
+    ``bot`` — ``telegram.Bot`` (из PTB-контекста или из админ-панели).
+    ``kind`` — вид уведомления (``law`` / ``digest`` / ``weekly`` / ``broadcast``): ``notify.sent`` с этим видом
     при успехе, ``notify.failed`` с ``blocked`` (403) или ``error`` при неудаче.
     Возвращает то же, что ``_deliver_notification``.
     """
-    result = await _deliver_notification(context, session_maker, user, message, reply_markup)
+    result = await _deliver_notification(bot, session_maker, user, message, reply_markup)
     if result:
         record_event(session_maker, NOTIFY_SENT, user.telegram_id, kind)
     else:
@@ -1063,7 +1064,7 @@ async def _send_notification(
     return result
 
 
-async def _deliver_notification(context, session_maker, user: User, message: str, reply_markup) -> bool | None:
+async def _deliver_notification(bot, session_maker, user: User, message: str, reply_markup) -> bool | None:
     """Отправляет одно сообщение пользователю с обработкой лимита 429 и блокировки 403.
 
     Возвращает True, если сообщение в итоге доставлено, False при обычной неудаче,
@@ -1071,7 +1072,7 @@ async def _deliver_notification(context, session_maker, user: User, message: str
     ему в этом цикле бессмысленна).
     """
     try:
-        await context.bot.send_message(
+        await bot.send_message(
             chat_id=user.telegram_id,
             text=message,
             reply_markup=reply_markup,
@@ -1092,7 +1093,7 @@ async def _deliver_notification(context, session_maker, user: User, message: str
             logger.warning("429 для %s, sleep %sс", user.telegram_id, retry_after)
             await asyncio.sleep(retry_after)
             try:
-                await context.bot.send_message(
+                await bot.send_message(
                     chat_id=user.telegram_id,
                     text=message,
                     reply_markup=reply_markup,
