@@ -35,6 +35,7 @@ SUMMARY_LIMIT = "summary.limit"
 # Доставка
 NOTIFY_SENT = "notify.sent"
 NOTIFY_FAILED = "notify.failed"
+BROADCAST_STARTED = "broadcast.started"
 # Конвейер
 CHECK_OK = "check.ok"
 CHECK_FAILED = "check.failed"

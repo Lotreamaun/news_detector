@@ -190,14 +190,34 @@ shown in the feed with a mark. `/admin` replies with a service note, the moderat
 available), a one-time link and a `web_app` button (private chats only); the reminder's "Ссылка для
 браузера" callback still sends the link only. Spec: `bot-activity-stats`.
 
+**Admin broadcasts (`broadcasts.py`, `app/models/broadcast.py`, tab "Рассылки" in `admin.html`).**
+Always available where the panel is (`WEBAPP_URL` + `ADMIN_CHAT_IDS`), independent of `WEEKLY_DIGEST_TIME`;
+routes `GET/POST /admin/api/broadcasts`, `GET /admin/api/broadcasts/audience?segment=`, `POST /admin/api/broadcasts/test`.
+Message = plain text (escaped whole with `escape_markdown(version=2)`, shown as typed; 1–3500 chars) +
+0–4 answer options (1–40 chars, no repeats) + at most one action button (`https://` link or
+"Проверить подписку", the latter only with `REQUIRED_CHANNEL_ID`). Fixed segments, `ADMIN_CHAT_IDS` excluded
+from all: `subscribers` (`is_active AND channel_verified`, as the regular notifications), `active_14d` /
+`silent_14d` (with / without a `stats.ACTIVE_KINDS` event in 14 days; together = `subscribers`), `unverified`
+(only with the channel gate on). Start = one transaction: `Broadcast` + a `pending` `BroadcastDelivery` row
+per recipient (audience snapshot); the background task (`spawn_broadcast`) sends through the same
+`_send_notification(bot, …, kind="broadcast")` (429/403/journal) and commits each row as `sent`/`blocked`/`error`
+right after sending; `post_init` resumes every `sending` broadcast (`resume_broadcasts`, only `pending` rows) —
+at most one duplicate per restart. Only one broadcast at a time (409), a repeated `client_token` returns the
+existing one. Test send goes only to the calling admin with `bc:0:<n>` buttons, no DB writes. Answers:
+callback `bc:<id>:<n>`, handler `broadcast_answer` registered **outside** `require_channel_verified`; accepted only
+from a recipient with a valid option, upsert into `broadcast_answers` (last answer wins), the chosen option gets
+"✓ ". The tab lists the last 20 with delivery counts and answers per option (share of `sent`), polling every 3 s
+while one is `sending`. Spec: `admin-broadcasts`.
+
 **Event journal (`app/models/event.py`, `app/services/events.py`).** Table `events`
 (`at` UTC, `kind`, `telegram_id` NULL for system events, `ref`). `record_event(session_maker, kind,
 telegram_id, ref)` is fire-and-forget (background task, failure = `logger.warning`, never breaks the
 caller). Sources: `track_activity` (`TypeHandler`, group -1: `cmd` — only names from `BOT_COMMANDS`,
 else `other`; `button` — first two `callback_data` segments), `track_bot_blocked` (`my_chat_member`,
 private chats; time from the update; unblock sets `is_active = True` for a registered user, block only goes to the journal), `start`/`check_subscription`/settings
-wizard, `force_summarize` (wrapper around `_force_summarize`), `_send_notification(kind=law|digest|weekly)`,
-`check_legislation_updates`, `_process_entry` (`act.processed` = `<page|ocr|none>/<ok|refused|error|none>`,
+wizard, `force_summarize` (wrapper around `_force_summarize`), `_send_notification(kind=law|digest|weekly|broadcast)`,
+`check_legislation_updates`, `start_broadcast` (`broadcast.started`, system, `ref = "<id>:<recipients>"`, shown in
+the feed; deliveries are `notify.sent`/`notify.failed` with `ref = broadcast`), `_process_entry` (`act.processed` = `<page|ocr|none>/<ok|refused|error|none>`,
 not written by backfill), `_send_weekly_digest`, and `POST /seen` (Mini-App open, verified `initData`,
 always 204). New event kinds: add a constant in `events.py`, a line in `stats._describe` if it should
 appear in the feed, and extend `BOT_COMMANDS` when adding a command. `purge_old_events` (daily job)
@@ -239,7 +259,8 @@ and appends "…", which can end mid-sentence.
   asks to subscribe to the channel (`check_subscription` callback); a "show
   example" button sends the demo article (`app/services/demo_article.py`,
   `is_demo`, hidden from `/today` and digests). Other commands/callbacks are
-  wrapped in `require_channel_verified` (default-deny, no admin bypass).
+  wrapped in `require_channel_verified` (default-deny, no admin bypass), except
+  the broadcast poll answer `bc:<id>:<n>` (see "Admin broadcasts").
 - Full-text button opens the Mini-App (`app/webapp/server.py`), which only
   appears when `WEBAPP_URL` is set (Telegram requires HTTPS for WebApps).
 
@@ -316,6 +337,8 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/models/event.py` | `Event` — event journal row (see "Event journal") |
 | `app/services/events.py` | Event kinds, fire-and-forget `record_event`, daily `purge_old_events` |
 | `app/services/stats.py` | `pulse()` / `trend()` SQL aggregates for the "Статистика" tab |
+| `app/models/broadcast.py` | `Broadcast`, `BroadcastDelivery` (PK broadcast + user, `pending`/`sent`/`blocked`/`error`), `BroadcastAnswer` (one per user) |
+| `app/services/broadcasts.py` | Admin broadcasts: segments, `validate_draft`, `build_markup`, start/send/resume, answers, `list_broadcasts` |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
 | `app/services/summary_usage.py` | Summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) plus in-memory "in flight" reserve (`reserve`/`release`/`reserved`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
@@ -360,7 +383,7 @@ This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
 `legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
 `digest-notifications`, `force-summarization`, `law-importance-scoring`,
-`weekly-important-digest`, `bot-activity-stats`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
+`weekly-important-digest`, `bot-activity-stats`, `admin-broadcasts`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
 in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
 change), finished ones moved under `openspec/changes/archive/` (dated). There
 are currently no active changes; `law-sphere-filter` and `law-region-filter`

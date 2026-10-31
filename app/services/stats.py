@@ -266,6 +266,9 @@ def _describe(kind: str, ref: str | None) -> str:
         return "⚠️ проверка pravo.gov.ru не удалась"
     if kind == ev.WEEKLY_SENT:
         return f"📌 недельная подборка отправлена · законов: {ref}"
+    if kind == ev.BROADCAST_STARTED:
+        broadcast_id, _, recipients = (ref or "").partition(":")
+        return f"📣 рассылка #{broadcast_id} запущена · получателей: {recipients}"
     return kind
 
 

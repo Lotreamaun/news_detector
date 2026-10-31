@@ -13,6 +13,7 @@ from telegram.helpers import escape_markdown
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler
 
 from app.models import Article, User
+from app.services.broadcasts import record_answer
 from app.services.channel_subscription import is_subscribed
 from app.services.events import (
     BUTTON,
@@ -723,6 +724,32 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
     )
     await _edit_ignoring_not_modified(query, "Подписка подтверждена! Настроим фильтры:", markup)
+
+
+async def broadcast_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ответ на опрос рассылки администратора (``bc:<id>:<n>``); регистрируется вне гейта канала.
+
+    ``id = 0`` — тестовая отправка: ответ не сохраняется. Нажатие не от получателя рассылки
+    или с несуществующим вариантом молча отбрасывается.
+    """
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+    _, broadcast_id, option = query.data.split(":")
+    if broadcast_id == "0":
+        await query.answer("Тестовая рассылка — ответ не сохраняется")
+        return
+    markup = await record_answer(_session_maker(context), int(broadcast_id), update.effective_user.id, int(option))
+    if markup is None:
+        await query.answer()
+        return
+    await query.answer("Спасибо!")
+    try:
+        await query.edit_message_reply_markup(reply_markup=markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+        logger.debug("Кнопки рассылки не изменились, правка пропущена: %s", exc)
 
 
 def require_channel_verified(handler):
