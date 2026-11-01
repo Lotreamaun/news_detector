@@ -4,7 +4,7 @@
   GET  /admin                — статичная страница панели (без данных)
   GET  /admin/login?t=<токен> — обмен одноразовой ссылки на сессию (cookie) и редирект на /admin
   GET  /admin/api/meta       — {moderation: bool}: доступна ли вкладка модерации
-  GET  /admin/api/stats?view=pulse|trend — статистика по журналу событий
+  GET  /admin/api/stats?view=pulse|trend|compare_week|compare_month — статистика по журналу событий
   GET  /admin/api/broadcasts  — последние рассылки с итогами и доступные сегменты
   POST /admin/api/broadcasts  — запуск рассылки (повтор ``client_token`` — та же рассылка)
   GET  /admin/api/broadcasts/audience?segment= — {count}: получателей в сегменте
@@ -30,6 +30,7 @@ import logging
 import secrets
 import time
 from datetime import datetime, timezone
+from functools import partial
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -175,14 +176,22 @@ async def handle_meta(request: web.Request) -> web.Response:
     return _json({"moderation": moderation_unavailable_reason(request.app["config"]) is None})
 
 
+_STATS_VIEWS = {
+    "pulse": stats.pulse,
+    "trend": stats.trend,
+    "compare_week": partial(stats.compare, unit="week"),
+    "compare_month": partial(stats.compare, unit="month"),
+}
+
+
 async def handle_stats(request: web.Request) -> web.Response:
-    """Пульс или Тренд по журналу событий (``?view=pulse|trend``), считается при каждом запросе."""
+    """Статистика по журналу событий (``?view=pulse|trend|compare_week|compare_month``), считается при каждом запросе."""
     require_admin(request)
     view = request.query.get("view")
-    if view not in ("pulse", "trend"):
+    build = _STATS_VIEWS.get(view)
+    if build is None:
         raise _deny(web.HTTPBadRequest, "bad_request", "Некорректный запрос.")
     try:
-        build = stats.pulse if view == "pulse" else stats.trend
         return _json(await build(request.app["session_maker"], request.app["config"]))
     except Exception:
         logger.exception("admin stats %s: error", view)

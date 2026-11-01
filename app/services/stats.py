@@ -1,5 +1,5 @@
 """
-Статистика для админ-панели: «Пульс» (сейчас) и «Тренд» (по неделям) по журналу событий.
+Статистика для админ-панели: «Пульс» (сейчас), «Тренд» (по неделям) и сравнение периодов по журналу событий.
 
 Всё считается агрегирующими SQL-запросами по запросу, без предрасчёта. Границы «сегодня»,
 «7 дней» и недель считаются по Москве и передаются в SQL как UTC-моменты. Администраторы
@@ -297,6 +297,50 @@ async def _feed(session, config) -> list[dict]:
 
 # -- Тренд ------------------------------------------------------------------
 
+def _trend_series(config) -> list[dict]:
+    """Определения 10 рядов «Тренда» — общие для недельного вида и сравнения периодов.
+
+    ``column`` — столбец-дата, ``where`` — условия, ``value`` — агрегат (по умолчанию COUNT(*)),
+    ``journal`` — ряд строится только по журналу событий (до его начала «нет данных»).
+    """
+    admin_events = _not_admin(Event.telegram_id, config)
+
+    def events_where(*kinds, ref=None, system=False):
+        """Условия по журналу; ``system=True`` — события без пользователя (администраторов не исключаем)."""
+        conditions = [Event.kind.in_(kinds)]
+        if ref is not None:
+            conditions.append(Event.ref == ref)
+        if not system:
+            conditions.append(admin_events)
+        return conditions
+
+    def row(key, title, column, where, *, value=None, journal=False):
+        return {"key": key, "title": title, "column": column, "where": where, "value": value, "journal": journal}
+
+    real_article = Article.is_demo.is_(False)
+    return [
+        row("registrations", "Регистрации", User.created_at, [_not_admin(User.telegram_id, config)]),
+        row("blocks", "Заблокировали бота", Event.at, events_where(ev.USER_BLOCKED), journal=True),
+        row(
+            "active", "Активные пользователи", Event.at, events_where(*ACTIVE_KINDS),
+            value=func.count(distinct(Event.telegram_id)), journal=True,
+        ),
+        row("opens", "Открытия Mini-App", Event.at, events_where(ev.WEBAPP_OPEN), journal=True),
+        row("summaries", "Саммари по запросу", Event.at, events_where(ev.SUMMARY_RESULT, ref="ok"), journal=True),
+        row("delivered", "Доставлено уведомлений", Event.at, events_where(ev.NOTIFY_SENT), journal=True),
+        row("accepted", "Принято актов", Article.created_at, [real_article]),
+        row("with_summary", "Из них с саммари", Article.created_at, [real_article, Article.summary.isnot(None)]),
+        row(
+            "check_failures", "Сбои проверок pravo.gov.ru", Event.at,
+            events_where(ev.CHECK_FAILED, system=True), journal=True,
+        ),
+        row(
+            "digest", "Недельная подборка отправлена", WeeklyDigestRun.period_end,
+            [WeeklyDigestRun.finished_at.isnot(None)],
+        ),
+    ]
+
+
 async def trend(session_maker, config, now: datetime | None = None) -> dict:
     """Данные вкладки «Тренд»: ряды по неделям за последние 12 недель, включая текущую.
 
@@ -308,14 +352,15 @@ async def trend(session_maker, config, now: datetime | None = None) -> dict:
     monday_dates = [this_monday - timedelta(weeks=TREND_WEEKS - 1 - i) for i in range(TREND_WEEKS)]
     origin = _msk_midnight(monday_dates[0])
     week_ends = [_msk_midnight(d + timedelta(weeks=1)) for d in monday_dates]
-    admin_events = _not_admin(Event.telegram_id, config)
 
-    async def weekly(session, table_column, *where, value=None) -> list[int]:
-        """Значения по неделям: ``value`` (по умолчанию COUNT(*)) для строк с датой ``>= origin``."""
-        bucket = _bucket(table_column, origin)
+    async def weekly(session, definition) -> list[int]:
+        """Значения по неделям: агрегат ряда для строк с датой ``>= origin``."""
+        column = definition["column"]
+        value = definition["value"]
+        bucket = _bucket(column, origin)
         rows = await session.execute(
             select(bucket, value if value is not None else func.count())
-            .where(table_column >= origin, *where)
+            .where(column >= origin, *definition["where"])
             .group_by(bucket)
         )
         result = [0] * TREND_WEEKS
@@ -324,61 +369,95 @@ async def trend(session_maker, config, now: datetime | None = None) -> dict:
                 result[index] = count
         return result
 
-    def events_where(*kinds, ref=None, system=False):
-        """Условия по журналу; ``system=True`` — события без пользователя (администраторов не исключаем)."""
-        conditions = [Event.kind.in_(kinds)]
-        if ref is not None:
-            conditions.append(Event.ref == ref)
-        if not system:
-            conditions.append(admin_events)
-        return conditions
-
-    async with session_maker() as session:
-        since = await session.scalar(select(func.min(Event.at)))
-        since_utc = _as_utc(since) if since else None
-
-        registrations = await weekly(session, User.created_at, _not_admin(User.telegram_id, config))
-        accepted = await weekly(session, Article.created_at, Article.is_demo.is_(False))
-        with_summary = await weekly(
-            session, Article.created_at, Article.is_demo.is_(False), Article.summary.isnot(None)
-        )
-        digest_runs = await weekly(session, WeeklyDigestRun.period_end, WeeklyDigestRun.finished_at.isnot(None))
-
-        blocks = await weekly(session, Event.at, *events_where(ev.USER_BLOCKED))
-        active = await weekly(
-            session, Event.at, *events_where(*ACTIVE_KINDS), value=func.count(distinct(Event.telegram_id))
-        )
-        opens = await weekly(session, Event.at, *events_where(ev.WEBAPP_OPEN))
-        summaries = await weekly(session, Event.at, *events_where(ev.SUMMARY_RESULT, ref="ok"))
-        delivered = await weekly(session, Event.at, *events_where(ev.NOTIFY_SENT))
-        check_failures = await weekly(session, Event.at, *events_where(ev.CHECK_FAILED, system=True))
-        feedback = await feedback_summary(session, config)
-
-    def from_journal(values: list[int]) -> list[int | None]:
+    def from_journal(values: list[int], since_utc: datetime | None) -> list[int | None]:
         """Недели целиком до начала журнала — ``None`` вместо нуля."""
         return [
             None if since_utc is None or week_end <= since_utc else value
             for value, week_end in zip(values, week_ends)
         ]
 
-    series = [
-        {"key": "registrations", "title": "Регистрации", "values": registrations},
-        {"key": "blocks", "title": "Заблокировали бота", "values": from_journal(blocks)},
-        {"key": "active", "title": "Активные пользователи", "values": from_journal(active)},
-        {"key": "opens", "title": "Открытия Mini-App", "values": from_journal(opens)},
-        {"key": "summaries", "title": "Саммари по запросу", "values": from_journal(summaries)},
-        {"key": "delivered", "title": "Доставлено уведомлений", "values": from_journal(delivered)},
-        {"key": "accepted", "title": "Принято актов", "values": accepted},
-        {"key": "with_summary", "title": "Из них с саммари", "values": with_summary},
-        {"key": "check_failures", "title": "Сбои проверок pravo.gov.ru", "values": from_journal(check_failures)},
-        {"key": "digest", "title": "Недельная подборка отправлена", "values": [min(v, 1) for v in digest_runs]},
-    ]
+    series = []
+    async with session_maker() as session:
+        since = await session.scalar(select(func.min(Event.at)))
+        since_utc = _as_utc(since) if since else None
+        for definition in _trend_series(config):
+            values = await weekly(session, definition)
+            if definition["journal"]:
+                values = from_journal(values, since_utc)
+            elif definition["key"] == "digest":
+                values = [min(v, 1) for v in values]
+            series.append({"key": definition["key"], "title": definition["title"], "values": values})
+        feedback = await feedback_summary(session, config)
+
     return {
         "generated_at": _iso(now),
         "tracking_since": _iso(since_utc) if since_utc else None,
         "weeks": [
             {"start": d.isoformat(), "current": d == this_monday} for d in monday_dates
         ],
+        "series": series,
+        "feedback": feedback,
+    }
+
+
+# -- Сравнение периодов -----------------------------------------------------
+
+def compare_periods(unit: str, now: datetime) -> tuple[datetime, datetime, datetime, datetime]:
+    """Отрезки сравнения ``(cur_start, cur_end, prev_start, prev_end)`` как UTC-моменты.
+
+    ``week`` — с понедельника 00:00 по Москве до ``now`` против такого же по длине отрезка прошлой
+    недели; ``month`` — с 1-го числа до ``now`` против такого же отрезка прошлого месяца, но не
+    дальше его конца. В Москве нет перехода на летнее время, поэтому длины в UTC и по Москве равны.
+    """
+    today = portal_today(now)
+    if unit == "week":
+        cur_start = _msk_midnight(today - timedelta(days=today.weekday()))
+        return cur_start, now, cur_start - timedelta(days=7), now - timedelta(days=7)
+    if unit == "month":
+        first = today.replace(day=1)
+        cur_start = _msk_midnight(first)
+        prev_start = _msk_midnight((first - timedelta(days=1)).replace(day=1))
+        return cur_start, now, prev_start, min(prev_start + (now - cur_start), cur_start)
+    raise ValueError(f"unit должен быть week или month, получено {unit!r}")
+
+
+async def compare(session_maker, config, unit: str, now: datetime | None = None) -> dict:
+    """Данные режимов «Неделя к неделе» / «Месяц к месяцу»: значение каждого ряда «Тренда» за два отрезка.
+
+    Ряд из журнала — ``None`` для отрезка, начавшегося раньше журнала (неполный отрезок дал бы
+    ложный рост). Ряд подборки — число подборок без ``min(v, 1)``; «да/нет» рисует фронт.
+    """
+    now = now or datetime.now(timezone.utc)
+    cur_start, cur_end, prev_start, prev_end = compare_periods(unit, now)
+
+    async def total(session, definition, start: datetime, end: datetime) -> int:
+        column = definition["column"]
+        value = definition["value"]
+        stmt = select(value if value is not None else func.count()).where(
+            column >= start, column < end, *definition["where"]
+        )
+        return await session.scalar(stmt) or 0
+
+    series = []
+    async with session_maker() as session:
+        since = await session.scalar(select(func.min(Event.at)))
+        since_utc = _as_utc(since) if since else None
+        for definition in _trend_series(config):
+            values = {}
+            for name, start, end in (("previous", prev_start, prev_end), ("current", cur_start, cur_end)):
+                if definition["journal"] and (since_utc is None or since_utc > start):
+                    values[name] = None
+                else:
+                    values[name] = await total(session, definition, start, end)
+            series.append({"key": definition["key"], "title": definition["title"], **values})
+        feedback = await feedback_summary(session, config)
+
+    return {
+        "generated_at": _iso(now),
+        "tracking_since": _iso(since_utc) if since_utc else None,
+        "unit": unit,
+        "current": {"start": _iso(cur_start), "end": _iso(cur_end)},
+        "previous": {"start": _iso(prev_start), "end": _iso(prev_end)},
         "series": series,
         "feedback": feedback,
     }
