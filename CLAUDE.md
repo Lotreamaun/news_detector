@@ -160,6 +160,17 @@ Empty digest (including after that exclusion) = nothing sent. Admin preview:
 `/test_digest weekly` (no DB writes, no scoring). Specs: `law-importance-scoring`,
 `weekly-important-digest`.
 
+**Feedback (`weekly_feedback.py`, `app/models/weekly_feedback.py`).** Under each weekly teaser, below
+"📖 Дайджест", sits a row "👍 Полезно" / "👎 Не то" (`callback_data` `wf:<run_id>:up|down|r<0-3>`, `run_id` =
+`weekly_digest_runs.id`, so `_weekly_run_start` returns it and the message is built after it). 👎 reveals four
+reasons (Много лишнего / Не хватает важного / Сложно читать / Не моя сфера), optional. One vote per user per period,
+the last wins (`weekly_feedback`; 👍 clears the reason, a reason implies 👎); the handler `weekly_feedback_vote`
+(under `require_channel_verified`) redraws only the pressed message from its own keyboard (`merge_markup`).
+`/test_digest weekly` uses `run_id = 0`: toast "Предпросмотр — оценка не сохраняется", nothing saved. Results:
+panel "Оценка подборки" in the admin "Тренд" (`feedback_summary`, last 8 periods, admins excluded, shares of
+recipients = distinct `notify.sent` with `ref = weekly` between `started_at` and `finished_at`; hint
+`trend.feedback`). Spec: `weekly-digest-feedback`.
+
 **Moderation (`weekly_review.py`, `webapp/admin.py`, `webapp/static/admin.html`).** The
 admin decision lives in `Article.digest_override` (`'include'` / `'exclude'` / NULL) and is
 final: `final_selection(window)` (window docs with a summary that are `include`, or NULL with
@@ -339,6 +350,8 @@ copies (`VACUUM INTO`) into `DB_BACKUP_DIR` and rotates them.
 | `app/services/stats.py` | `pulse()` / `trend()` SQL aggregates for the "Статистика" tab |
 | `app/models/broadcast.py` | `Broadcast`, `BroadcastDelivery` (PK broadcast + user, `pending`/`sent`/`blocked`/`error`), `BroadcastAnswer` (one per user) |
 | `app/services/broadcasts.py` | Admin broadcasts: segments, `validate_draft`, `build_markup`, start/send/resume, answers, `list_broadcasts` |
+| `app/models/weekly_feedback.py` | `WeeklyFeedback` — one vote per user per weekly period (`verdict`, `reason`) |
+| `app/services/weekly_feedback.py` | Weekly digest rating: keyboard rows, `record_vote`, `feedback_summary` for the "Тренд" panel |
 | `app/models/weekly_review_ping.py` | `WeeklyReviewPing` — one row per sent admin reminder (idempotency) |
 | `app/services/scheduler.py` | Orchestrates fetch → classify → summarize/OCR → save → score → notify; backlog scoring; weekly digest |
 | `app/services/summary_usage.py` | Summary-attempt counter (`get_summary_usage`, `current_month`, `limit_message`) plus in-memory "in flight" reserve (`reserve`/`release`/`reserved`) shown in `/settings`, bot/Mini-App limit refusals and the Mini-App chip |
@@ -383,7 +396,7 @@ This repo uses OpenSpec (`openspec/`) to track feature proposals and specs.
 `openspec/specs/` holds current capability specs (e.g. `law-force-filter`,
 `legislation-ingestion`, `llm-refusal-handling`, `content-viewing`,
 `digest-notifications`, `force-summarization`, `law-importance-scoring`,
-`weekly-important-digest`, `bot-activity-stats`, `admin-broadcasts`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
+`weekly-important-digest`, `weekly-digest-feedback`, `bot-activity-stats`, `admin-broadcasts`, `deployment`, `summary-limit-display`); `openspec/changes/` holds
 in-progress change proposals (`proposal.md`, `design.md`, `tasks.md` per
 change), finished ones moved under `openspec/changes/archive/` (dated). There
 are currently no active changes; `law-sphere-filter` and `law-region-filter`

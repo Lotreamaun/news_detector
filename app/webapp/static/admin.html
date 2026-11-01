@@ -688,7 +688,8 @@
     'trend.accepted': { title: 'Принято актов', what: 'Сколько новых актов бот принял с pravo.gov.ru за неделю.', how: 'По дате, когда бот принял акт, а не по дате публикации. По всей истории базы, демо-акт не считается.' },
     'trend.with_summary': { title: 'Из них с саммари', what: 'Сколько из принятых за неделю актов сейчас имеют саммари.', how: 'Считается на момент открытия: сюда входят и саммари, сделанные позже — по запросу или вручную в панели.' },
     'trend.check_failures': { title: 'Сбои проверок pravo.gov.ru', what: 'Сколько раз за неделю не удалось получить список актов с портала.', how: 'Неудачные проверки из журнала. В норме — 0.' },
-    'trend.digest': { title: 'Недельная подборка отправлена', what: 'Ушла ли недельная подборка важных законов.', how: '1 — подборка за период, закончившийся на этой неделе, разослана; 0 — нет (не было актов, пропущена или функция выключена).' }
+    'trend.digest': { title: 'Недельная подборка отправлена', what: 'Ушла ли недельная подборка важных законов.', how: '1 — подборка за период, закончившийся на этой неделе, разослана; 0 — нет (не было актов, пропущена или функция выключена).' },
+    'trend.feedback': { title: 'Оценка подборки', what: 'Как подписчики оценили последние недельные подборки: 👍, 👎 и причины 👎.', how: 'Получили — разные люди, которым подборка периода доставлена. Доли — от получивших. Один голос на человека, считается последний; причина — необязательна («без причины»). Администраторы не учитываются. Последние 8 подборок, новые сверху; периоды без получивших не показываются.' }
   };
   const HINT_GROUPS = {
     pulse: [
@@ -698,7 +699,8 @@
     ],
     trend: [
       ['Люди и доставка', ['trend.registrations', 'trend.blocks', 'trend.active', 'trend.opens', 'trend.summaries', 'trend.delivered']],
-      ['Акты и подборка', ['trend.accepted', 'trend.with_summary', 'trend.check_failures', 'trend.digest']]
+      ['Акты и подборка', ['trend.accepted', 'trend.with_summary', 'trend.check_failures', 'trend.digest']],
+      ['Оценка подборки', ['trend.feedback']]
     ]
   };
   const HINT_TREND_NOTE = 'Недели пн–вс по Москве, последний столбец — текущая неделя, она ещё идёт. Ряды из журнала событий для недель до его начала — «нет данных», а не ноль.';
@@ -925,7 +927,20 @@
           h('div', { class: 'trend-now' }, 'эта неделя: ', h('b', { text: cur == null ? 'нет данных' : String(cur) }))),
         spark(s, d.weeks));
     });
-    return h('div', {}, block('Последние 12 недель', hint, rows), allHintsLink('trend'));
+    return h('div', {}, block('Последние 12 недель', hint, rows), feedbackBlock(d.feedback || []), allHintsLink('trend'));
+  }
+  function feedbackBlock(items) {
+    const pct = function(n, total) { return Math.round(n / total * 100) + '%'; };
+    const body = items.length ? items.map(function(f) {
+      const reasons = f.reasons.filter(function(r) { return r.count > 0; })
+        .map(function(r) { return r.label + ' ' + r.count; });
+      if (f.no_reason > 0) reasons.push('без причины ' + f.no_reason);
+      return h('div', { class: 'panel' },
+        h('div', { class: 'kv' }, h('span', { text: mskDay(f.date + 'T12:00:00+03:00') + ' · получили ' + f.received }),
+          h('b', { text: '👍 ' + f.up + ' · ' + pct(f.up, f.received) + '   👎 ' + f.down + ' · ' + pct(f.down, f.received) })),
+        reasons.length > 0 && h('div', { class: 'tile-sub', text: reasons.join(' · ') }));
+    }) : [h('div', { class: 'panel', text: 'Оценок пока нет' })];
+    return block('Оценка подборки', null, body, 'trend.feedback');
   }
 
   function updateStatsClock() {

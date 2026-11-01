@@ -31,6 +31,17 @@ from app.services.gigachat import calls_ahead_of_user
 from app.services.rss_parser import IMPORTANT_LEVELS, _normalize_text
 from app.services.summary_usage import format_reset_date, get_summary_usage, limit_message
 from app.services.today import FEDERAL, OTHER, REGIONAL, day_bounds, pick_top, portal_today, scope_of
+from app.services.weekly_feedback import (
+    TOAST_DOWN,
+    TOAST_PREVIEW,
+    TOAST_REASON,
+    TOAST_UP,
+    UP,
+    feedback_rows,
+    merge_markup,
+    parse_callback,
+    record_vote,
+)
 from app.services.weekly_review import moderation_unavailable_reason, panel_unavailable_reason
 from app.webapp.admin import issue_login_token, login_url
 from app.services.scheduler import (
@@ -750,6 +761,34 @@ async def broadcast_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if "message is not modified" not in str(exc).lower():
             raise
         logger.debug("Кнопки рассылки не изменились, правка пропущена: %s", exc)
+
+
+async def weekly_feedback_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Оценка недельной подборки (``wf:<run_id>:up|down|r<n>``): сохраняет голос и перерисовывает кнопки.
+
+    ``run_id = 0`` — предпросмотр администратора: ничего не сохраняется и сообщение не меняется.
+    """
+    query = update.callback_query
+    parsed = parse_callback(query.data) if query else None
+    if query is None or update.effective_user is None or parsed is None:
+        return
+    run_id, action = parsed
+    if run_id == 0:
+        await query.answer(TOAST_PREVIEW)
+        return
+    vote = await record_vote(_session_maker(context), run_id, update.effective_user.id, action)
+    if vote is None:
+        await query.answer()
+        return
+    verdict, reason = vote
+    await query.answer(TOAST_UP if action == UP else TOAST_REASON if action.startswith("r") else TOAST_DOWN)
+    markup = merge_markup(query.message.reply_markup, feedback_rows(run_id, verdict, reason))
+    try:
+        await query.edit_message_reply_markup(reply_markup=markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+        logger.debug("Кнопки оценки подборки не изменились, правка пропущена: %s", exc)
 
 
 def require_channel_verified(handler):

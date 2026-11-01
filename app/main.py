@@ -36,6 +36,7 @@ from app.bot.handlers import (
     today,
     track_activity,
     track_bot_blocked,
+    weekly_feedback_vote,
 )
 from app.core.config import Config
 from app.core.database import (
@@ -148,6 +149,9 @@ def _build_application(config: Config) -> Application:
     )
     application.add_handler(CallbackQueryHandler(check_subscription, pattern=r"^check_subscription$"))
     application.add_handler(CallbackQueryHandler(broadcast_answer, pattern=r"^bc:\d+:\d+$"))
+    application.add_handler(
+        CallbackQueryHandler(require_channel_verified(weekly_feedback_vote), pattern=r"^wf:\d+:(up|down|r[0-3])$")
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("today", require_channel_verified(today)))
     application.add_handler(CommandHandler("help", require_channel_verified(help_command)))
