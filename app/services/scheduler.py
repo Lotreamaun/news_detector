@@ -62,6 +62,7 @@ from app.services.rss_parser import (
     ocr_document_text,
 )
 from app.services.summarizer import Summarizer, SummarizerConfig
+from app.services.weekly_feedback import feedback_rows, merge_markup
 from app.services.weekly_review import (
     EXCLUDE,
     INCLUDE,
@@ -617,15 +618,21 @@ async def _load_weekly_window(session_maker, start: datetime, end: datetime) -> 
         )
 
 
-def _build_weekly_message(articles: list[Article], webapp_url: str | None) -> tuple[str, InlineKeyboardMarkup]:
-    """Недельное сообщение: тизер дайджеста с отдельным заголовком и порядком по важности."""
+def _build_weekly_message(
+    articles: list[Article], webapp_url: str | None, run_id: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Недельное сообщение: тизер дайджеста с отдельным заголовком, порядком по важности и кнопками оценки.
+
+    ``run_id`` — строка периода в ``weekly_digest_runs`` (``0`` — предпросмотр).
+    """
     order = {a.id: i for i, a in enumerate(articles)}
-    return _build_digest(
+    text, markup = _build_digest(
         articles,
         webapp_url,
         header=WEEKLY_HEADER_TEMPLATE.format(count=len(articles)),
         sort_key=lambda a: order[a.id],
     )
+    return text, merge_markup(markup, feedback_rows(run_id, None, None))
 
 
 async def build_weekly_preview(session_maker, config) -> tuple[str | None, InlineKeyboardMarkup | None, str]:
@@ -671,7 +678,7 @@ async def build_weekly_preview(session_maker, config) -> tuple[str | None, Inlin
     )
     if not included:
         return None, None, "\n".join(lines)
-    text, markup = _build_weekly_message(included, config.WEBAPP_URL)
+    text, markup = _build_weekly_message(included, config.WEBAPP_URL, 0)
     return text, markup, "\n".join(lines)
 
 
@@ -684,17 +691,22 @@ async def _weekly_run_finished(session_maker, period_end: datetime) -> bool:
     return finished is not None
 
 
-async def _weekly_run_start(session_maker, period_end: datetime) -> None:
-    """Фиксирует начало рассылки периода (повторный старт после сбоя обновляет ``started_at``)."""
+async def _weekly_run_start(session_maker, period_end: datetime) -> int:
+    """Фиксирует начало рассылки периода (повторный старт после сбоя обновляет ``started_at``).
+
+    Возвращает ``id`` строки периода (новой или существующей).
+    """
     async with session_maker() as session:
         run = await session.scalar(
             select(WeeklyDigestRun).where(WeeklyDigestRun.period_end == _as_utc(period_end))
         )
         if run is None:
-            session.add(WeeklyDigestRun(period_end=_as_utc(period_end), started_at=datetime.now(timezone.utc)))
+            run = WeeklyDigestRun(period_end=_as_utc(period_end), started_at=datetime.now(timezone.utc))
+            session.add(run)
         else:
             run.started_at = datetime.now(timezone.utc)
         await session.commit()
+        return run.id
 
 
 async def _weekly_run_finish(session_maker, period_end: datetime) -> None:
@@ -928,8 +940,8 @@ async def _send_weekly_digest(context) -> None:
         logger.info("Недельная подборка за %s пуста — ничего не отправляем", period_end)
         return
 
-    text, markup = _build_weekly_message(included, config.WEBAPP_URL)
-    await _weekly_run_start(session_maker, period_end)
+    run_id = await _weekly_run_start(session_maker, period_end)
+    text, markup = _build_weekly_message(included, config.WEBAPP_URL, run_id)
     async with session_maker() as session:
         users = list(
             (

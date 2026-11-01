@@ -16,6 +16,7 @@ from sqlalchemy import Integer, and_, case, cast, distinct, exists, false, func,
 from app.models import Article, Event, User, UserFilter, WeeklyDigestRun
 from app.services import events as ev
 from app.services.today import PORTAL_TZ, portal_today
+from app.services.weekly_feedback import feedback_summary
 
 # Пояснения к метрикам — `HINTS` в webapp/static/admin.html: меняешь подсчёт — поправь текст
 # Виды событий, по которым пользователь считается активным
@@ -351,6 +352,7 @@ async def trend(session_maker, config, now: datetime | None = None) -> dict:
         summaries = await weekly(session, Event.at, *events_where(ev.SUMMARY_RESULT, ref="ok"))
         delivered = await weekly(session, Event.at, *events_where(ev.NOTIFY_SENT))
         check_failures = await weekly(session, Event.at, *events_where(ev.CHECK_FAILED, system=True))
+        feedback = await feedback_summary(session, config)
 
     def from_journal(values: list[int]) -> list[int | None]:
         """Недели целиком до начала журнала — ``None`` вместо нуля."""
@@ -378,4 +380,5 @@ async def trend(session_maker, config, now: datetime | None = None) -> dict:
             {"start": d.isoformat(), "current": d == this_monday} for d in monday_dates
         ],
         "series": series,
+        "feedback": feedback,
     }
