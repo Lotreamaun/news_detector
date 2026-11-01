@@ -195,7 +195,7 @@ live in `app/webapp/static/webapp.css`. Spec: `weekly-digest-moderation`.
 `WEEKLY_DIGEST_TIME` is set too (otherwise 404, the tab "Подборка" is hidden via `meta.moderation`).
 The "Статистика" tab shows "Пульс" (today / 7 days by Moscow, audience, engagement, delivery,
 pipeline health, level filters, last-50 feed; auto-refresh every 60 s only while the page is visible)
-and "Тренд" (12 weeks, inline-SVG bars; "нет данных" before `MIN(events.at)`). Everything is computed
+and "Тренд" (12 weeks, inline-SVG bars; "нет данных" before `MIN(events.at)`). "Тренд" has three modes (switch saved in `localStorage` `adminTrendMode`): "Недели" (`view=trend`), "Неделя к неделе" / "Месяц к месяцу" (`view=compare_week|compare_month`, `stats.compare`: current period from Monday / the 1st to now vs the same-length span of the previous one, capped at its end; journal rows are "нет данных" if the journal started after the span start). Series definitions are shared (`_trend_series`). In "Недели" a tap on a bar shows that week's value. Everything is computed
 per request from SQL; each tile, panel title and "Тренд" row opens a bottom-sheet "что это / как считается" on tap ("Все пояснения" link lists them all); the texts are `HINTS` in `admin.html` — fix them when `stats.py` counting changes; admins (`ADMIN_CHAT_IDS`, current value) are excluded from user metrics but
 shown in the feed with a mark. `/admin` replies with a service note, the moderation summary (if
 available), a one-time link and a `web_app` button (private chats only); the reminder's "Ссылка для
