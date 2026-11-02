@@ -402,33 +402,51 @@ async def trend(session_maker, config, now: datetime | None = None) -> dict:
 
 # -- Сравнение периодов -----------------------------------------------------
 
-def compare_periods(unit: str, now: datetime) -> tuple[datetime, datetime, datetime, datetime]:
+COMPARE_BASES = ("to_date", "rolling", "completed")
+
+
+def compare_periods(unit: str, basis: str, now: datetime) -> tuple[datetime, datetime, datetime, datetime]:
     """Отрезки сравнения ``(cur_start, cur_end, prev_start, prev_end)`` как UTC-моменты.
 
-    ``week`` — с понедельника 00:00 по Москве до ``now`` против такого же по длине отрезка прошлой
-    недели; ``month`` — с 1-го числа до ``now`` против такого же отрезка прошлого месяца, но не
-    дальше его конца. В Москве нет перехода на летнее время, поэтому длины в UTC и по Москве равны.
+    ``unit`` — ``week`` или ``month``; ``basis`` — режим счёта:
+    ``to_date`` — с понедельника 00:00 по Москве (с 1-го числа) до ``now`` против такого же по длине
+    отрезка прошлого периода, но не дальше его конца; ``rolling`` — последние 7 (28) дней до ``now``
+    против стольких же дней перед ними; ``completed`` — последняя завершённая неделя пн–вс
+    (календарный месяц) против предыдущей. В Москве нет перехода на летнее время, поэтому длины
+    в UTC и по Москве равны.
     """
+    if unit not in ("week", "month"):
+        raise ValueError(f"unit должен быть week или month, получено {unit!r}")
+    if basis not in COMPARE_BASES:
+        raise ValueError(f"basis должен быть один из {COMPARE_BASES}, получено {basis!r}")
     today = portal_today(now)
+    if basis == "rolling":
+        span = timedelta(days=7 if unit == "week" else 28)
+        return now - span, now, now - 2 * span, now - span
     if unit == "week":
-        cur_start = _msk_midnight(today - timedelta(days=today.weekday()))
-        return cur_start, now, cur_start - timedelta(days=7), now - timedelta(days=7)
-    if unit == "month":
-        first = today.replace(day=1)
-        cur_start = _msk_midnight(first)
-        prev_start = _msk_midnight((first - timedelta(days=1)).replace(day=1))
-        return cur_start, now, prev_start, min(prev_start + (now - cur_start), cur_start)
-    raise ValueError(f"unit должен быть week или month, получено {unit!r}")
+        monday = _msk_midnight(today - timedelta(days=today.weekday()))
+        if basis == "to_date":
+            return monday, now, monday - timedelta(days=7), now - timedelta(days=7)
+        return monday - timedelta(days=7), monday, monday - timedelta(days=14), monday - timedelta(days=7)
+    first = today.replace(day=1)
+    cur_first = _msk_midnight(first)
+    last_first = _msk_midnight((first - timedelta(days=1)).replace(day=1))
+    if basis == "to_date":
+        return cur_first, now, last_first, min(last_first + (now - cur_first), cur_first)
+    prev_first = _msk_midnight((last_first.astimezone(PORTAL_TZ).date() - timedelta(days=1)).replace(day=1))
+    return last_first, cur_first, prev_first, last_first
 
 
-async def compare(session_maker, config, unit: str, now: datetime | None = None) -> dict:
+async def compare(session_maker, config, unit: str, basis: str = "to_date", now: datetime | None = None) -> dict:
     """Данные режимов «Неделя к неделе» / «Месяц к месяцу»: значение каждого ряда «Тренда» за два отрезка.
+
+    ``basis`` — режим счёта отрезков (см. ``compare_periods``), возвращается в ответе.
 
     Ряд из журнала — ``None`` для отрезка, начавшегося раньше журнала (неполный отрезок дал бы
     ложный рост). Ряд подборки — число подборок без ``min(v, 1)``; «да/нет» рисует фронт.
     """
     now = now or datetime.now(timezone.utc)
-    cur_start, cur_end, prev_start, prev_end = compare_periods(unit, now)
+    cur_start, cur_end, prev_start, prev_end = compare_periods(unit, basis, now)
 
     async def total(session, definition, start: datetime, end: datetime) -> int:
         column = definition["column"]
@@ -456,6 +474,7 @@ async def compare(session_maker, config, unit: str, now: datetime | None = None)
         "generated_at": _iso(now),
         "tracking_since": _iso(since_utc) if since_utc else None,
         "unit": unit,
+        "basis": basis,
         "current": {"start": _iso(cur_start), "end": _iso(cur_end)},
         "previous": {"start": _iso(prev_start), "end": _iso(prev_end)},
         "series": series,
