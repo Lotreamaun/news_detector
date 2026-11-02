@@ -680,6 +680,8 @@
   const STATS_REFRESH_MS = 60000;
   const LEVEL_LABELS = { CONSTITUTION: 'Конституция', FKZ: 'ФКЗ', FZ: 'ФЗ', DECREE: 'Указы', GOV_RESOLUTION: 'Постановления', DEPARTMENTAL: 'Ведомственные', REGIONAL: 'Региональные' };
   // Пояснения к метрикам. Меняешь подсчёт в app/services/stats.py — поправь текст здесь.
+  const CMP_TAIL_WEEK = 'Изменение — разница в числах и в процентах от прошлого значения, округлённых до целого; если прошлое значение 0, процент не показывается. «Нет данных» — ряд из журнала событий, а журнал начался позже начала отрезка: тогда изменение не считается. Цветом выделены только ряды с понятным направлением: рост регистраций, активных, открытий Mini-App и саммари — к лучшему (зелёный), рост блокировок и сбоев проверок — к худшему (красный). Подборка показана «да»/«нет».';
+  const CMP_TAIL_MONTH = 'Изменение — разница в числах и в процентах от прошлого значения, округлённых до целого; если прошлое значение 0, процент не показывается. «Нет данных» — ряд из журнала событий, а журнал начался позже начала отрезка: тогда изменение не считается. Цветом выделены только ряды с понятным направлением: рост регистраций, активных, открытий Mini-App и саммари — к лучшему (зелёный), рост блокировок и сбоев проверок — к худшему (красный). Подборка показана числом.';
   const HINTS = {
     'pulse.subscribers': { title: 'Подписчики', what: 'Те, кому сейчас реально уходят уведомления о законах.', how: 'Прошли проверку подписки на канал, рассылка им не отключена, бот не заблокирован. Администраторы не учитываются.' },
     'pulse.registered': { title: 'Зарегистрировано', what: 'Все, кто хоть раз нажал /start, включая тех, кто потом ушёл.', how: 'Все пользователи в базе без администраторов. Не прошедшие проверку канала и заблокировавшие бота входят сюда.' },
@@ -706,8 +708,12 @@
     'trend.with_summary': { title: 'Из них с саммари', what: 'Сколько из принятых за период актов сейчас имеют саммари.', how: 'Считается на момент открытия: сюда входят и саммари, сделанные позже — по запросу или вручную в панели. У более раннего отрезка было больше времени получить саммари, поэтому при сравнении ряд систематически выше у прошлого периода.' },
     'trend.check_failures': { title: 'Сбои проверок pravo.gov.ru', what: 'Сколько раз за период не удалось получить список актов с портала.', how: 'Неудачные проверки из журнала событий (администраторов тут нет: это работа бота). В норме — 0. До начала журнала — «нет данных».' },
     'trend.digest': { title: 'Недельная подборка отправлена', what: 'Сколько недельных подборок важных законов ушло за период.', how: 'Считаются разосланные подборки, период которых закончился внутри недели или отрезка. В «Неделях» и в сравнении недели к неделе показывается «да» (1) или «нет» (0); в сравнении месяцев — число подборок. 0 — подборки не было (не было актов, пропущена или функция выключена).' },
-    'trend.compare_week': { title: 'Неделя к неделе', what: 'Сравнение текущей недели с прошлой на одинаковом отрезке.', how: 'Сейчас — с понедельника 00:00 по Москве до момента открытия; прошлая неделя — с её понедельника на такое же время (иначе неполная неделя всегда выглядела бы падением). Изменение — разница в числах и в процентах от прошлого значения, округлённых до целого; если прошлое значение 0, процент не показывается. «Нет данных» — ряд из журнала событий, а журнал начался позже начала отрезка: тогда изменение не считается. Цветом выделены только ряды с понятным направлением: рост регистраций, активных, открытий Mini-App и саммари — к лучшему (зелёный), рост блокировок и сбоев проверок — к худшему (красный). Подборка показана как «да»/«нет».' },
-    'trend.compare_month': { title: 'Месяц к месяцу', what: 'Сравнение текущего месяца с прошлым на одинаковом отрезке.', how: 'Сейчас — с 1-го числа 00:00 по Москве до момента открытия; прошлый месяц — с его 1-го числа на такое же время, но не дальше его конца, если он короче (31 марта сравнивается со всем февралём). Активные считаются отдельно за каждый отрезок: это разные люди за месяц, а не сумма недель. Изменение — разница в числах и в процентах от прошлого значения, округлённых до целого; если прошлое значение 0, процент не показывается. «Нет данных» — ряд из журнала событий, а журнал начался позже начала отрезка: тогда изменение не считается. Цветом выделены только ряды с понятным направлением: рост регистраций, активных, открытий Mini-App и саммари — к лучшему (зелёный), рост блокировок и сбоев проверок — к худшему (красный). Подборка показана числом.' },
+    'trend.compare_week_to_date': { title: 'Неделя к неделе', what: 'Сравнение текущей недели с прошлой на одинаковом отрезке.', how: 'Сейчас — с понедельника 00:00 по Москве до момента открытия; прошлая неделя — с её понедельника на такое же время (иначе неполная неделя всегда выглядела бы падением). ' + CMP_TAIL_WEEK + ' Другие режимы счёта: «7 дней» — скользящее окно, «Прошлая неделя» — две последние завершённые недели.' },
+    'trend.compare_week_rolling': { title: 'Неделя к неделе', what: 'Сравнение последних 7 дней с предыдущими 7 днями.', how: 'Последние 7 дней до момента открытия против таких же 7 дней перед ними; всегда полные дни недели, удобно, чтобы понять, растём ли сейчас. ' + CMP_TAIL_WEEK + ' Другие режимы счёта: «С начала недели» — идущая неделя против такого же отрезка прошлой, «Прошлая неделя» — две последние завершённые недели.' },
+    'trend.compare_week_completed': { title: 'Неделя к неделе', what: 'Сравнение последней завершённой недели с предыдущей.', how: 'Две последние завершённые недели пн–вс по Москве; идущая неделя не учитывается, цифры не меняются до её конца — для отчёта. ' + CMP_TAIL_WEEK + ' Другие режимы счёта: «С начала недели» — идущая неделя, «7 дней» — скользящее окно.' },
+    'trend.compare_month_to_date': { title: 'Месяц к месяцу', what: 'Сравнение текущего месяца с прошлым на одинаковом отрезке.', how: 'Сейчас — с 1-го числа 00:00 по Москве до момента открытия; прошлый месяц — с его 1-го числа на такое же время, но не дальше его конца, если он короче (31 марта сравнивается со всем февралём). Активные считаются отдельно за каждый отрезок: это разные люди за месяц, а не сумма недель. ' + CMP_TAIL_MONTH + ' Другие режимы счёта: «28 дней» — скользящее окно, «Прошлый месяц» — два последних завершённых месяца.' },
+    'trend.compare_month_rolling': { title: 'Месяц к месяцу', what: 'Сравнение последних 28 дней с предыдущими 28 днями.', how: 'Последние 28 дней (ровно 4 недели, каждый день недели встречается поровну) до момента открытия против таких же 28 дней перед ними. Активные считаются отдельно за каждый отрезок. ' + CMP_TAIL_MONTH + ' Другие режимы счёта: «С начала месяца» — идущий месяц против такого же отрезка прошлого, «Прошлый месяц» — два последних завершённых месяца.' },
+    'trend.compare_month_completed': { title: 'Месяц к месяцу', what: 'Сравнение последнего завершённого месяца с предыдущим.', how: 'Два последних завершённых календарных месяца по Москве; идущий месяц не учитывается, цифры не меняются до его конца — для отчёта. Месяцы разной длины (31 против 30 дней), поэтому ±3% возможны сами по себе. Активные считаются отдельно за каждый отрезок. ' + CMP_TAIL_MONTH + ' Другие режимы счёта: «С начала месяца» — идущий месяц, «28 дней» — скользящее окно.' },
     'trend.feedback': { title: 'Оценка подборки', what: 'Как подписчики оценили последние недельные подборки: 👍, 👎 и причины 👎.', how: 'Получили — разные люди, которым подборка периода доставлена. Доли — от получивших. Один голос на человека, считается последний; причина — необязательна («без причины»). Администраторы не учитываются. Последние 8 подборок, новые сверху; периоды без получивших не показываются.' }
   };
   const HINT_GROUPS = {
@@ -722,7 +728,7 @@
       ['Оценка подборки', ['trend.feedback']]
     ]
   };
-  const HINT_TREND_NOTE = 'Недели пн–вс по Москве, последний столбец — текущая неделя, она ещё идёт; нажмите на столбик, чтобы увидеть значение той недели. Ряды из журнала событий для недель до его начала — «нет данных», а не ноль. Режимы «Неделя к неделе» и «Месяц к месяцу» сравнивают текущий период с таким же отрезком прошлого.';
+  const HINT_TREND_NOTE = 'Недели пн–вс по Москве, последний столбец — текущая неделя, она ещё идёт; нажмите на столбик, чтобы увидеть значение той недели. Ряды из журнала событий для недель до его начала — «нет данных», а не ноль. Режимы «Неделя к неделе» и «Месяц к месяцу» сравнивают два отрезка; как именно — выбирается режимом счёта над таблицей.';
   const TREND_MODES = [['weeks', 'Недели'], ['compare_week', 'Неделя к неделе'], ['compare_month', 'Месяц к месяцу']];
   // рост к лучшему (1) или к худшему (-1); у остальных рядов направление неоднозначно — без цвета
   const TREND_BETTER = { registrations: 1, active: 1, opens: 1, summaries: 1, blocks: -1, check_failures: -1 };
@@ -733,10 +739,20 @@
   let tab = 'stats';           // digest | stats | broadcasts
   let statsKind = 'pulse';     // pulse | trend
   let trendMode = 'weeks';     // weeks | compare_week | compare_month
+  let compareBasis = 'to_date'; // to_date | rolling | completed — режим счёта сравнения, общий для недель и месяцев
   let trendPick = {};          // ключ ряда → индекс выбранной недели (по умолчанию текущая)
-  const sv = { pulse: null, trend: null, compare_week: null, compare_month: null, error: '', fatal: '', lastOk: 0, stale: false, loading: {} };
-  // что показываем на вкладке: pulse | trend | compare_week | compare_month (так же называется вид в API)
-  function statsView() { return statsKind === 'pulse' ? 'pulse' : trendMode === 'weeks' ? 'trend' : trendMode; }
+  const sv = { pulse: null, trend: null, error: '', fatal: '', lastOk: 0, stale: false, loading: {} };
+  const COMPARE_BASES = ['to_date', 'rolling', 'completed'];
+  const BASIS_LABELS = {
+    week: [['to_date', 'С начала недели'], ['rolling', '7 дней'], ['completed', 'Прошлая неделя']],
+    month: [['to_date', 'С начала месяца'], ['rolling', '28 дней'], ['completed', 'Прошлый месяц']]
+  };
+  // что показываем на вкладке: pulse | trend | compare_week:<basis> | compare_month:<basis> (ключ слота sv[...];
+  // часть до «:» — вид в API, после — режим счёта)
+  function statsView() {
+    if (statsKind === 'pulse') return 'pulse';
+    return trendMode === 'weeks' ? 'trend' : trendMode + ':' + compareBasis;
+  }
 
   function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
   function lsSet(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* без запоминания работает как раньше */ } }
@@ -764,7 +780,8 @@
     if (sv.loading[kind]) return;   // запрос этого вида уже идёт (Пульс и Тренд грузятся независимо)
     sv.loading[kind] = true;
     try {
-      sv[kind] = await api('/admin/api/stats?view=' + kind);
+      const parts = kind.split(':');
+      sv[kind] = await api('/admin/api/stats?view=' + parts[0] + (parts[1] ? '&basis=' + parts[1] : ''));
       sv.error = '';
       sv.stale = false;
       if (kind === 'pulse') sv.lastOk = Date.now();
@@ -806,7 +823,7 @@
   function openAllHints(kind) {
     const nodes = [h('h3', { id: 'hint-title', text: 'Пояснения: ' + (kind === 'pulse' ? 'Пульс' : 'Тренд') })];
     if (kind === 'trend') nodes.push(h('p', { class: 'hint-how', text: HINT_TREND_NOTE }));
-    const groups = kind === 'trend' && trendMode !== 'weeks' ? [['Сравнение', ['trend.' + trendMode]]].concat(HINT_GROUPS.trend) : HINT_GROUPS[kind];
+    const groups = kind === 'trend' && trendMode !== 'weeks' ? [['Сравнение', ['trend.compare_' + trendMode.slice(8) + '_' + compareBasis]]].concat(HINT_GROUPS.trend) : HINT_GROUPS[kind];
     groups.forEach(function(group) {
       nodes.push(h('h4', { text: group[0] }));
       nodes.push(h('dl', {}, group[1].map(function(key) {
@@ -1010,6 +1027,11 @@
       return h('button', { type: 'button', role: 'tab', 'data-key': 'mode:' + m[0], 'aria-selected': String(trendMode === m[0]), onclick: function() { setTrendMode(m[0]); } }, m[1]);
     }));
   }
+  function basisSwitch(unit) {
+    return h('div', { class: 'seg seg-wide', role: 'tablist', 'aria-label': 'Режим счёта' }, BASIS_LABELS[unit].map(function(b) {
+      return h('button', { type: 'button', role: 'tab', 'data-key': 'basis:' + b[0], 'aria-selected': String(compareBasis === b[0]), onclick: function() { setCompareBasis(b[0]); } }, b[1]);
+    }));
+  }
   function mskStamp(iso) {
     const day = new Date(iso).toLocaleDateString('ru-RU', { weekday: 'short', day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' });
     return day.replace(',', '') + ' ' + mskTime(iso);
@@ -1044,12 +1066,19 @@
   function compareView(d) {
     const month = d.unit === 'month';
     const dayBefore = function(iso) { return mskDay(new Date(new Date(iso).getTime() - 60000).toISOString()); };
-    const before = d.previous.end === d.current.start
-      ? 'весь прошлый месяц, ' + mskDay(d.previous.start) + '–' + dayBefore(d.previous.end)
-      : mskStamp(d.previous.start) + ' – ' + mskStamp(d.previous.end);
-    const caption = 'Сейчас: ' + mskStamp(d.current.start) + ' – ' + mskStamp(d.current.end) + ' · Было: ' + before + '.';
+    const range = function(p) { return mskDay(p.start) + '–' + dayBefore(p.end); };
+    const stamps = function(p) { return mskStamp(p.start) + ' – ' + mskStamp(p.end); };
+    let caption;
+    if (d.basis === 'completed') {
+      caption = (month ? 'Месяц ' : 'Неделя ') + range(d.current) + ' · Было: ' + range(d.previous) + '.';
+    } else {
+      const before = d.basis === 'to_date' && d.previous.end === d.current.start
+        ? 'весь прошлый месяц, ' + range(d.previous)
+        : stamps(d.previous);
+      caption = 'Сейчас: ' + stamps(d.current) + ' · Было: ' + before + '.';
+    }
     const rows = d.series.map(function(s) { return compareRow(s, d.unit); });
-    return h('div', {}, modeSwitch(), block(month ? 'Месяц к месяцу' : 'Неделя к неделе', caption, rows, 'trend.compare_' + d.unit),
+    return h('div', {}, modeSwitch(), basisSwitch(d.unit), block(month ? 'Месяц к месяцу' : 'Неделя к неделе', caption, rows, 'trend.compare_' + d.unit + '_' + compareBasis),
       feedbackBlock(d.feedback || []), allHintsLink('trend'));
   }
   function feedbackBlock(items) {
@@ -1103,7 +1132,7 @@
     updateStatsClock();
     window.scrollTo(0, scrollY);
     // вкладка пересобирается целиком — фокус режима возвращаем тому, кто им владел
-    if (modeKey && modeKey.indexOf('mode:') === 0) {
+    if (modeKey && (modeKey.indexOf('mode:') === 0 || modeKey.indexOf('basis:') === 0)) {
       const el = document.querySelector('[data-key="' + modeKey + '"]');
       if (el) el.focus({ preventScroll: true });
     }
@@ -1123,6 +1152,15 @@
     sv.error = '';
     renderStatsTab();
     loadStats(statsView(), true);   // режим тоже обновляется при каждом выборе
+  }
+
+  function setCompareBasis(basis) {
+    if (basis === compareBasis) return;
+    compareBasis = basis;
+    lsSet('adminCompareBasis', basis);
+    sv.error = '';
+    renderStatsTab();
+    loadStats(statsView(), true);
   }
 
   // ---- рассылки ----
@@ -1402,6 +1440,8 @@
     if (savedKind === 'pulse' || savedKind === 'trend') statsKind = savedKind;
     const savedMode = lsGet('adminTrendMode');
     if (TREND_MODES.some(function(m) { return m[0] === savedMode; })) trendMode = savedMode;
+    const savedBasis = lsGet('adminCompareBasis');
+    if (COMPARE_BASES.indexOf(savedBasis) >= 0) compareBasis = savedBasis;
     const savedTab = lsGet('adminTab');
     setTab(moderation && (savedTab === 'digest' || savedTab === null) ? 'digest' : savedTab === 'broadcasts' ? 'broadcasts' : 'stats');
   }

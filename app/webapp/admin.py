@@ -4,7 +4,8 @@
   GET  /admin                — статичная страница панели (без данных)
   GET  /admin/login?t=<токен> — обмен одноразовой ссылки на сессию (cookie) и редирект на /admin
   GET  /admin/api/meta       — {moderation: bool}: доступна ли вкладка модерации
-  GET  /admin/api/stats?view=pulse|trend|compare_week|compare_month — статистика по журналу событий
+  GET  /admin/api/stats?view=pulse|trend|compare_week|compare_month[&basis=to_date|rolling|completed] — статистика
+                             по журналу событий (``basis`` — режим счёта сравнения, по умолчанию to_date)
   GET  /admin/api/broadcasts  — последние рассылки с итогами и доступные сегменты
   POST /admin/api/broadcasts  — запуск рассылки (повтор ``client_token`` — та же рассылка)
   GET  /admin/api/broadcasts/audience?segment= — {count}: получателей в сегменте
@@ -185,14 +186,20 @@ _STATS_VIEWS = {
 
 
 async def handle_stats(request: web.Request) -> web.Response:
-    """Статистика по журналу событий (``?view=pulse|trend|compare_week|compare_month``), считается при каждом запросе."""
+    """Статистика по журналу событий (``?view=pulse|trend|compare_week|compare_month[&basis=…]``), считается при каждом запросе."""
     require_admin(request)
     view = request.query.get("view")
     build = _STATS_VIEWS.get(view)
     if build is None:
         raise _deny(web.HTTPBadRequest, "bad_request", "Некорректный запрос.")
+    kwargs = {}
+    if view in ("compare_week", "compare_month"):
+        basis = request.query.get("basis", "to_date")
+        if basis not in stats.COMPARE_BASES:
+            raise _deny(web.HTTPBadRequest, "bad_request", "Некорректный запрос.")
+        kwargs["basis"] = basis
     try:
-        return _json(await build(request.app["session_maker"], request.app["config"]))
+        return _json(await build(request.app["session_maker"], request.app["config"], **kwargs))
     except Exception:
         logger.exception("admin stats %s: error", view)
         return _json({"error": "internal", "message": "Не удалось загрузить статистику."}, 500)
